@@ -1,0 +1,16 @@
+# Render Blueprint — ShipHero Tote Complete listener.
+services:
+  - type: web
+    name: ikigai-tote-webhook
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 1 -b 0.0.0.0:$PORT app:app
+    healthCheckPath: /
+    envVars:
+      - key: GSHEET_WEBAPP_URL
+        sync: false
+      - key: SHIPHERO_WEBHOOK_SECRET
+        sync: false
+      - key: VERIFY_SIGNATURE
+        value: "true"
