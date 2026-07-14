@@ -1,34 +1,35 @@
 """
-ShipHero Tote Complete -> Engraving Logger sheet (Totes tab).
+ShipHero Tote Complete -> Postgres (tote_content).  DB-backed successor to the
+Google-Sheets webhook. Verifies the HMAC signature, keeps only real engraving
+rows (DOTW/LID/IPE), and writes them to Postgres with ON CONFLICT DO NOTHING so
+duplicate webhook deliveries (same batch_id) collapse automatically.
 
-Receives ShipHero's Tote Complete webhook, verifies the HMAC signature, flattens each
-tote's orders+items into rows, and posts them (one batch call) to the same Google Apps
-Script web app that backs your Engraving Logger sheet — routed to a "Totes" tab as:
-
-    received_at, tote_barcode, tote_name, batch_id, order_number, sku, quantity,
-    is_engraving, engraving_type
-
-That gives the tote_barcode -> orders -> engraving SKUs mapping, so the barcodes engravers
-scan at the station resolve to real ShipHero orders + DOTW/LID/IPE counts.
-
-Ready-to-run: deploy to Render, then register the Tote Complete webhook once ShipHero support
-enables the account flag (webhook_create returns the shared_signature_secret -> set it here).
-
-Env: GSHEET_WEBAPP_URL (same /exec URL as the logger), SHIPHERO_WEBHOOK_SECRET,
-     VERIFY_SIGNATURE (default true), PORT
+Env:
+  DATABASE_URL              Postgres (Render Internal Connection String)
+  SHIPHERO_WEBHOOK_SECRET   shared_signature_secret from webhook_create
+  VERIFY_SIGNATURE          "true" (default) — 401 unsigned requests
+  ENGRAVING_ONLY            "true" (default) — store only DOTW/LID/IPE rows
 """
-import base64, hashlib, hmac, json, os, urllib.request
+import base64, hashlib, hmac, json, os
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
+from db import connect
 
 app = Flask(__name__)
-SECRET = os.environ.get("SHIPHERO_WEBHOOK_SECRET", "")
-VERIFY = os.environ.get("VERIFY_SIGNATURE", "true").lower() != "false"
-WEBAPP_URL = os.environ.get("GSHEET_WEBAPP_URL", "")
+SECRET  = os.environ.get("SHIPHERO_WEBHOOK_SECRET", "")
+VERIFY  = os.environ.get("VERIFY_SIGNATURE", "true").lower() != "false"
+ENG_ONLY = os.environ.get("ENGRAVING_ONLY", "true").lower() != "false"
+
+INSERT = """
+INSERT INTO tote_content
+  (received_at, tote_barcode, tote_name, batch_id, order_number, sku, quantity, engraving_type)
+VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+ON CONFLICT (tote_barcode, order_number, sku, batch_id) DO NOTHING
+"""
 
 def eng_type(sku):
     s = (sku or "").upper()
-    if s.startswith("ENG-OPS"):  return "OPS-CHECK"   # 'Double Check Engravings' — not output
+    if s.startswith("ENG-OPS"):  return "OPS-CHECK"
     if s.startswith("ENG-DOTW"): return "DOTW"
     if s.startswith("ENG-LID"):  return "LID"
     if s.startswith("ENG-IPE"):  return "IPE"
@@ -38,33 +39,29 @@ def eng_type(sku):
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-def post_rows(rows):
-    if not WEBAPP_URL:
-        print("[sink] no GSHEET_WEBAPP_URL set", flush=True); return
-    body = json.dumps({"kind": "tote_batch", "rows": rows}).encode()
-    req = urllib.request.Request(WEBAPP_URL, data=body, headers={"Content-Type": "application/json"})
-    try:
-        urllib.request.urlopen(req, timeout=10).read()
-        print(f"[sink] wrote {len(rows)} tote row(s)", flush=True)
-    except Exception as e:
-        print("[sink] error:", repr(e), flush=True)
-
 def sig_ok(raw):
     if not VERIFY:
         return True
     header = request.headers.get("x-shiphero-hmac-sha256", "")
     if not SECRET or not header:
         return False
-    calc = base64.b64encode(hmac.new(SECRET.encode("utf-8"), raw, hashlib.sha256).digest())
-    return hmac.compare_digest(calc, header.encode("utf-8"))
+    calc = base64.b64encode(hmac.new(SECRET.encode(), raw, hashlib.sha256).digest())
+    return hmac.compare_digest(calc, header.encode())
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify(status="ok", verify=VERIFY, has_secret=bool(SECRET), has_webapp=bool(WEBAPP_URL))
+    db_ok = False
+    try:
+        with connect() as c, c.cursor() as cur:
+            cur.execute("SELECT 1"); db_ok = cur.fetchone() is not None
+    except Exception as e:
+        db_ok = f"error: {e!r}"
+    return jsonify(status="ok", verify=VERIFY, has_secret=bool(SECRET),
+                   engraving_only=ENG_ONLY, db=db_ok)
 
 @app.route("/webhook", methods=["POST", "HEAD"])
 def webhook():
-    if request.method == "HEAD":          # ShipHero validates reachability with a HEAD
+    if request.method == "HEAD":
         return "", 200
     raw = request.get_data()
     if not sig_ok(raw):
@@ -75,20 +72,28 @@ def webhook():
         return jsonify(code="400", Message="bad json"), 400
 
     if payload.get("webhook_type") == "Tote Complete":
-        received = now_iso(); batch = payload.get("batch_id", ""); rows = []
+        received = now_iso()
+        batch = payload.get("batch_id", "")
+        rows = []
         for tote in payload.get("totes", []):
             tname, tbc = tote.get("tote_name", ""), tote.get("tote_barcode", "")
             for order in tote.get("orders", []):
                 onum = order.get("order_number", "")
                 for it in order.get("items", []):
                     sku = it.get("sku", ""); et = eng_type(sku)
-                    rows.append({"received_at": received, "tote_barcode": tbc, "tote_name": tname,
-                                 "batch_id": batch, "order_number": onum, "sku": sku,
-                                 "quantity": it.get("quantity", ""),
-                                 "is_engraving": ("yes" if et and et != "OPS-CHECK" else "no"),
-                                 "engraving_type": et})
+                    if ENG_ONLY and not (et and et != "OPS-CHECK"):
+                        continue
+                    rows.append((received, str(tbc), tname, batch, onum, sku,
+                                 it.get("quantity", 0), et))
         if rows:
-            post_rows(rows)
+            try:
+                with connect() as c, c.cursor() as cur:
+                    cur.executemany(INSERT, rows)
+                    c.commit()
+                    print(f"[db] wrote {cur.rowcount} tote_content row(s)", flush=True)
+            except Exception as e:
+                print("[db] error:", repr(e), flush=True)
+                return jsonify(code="500", Message="db error"), 500
     return jsonify(code="200", Message="Success"), 200
 
 if __name__ == "__main__":
