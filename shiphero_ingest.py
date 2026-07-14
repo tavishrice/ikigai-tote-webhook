@@ -98,6 +98,25 @@ USER_MAP = {
     "VXNlcjo3NzgyMjE=": "Kadil Ladson", "VXNlcjo3ODQ0MjU=": "Esra Altug",
 }
 
+# Resolve EVERY ShipHero user_id -> name from the account directory, so inventory
+# rows (which only carry user_id) are credited to the right person automatically.
+Q_USERS = """query{ account{ data{ users{ id account_id first_name last_name } } } }"""
+
+def resolve_users(token):
+    m = dict(USER_MAP)
+    try:
+        users = gql(Q_USERS, token)["data"]["account"]["data"]["users"] or []
+        for u in users:
+            nm = f"{u.get('first_name','') or ''} {u.get('last_name','') or ''}".strip()
+            if u.get("id") and nm:
+                m[u["id"]] = nm
+        print(f"[shiphero] user directory: {len(m)} names", flush=True)
+        for uid in ("VXNlcjo1ODEwMDM=","VXNlcjo3Nzg0NjM=","VXNlcjo3NzY5OTc=","VXNlcjozODc2OTQ="):
+            print(f"[shiphero]   {uid} -> {m.get(uid,'?')}", flush=True)
+    except Exception as e:
+        print(f"[shiphero] user resolve failed ({e}); using static map", flush=True)
+    return m
+
 def _name(n): return f"{n.get('user_first_name','') or ''} {n.get('user_last_name','') or ''}".strip()
 
 def classify(reason, delta, cycle):
@@ -118,9 +137,31 @@ def _refresh_day(cur, d):
     cur.execute("SELECT refresh_contribution_day(%s)", (d,))
     cur.execute("SELECT refresh_shift_day(%s)", (d,))
 
+def fix_historical(cur, umap):
+    """Re-credit any previously-loaded 'User-<id>' rows now that we have names."""
+    cur.execute("SELECT DISTINCT person FROM event WHERE person LIKE 'User-%'")
+    fixed = 0
+    for (p,) in cur.fetchall():
+        nm = umap.get(p[5:])            # strip 'User-' -> base64 id
+        if nm and nm != p:
+            cur.execute("UPDATE event SET person=%s WHERE person=%s", (nm, p))
+            fixed += cur.rowcount
+    if fixed:
+        print(f"[shiphero] re-credited {fixed} historical inventory rows", flush=True)
+    return fixed
+
 def run(df, dt_):
     tok = access_token()
+    umap = resolve_users(tok)
     d0 = dt.date.fromisoformat(df); d1 = dt.date.fromisoformat(dt_)
+    # one-time repair of earlier mis-attributed rows + refresh their rollups
+    with connect() as c, c.cursor() as cur:
+        if fix_historical(cur, umap):
+            cur.execute("SELECT DISTINCT et_day(ts) FROM event WHERE source='shiphero'")
+            for (d,) in cur.fetchall():
+                cur.execute("SELECT refresh_stage_contribution_day(%s)", (d,))
+                cur.execute("SELECT refresh_shift_day(%s)", (d,))
+        c.commit()
     day = d0
     while day < d1:
         nxt = day + dt.timedelta(days=1)
@@ -141,7 +182,7 @@ def run(df, dt_):
                 if not stage: continue
                 eid = str(n["id"])
                 uid = n.get("user_id")
-                person = USER_MAP.get(uid, f"User-{uid}")
+                person = umap.get(uid, f"User-{uid}")
                 inv.append((n["created_at"], person, stage, stage, None, n.get("sku"),
                             abs(n.get("change_in_on_hand") or 0), sub, eid, "shiphero|"+eid))
         except Exception as e:
