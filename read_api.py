@@ -163,6 +163,7 @@ tr:last-child td{border-bottom:0}
 <script>
 const API="";
 function etToday(){const d=new Date(Date.now()-4*3600*1000);return d.toISOString().slice(0,10);}
+function etDaysAgo(n){const d=new Date(Date.now()-4*3600*1000-n*86400000);return d.toISOString().slice(0,10);}
 async function getj(path){for(let i=0;i<6;i++){try{const r=await fetch(API+path);if(r.ok)return await r.json();}catch(e){}
   document.getElementById('status').textContent='Waking the server… ('+(i+1)+')';await new Promise(s=>setTimeout(s,4000));}
   throw new Error('unreachable');}
@@ -207,7 +208,7 @@ async function load(){
   document.getElementById('foot').textContent='Range '+f+' → '+t+' · loaded '+new Date().toLocaleTimeString();
  }catch(e){document.getElementById('status').textContent='Could not reach the API — try Refresh.';}
 }
-document.getElementById('from').value=etToday();
+document.getElementById('from').value=etDaysAgo(7);
 document.getElementById('to').value=etToday();
 load();
 </script></body></html>"""
