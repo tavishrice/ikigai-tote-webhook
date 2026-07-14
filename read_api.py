@@ -90,9 +90,9 @@ def warehouse():
         (person,pk_i,pk_o,psh_i,psh_o,psp_i,psp_o,repl,eng_i,pick_c,pack_c,ful_c,mov_c,cnt_c,eng_c,first,last)=r
         people.append(dict(person=person, type=PERSON_TYPE.get(person,""),
             items_picked_sh=pk_i, items_packed_sh=psh_i, items_packed_shop=psp_i,
-            replenished=repl, engraved=eng_i, orders_picked_sh=pk_o, orders_packed_sh=psh_o, orders_packed_shop=psp_o))
+            replenished=repl, engraved=eng_c, orders_picked_sh=pk_o, orders_packed_sh=psh_o, orders_packed_shop=psp_o))
         tot["pk_i"]+=pk_i; tot["packsh_i"]+=psh_i; tot["packshop_i"]+=psp_i
-        tot["pk_o"]+=pk_o; tot["packsh_o"]+=psh_o; tot["packshop_o"]+=psp_o; tot["repl"]+=repl; tot["eng"]+=eng_i
+        tot["pk_o"]+=pk_o; tot["packsh_o"]+=psh_o; tot["packshop_o"]+=psp_o; tot["repl"]+=repl; tot["eng"]+=eng_c
         g = gaps.get(person)
         floor.append(dict(person=person, first_ts=first.isoformat() if first else None,
             last_ts=last.isoformat() if last else None,
@@ -166,7 +166,7 @@ tr.tot td{font-weight:700;border-top:2px solid #e5e7eb}
 .hide{display:none}
 </style></head><body><div class=wrap>
 <h1>Warehouse Picking &amp; Packing</h1>
-<div class=sub>Live contribution from ShipHero <b>+ direct-in-Shopify fulfillments</b>, PTO-aware. Toggle <b>Combined / Items / Orders</b> to cut the clutter.</div>
+<div class=sub>Live contribution from ShipHero <b>+ direct-in-Shopify fulfillments + engraving</b>, PTO-aware. Toggle <b>Combined / Items / Orders</b> to cut the clutter.</div>
 <div class=tabs>
   <div class="tab on" data-tab=dash onclick="tab('dash')">Dashboard</div>
   <div class=tab data-tab=floor onclick="tab('floor')">Floor Time</div>
@@ -202,7 +202,7 @@ tr.tot td{font-weight:700;border-top:2px solid #e5e7eb}
   <div class=note>Showing <b>activity</b> for the selected Unit / Stage / Source. &ldquo;Total&rdquo; sums the shown stages &amp; sources &mdash; an order counts in each stage it touched, so it is workload, <b>not</b> the deduped Orders shipped up top.</div>
   <div class=card style=margin-top:8px>
     <h2>Contribution by person</h2>
-    <div class=sub style=margin:0>Items: Picked&middot;ShipHero + Packed&middot;ShipHero + Packed&middot;Shopify + Replenished&middot;ShipHero (chart shows items) &middot; click a bar for that person.</div>
+    <div class=sub style=margin:0>Items: Picked&middot;ShipHero + Packed&middot;ShipHero + Packed&middot;Shopify + Replenished&middot;ShipHero + Engraving scans (chart) &middot; click a bar for that person.</div>
     <div class=chartwrap><canvas id=chart></canvas></div>
   </div>
   <div class=card style=margin-top:16px>
@@ -215,7 +215,7 @@ tr.tot td{font-weight:700;border-top:2px solid #e5e7eb}
 <div id=floor class=hide>
   <div class=card>
     <h2>Floor Time <span style="color:#9ca3af;font-weight:400">&mdash; when each person was actually active, and their gaps</span></h2>
-    <div class=sub style=margin:0><b>Team-wide.</b> All ShipHero activity &mdash; picking, packing, restocking, receiving, cycle counts &mdash; attributed by user, in Eastern time. (Truly off-scanner work like engraving still won&rsquo;t show.)</div>
+    <div class=sub style=margin:0><b>Team-wide.</b> All ShipHero activity &mdash; picking, packing, restocking, receiving, cycle counts &mdash; plus engraving scans, attributed by user, in Eastern time.</div>
     <div id=floortable></div>
   </div>
 </div>
@@ -225,7 +225,7 @@ tr.tot td{font-weight:700;border-top:2px solid #e5e7eb}
 </div>
 
 <div class=foot>
-  <b>Chart colours:</b> <span class=s-sh>Picked&middot;ShipHero</span>, <span style=color:#16a34a>Packed&middot;ShipHero</span>, <span class=s-shop>Packed&middot;Shopify</span>, <span class=s-repl>Replenished&middot;ShipHero</span>, <span class=s-eng>Engraved</span>. &ldquo;Packed&middot;Shopify&rdquo; = fulfilled by hand in Shopify. &ldquo;Replenished&rdquo; = inventory work (receive/restock/tote&rarr;bin move/count); a parallel track, never added into items/orders totals.
+  <b>Chart colours:</b> <span class=s-sh>Picked&middot;ShipHero</span>, <span style=color:#16a34a>Packed&middot;ShipHero</span>, <span class=s-shop>Packed&middot;Shopify</span>, <span class=s-repl>Replenished&middot;ShipHero</span>, <span class=s-eng>Engraved</span>. &ldquo;Packed&middot;Shopify&rdquo; = fulfilled by hand in Shopify. &ldquo;Replenished&rdquo; = inventory work; &ldquo;Engraved&rdquo; = engraving-station cart scans. Both are parallel tracks, never added into the items/orders totals.
 </div>
 </div>
 <script>
@@ -294,7 +294,7 @@ function drawChart(ppl){const labels=ppl.map(p=>p.person);
     {label:'Packed · ShipHero',backgroundColor:C.pack,data:ppl.map(p=>p.items_packed_sh)},
     {label:'Packed · Shopify',backgroundColor:C.fulfill,data:ppl.map(p=>p.items_packed_shop)},
     {label:'Replenished · ShipHero',backgroundColor:C.repl,data:ppl.map(p=>p.replenished)},
-    {label:'Engraved',backgroundColor:C.engrave,data:ppl.map(p=>p.engraved)}];
+    {label:'Engraving scans',backgroundColor:C.engrave,data:ppl.map(p=>p.engraved)}];
   if(chart)chart.destroy();
   chart=new Chart(document.getElementById('chart'),{type:'bar',data:{labels,datasets:ds},
     options:{responsive:true,maintainAspectRatio:false,scales:{x:{stacked:true,grid:{display:false}},y:{stacked:true,beginAtZero:true}},
@@ -304,7 +304,7 @@ function drawDetail(ppl,unit){
   let h='<table><tr><th onclick="sortBy(\'person\')">Person</th><th>Type</th><th>PTO</th>';
   if(showI)h+='<th onclick="sortBy(\'items_picked_sh\')">Items picked <span class=s>ShipHero</span></th><th onclick="sortBy(\'items_packed_sh\')">Items packed <span class=s>ShipHero</span></th><th onclick="sortBy(\'items_packed_shop\')">Items packed <span class="s o">Shopify</span></th><th onclick="sortBy(\'items_total\')">Items total</th>';
   h+='<th onclick="sortBy(\'replenished\')">Replenished <span class="s p">units</span></th>';
-  h+='<th onclick="sortBy(\'engraved\')">Engraved <span class="s eng">units</span></th>';
+  h+='<th onclick="sortBy(\'engraved\')">Engraving <span class="s eng">scans</span></th>';
   if(showO)h+='<th onclick="sortBy(\'orders_picked_sh\')">Orders picked <span class=s>ShipHero</span></th><th onclick="sortBy(\'orders_packed_sh\')">Orders packed <span class=s>ShipHero</span></th><th onclick="sortBy(\'orders_packed_shop\')">Orders packed <span class="s o">Shopify</span></th>';
   h+='</tr>';
   const arr=ppl.map(p=>({...p,items_total:p.items_picked_sh+p.items_packed_sh+p.items_packed_shop}));
@@ -335,12 +335,12 @@ function drawFloor(){const f=[...DATA.floor].filter(x=>DATA.people.find(p=>p.per
 function drawAnalytics(ppl){const arr=ppl.map(p=>p.items_picked_sh+p.items_packed_sh+p.items_packed_shop).sort((a,b)=>a-b);
   const sum=arr.reduce((a,b)=>a+b,0),mean=arr.length?Math.round(sum/arr.length):0,med=arr.length?arr[Math.floor(arr.length/2)]:0;
   document.getElementById('analytics').innerHTML='<div class=cards>'+card('People','active','s-sel',ppl.length)+card('Mean items','per person','s-sel',mean)+card('Median items','per person','s-sel',med)+card('Total items','activity','s-sel',sum)+'</div>';}
-function copyChat(){const rows=DATA.people.filter(teamFilter).map(p=>p.person+': picked '+p.items_picked_sh+', packed '+(p.items_packed_sh+p.items_packed_shop)+', replenished '+p.replenished);
+function copyChat(){const rows=DATA.people.filter(teamFilter).map(p=>p.person+': picked '+p.items_picked_sh+', packed '+(p.items_packed_sh+p.items_packed_shop)+', replenished '+p.replenished+', engraving '+p.engraved);
   navigator.clipboard.writeText('Warehouse '+DATA.range.from+'\n'+DATA.shipped.total+' orders shipped\n'+rows.join('\n'));document.getElementById('status').textContent='copied!';setTimeout(()=>document.getElementById('status').textContent='',1500);}
 function dl(kind){const ppl=DATA.people.filter(teamFilter);let blob,name;
   if(kind==='json'){blob=new Blob([JSON.stringify(DATA,null,2)],{type:'application/json'});name='warehouse.json';}
-  else{const hdr=['person','type','items_picked_sh','items_packed_sh','items_packed_shopify','replenished','orders_picked_sh','orders_packed_sh','orders_packed_shopify'];
-    const lines=[hdr.join(',')].concat(ppl.map(p=>[p.person,p.type,p.items_picked_sh,p.items_packed_sh,p.items_packed_shop,p.replenished,p.orders_picked_sh,p.orders_packed_sh,p.orders_packed_shop].join(',')));
+  else{const hdr=['person','type','items_picked_sh','items_packed_sh','items_packed_shopify','replenished','engraving_scans','orders_picked_sh','orders_packed_sh','orders_packed_shopify'];
+    const lines=[hdr.join(',')].concat(ppl.map(p=>[p.person,p.type,p.items_picked_sh,p.items_packed_sh,p.items_packed_shop,p.replenished,p.engraved,p.orders_picked_sh,p.orders_packed_sh,p.orders_packed_shop].join(',')));
     blob=new Blob([lines.join('\n')],{type:'text/csv'});name='warehouse.csv';}
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();}
 document.getElementById('from').value=etAgo(7);document.getElementById('to').value=etToday();
