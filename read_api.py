@@ -5,14 +5,23 @@ plus JSON endpoints. Reads pre-aggregated + raw event data; live on every open.
 """
 import os, json
 from flask import Flask, request, jsonify, Response
+from psycopg.rows import tuple_row
 from db import connect
 
 app = Flask(__name__)
 
-# Full-timer / Intern designation (from HR; edit as staffing changes).
+# Full-timer / Intern designation (sourced from the HR employee database:
+# warehouse_operations team = FT, interns team = Intern). Keyed by the name as it
+# appears in ShipHero pick/pack data. Update by re-pulling list_employees.
 PERSON_TYPE = {
+    # warehouse_operations (full-time)
     "Nic Cox":"FT","Halil Gurler":"FT","Kadil Ladson":"FT","Manu Bekele":"FT",
-    "Maurice Williams":"FT","Jeffrey Kwan":"FT","Esra Altug":"Intern","Simay Guner":"Intern",
+    "Maurice Williams":"FT","Jeffrey Kwan":"FT","Shambria Green":"FT","Breton Rice":"FT",
+    # interns
+    "Esra Altug":"Intern","Simay Guner":"Intern","Cindy Lin":"Intern",
+    "Brennen Myrick":"Intern","Lara Nielsen":"Intern","Patrick Robin":"Intern",
+    # seen in data but not on the active roster (likely departed) — shown, unbadged
+    "Broghan Rice":"","Daniella Gross":"","Roland Tilk":"",
 }
 
 @app.after_request
@@ -25,7 +34,7 @@ def _range():
 
 @app.route("/health")
 def health():
-    with connect() as c, c.cursor() as cur:
+    with connect() as c, c.cursor(row_factory=tuple_row) as cur:
         cur.execute("SELECT count(*) FROM event"); n = cur.fetchone()[0]
     return jsonify(status="ok", events=n)
 
@@ -33,7 +42,7 @@ def health():
 def warehouse():
     """Everything the dashboard needs for a date range, in one call."""
     frm, to = _range()
-    with connect() as c, c.cursor() as cur:
+    with connect() as c, c.cursor(row_factory=tuple_row) as cur:
         cur.execute("""
         WITH e AS (SELECT person,stage,subtype,source,order_number,quantity,ts
                    FROM event WHERE et_day(ts) BETWEEN %s AND %s)
@@ -45,11 +54,13 @@ def warehouse():
           COALESCE(sum(quantity) FILTER (WHERE stage='pack' AND source='shopify'),0)              packshop_items,
           count(DISTINCT order_number) FILTER (WHERE stage='pack' AND source='shopify')           packshop_orders,
           COALESCE(sum(quantity) FILTER (WHERE stage='replenish' AND subtype='physical'),0)       repl_units,
+          COALESCE(sum(quantity) FILTER (WHERE stage='engrave'),0)                                 eng_items,
           count(*) FILTER (WHERE stage='pick')                                pick_cnt,
           count(*) FILTER (WHERE stage='pack' AND source='shiphero')          pack_cnt,
           count(*) FILTER (WHERE stage='pack' AND source='shopify')           fulfill_cnt,
           count(*) FILTER (WHERE stage='replenish' AND subtype='physical')    move_cnt,
           count(*) FILTER (WHERE stage='count')                              count_cnt,
+          count(*) FILTER (WHERE stage='engrave')                            eng_cnt,
           min(ts)  FILTER (WHERE is_floor_labor(stage,subtype))              first_ts,
           max(ts)  FILTER (WHERE is_floor_labor(stage,subtype))              last_ts
         FROM e GROUP BY person""", [frm, to])
@@ -74,21 +85,21 @@ def warehouse():
         gaps = {r[0]: r for r in cur.fetchall()}
 
     people, floor = [], []
-    tot = dict(pk_i=0,packsh_i=0,packshop_i=0,pk_o=0,packsh_o=0,packshop_o=0,repl=0)
+    tot = dict(pk_i=0,packsh_i=0,packshop_i=0,pk_o=0,packsh_o=0,packshop_o=0,repl=0,eng=0)
     for r in rows:
-        (person,pk_i,pk_o,psh_i,psh_o,psp_i,psp_o,repl,pick_c,pack_c,ful_c,mov_c,cnt_c,first,last)=r
+        (person,pk_i,pk_o,psh_i,psh_o,psp_i,psp_o,repl,eng_i,pick_c,pack_c,ful_c,mov_c,cnt_c,eng_c,first,last)=r
         people.append(dict(person=person, type=PERSON_TYPE.get(person,""),
             items_picked_sh=pk_i, items_packed_sh=psh_i, items_packed_shop=psp_i,
-            replenished=repl, orders_picked_sh=pk_o, orders_packed_sh=psh_o, orders_packed_shop=psp_o))
+            replenished=repl, engraved=eng_i, orders_picked_sh=pk_o, orders_packed_sh=psh_o, orders_packed_shop=psp_o))
         tot["pk_i"]+=pk_i; tot["packsh_i"]+=psh_i; tot["packshop_i"]+=psp_i
-        tot["pk_o"]+=pk_o; tot["packsh_o"]+=psh_o; tot["packshop_o"]+=psp_o; tot["repl"]+=repl
+        tot["pk_o"]+=pk_o; tot["packsh_o"]+=psh_o; tot["packshop_o"]+=psp_o; tot["repl"]+=repl; tot["eng"]+=eng_i
         g = gaps.get(person)
         floor.append(dict(person=person, first_ts=first.isoformat() if first else None,
             last_ts=last.isoformat() if last else None,
             gap_min=(int(g[1]) if g and g[1] is not None else 0),
             gap_from=(g[2].isoformat() if g and g[2] else None),
             gap_to=(g[3].isoformat() if g and g[3] else None),
-            mix=dict(pick=pick_c, pack=pack_c, fulfill=ful_c, move=mov_c, count=cnt_c)))
+            mix=dict(pick=pick_c, pack=pack_c, fulfill=ful_c, move=mov_c, count=cnt_c, engrave=eng_c)))
     return jsonify(range={"from":frm,"to":to},
         shipped=dict(total=shipped[0], shiphero=shipped[1], shopify_only=shipped[2], both=shipped[3]),
         totals=tot, people=people, floor=floor)
@@ -145,7 +156,7 @@ tr:hover td{background:#fafbfe}
 td.name{font-weight:600;color:#111827}
 .badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:11px;font-weight:600}
 .badge.ft{background:#e0edff;color:#2563eb}.badge.in{background:#ede9fe;color:#7c3aed}
-.o{color:#c2620c}.p{color:#7c3aed;font-weight:600}
+.o{color:#c2620c}.p{color:#7c3aed;font-weight:600}.eng{color:#0d9488;font-weight:600}.s-eng{color:#0d9488}
 tr.tot td{font-weight:700;border-top:2px solid #e5e7eb}
 .red{color:#dc2626;font-weight:600}
 .lunch{background:#fef3c7;color:#92400e;border-radius:20px;padding:1px 7px;font-size:11px;margin-left:6px}
@@ -162,10 +173,10 @@ tr.tot td{font-weight:700;border-top:2px solid #e5e7eb}
   <div class=tab data-tab=an onclick="tab('an')">Analytics</div>
 </div>
 <div class=ctl>
-  <button class="pill on" data-preset=today onclick="preset('today')">Today</button>
+  <button class=pill data-preset=today onclick="preset('today')">Today</button>
   <button class=pill data-preset=yest onclick="preset('yest')">Yesterday</button>
   <button class=pill data-preset=week onclick="preset('week')">This week</button>
-  <button class=pill data-preset=7 onclick="preset('7')">Last 7 days</button>
+  <button class="pill on" data-preset=7 onclick="preset('7')">Last 7 days</button>
   <button class=pill data-preset=30 onclick="preset('30')">Last 30 days</button>
   <input type=date id=from> <span style=color:#9ca3af>to</span> <input type=date id=to>
   <button class=pill onclick="load()">Apply</button><span id=status></span>
@@ -214,11 +225,11 @@ tr.tot td{font-weight:700;border-top:2px solid #e5e7eb}
 </div>
 
 <div class=foot>
-  <b>Chart colours:</b> <span class=s-sh>Picked&middot;ShipHero</span>, <span style=color:#16a34a>Packed&middot;ShipHero</span>, <span class=s-shop>Packed&middot;Shopify</span>, <span class=s-repl>Replenished&middot;ShipHero</span>. &ldquo;Packed&middot;Shopify&rdquo; = fulfilled by hand in Shopify. &ldquo;Replenished&rdquo; = inventory work (receive/restock/tote&rarr;bin move/count); a parallel track, never added into items/orders totals.
+  <b>Chart colours:</b> <span class=s-sh>Picked&middot;ShipHero</span>, <span style=color:#16a34a>Packed&middot;ShipHero</span>, <span class=s-shop>Packed&middot;Shopify</span>, <span class=s-repl>Replenished&middot;ShipHero</span>, <span class=s-eng>Engraved</span>. &ldquo;Packed&middot;Shopify&rdquo; = fulfilled by hand in Shopify. &ldquo;Replenished&rdquo; = inventory work (receive/restock/tote&rarr;bin move/count); a parallel track, never added into items/orders totals.
 </div>
 </div>
 <script>
-const C={pick:'#2563eb',pack:'#16a34a',fulfill:'#f59e0b',repl:'#7c3aed'};
+const C={pick:'#2563eb',pack:'#16a34a',fulfill:'#f59e0b',repl:'#7c3aed',engrave:'#0d9488'};
 let DATA=null, sortKey='items_total', sortDir=-1, chart=null;
 function etToday(){return new Date(Date.now()-4*3600*1000).toISOString().slice(0,10);}
 function etAgo(n){return new Date(Date.now()-4*3600*1000-n*86400000).toISOString().slice(0,10);}
@@ -282,7 +293,8 @@ function drawChart(ppl){const labels=ppl.map(p=>p.person);
     {label:'Picked · ShipHero',backgroundColor:C.pick,data:ppl.map(p=>p.items_picked_sh)},
     {label:'Packed · ShipHero',backgroundColor:C.pack,data:ppl.map(p=>p.items_packed_sh)},
     {label:'Packed · Shopify',backgroundColor:C.fulfill,data:ppl.map(p=>p.items_packed_shop)},
-    {label:'Replenished · ShipHero',backgroundColor:C.repl,data:ppl.map(p=>p.replenished)}];
+    {label:'Replenished · ShipHero',backgroundColor:C.repl,data:ppl.map(p=>p.replenished)},
+    {label:'Engraved',backgroundColor:C.engrave,data:ppl.map(p=>p.engraved)}];
   if(chart)chart.destroy();
   chart=new Chart(document.getElementById('chart'),{type:'bar',data:{labels,datasets:ds},
     options:{responsive:true,maintainAspectRatio:false,scales:{x:{stacked:true,grid:{display:false}},y:{stacked:true,beginAtZero:true}},
@@ -292,20 +304,21 @@ function drawDetail(ppl,unit){
   let h='<table><tr><th onclick="sortBy(\'person\')">Person</th><th>Type</th><th>PTO</th>';
   if(showI)h+='<th onclick="sortBy(\'items_picked_sh\')">Items picked <span class=s>ShipHero</span></th><th onclick="sortBy(\'items_packed_sh\')">Items packed <span class=s>ShipHero</span></th><th onclick="sortBy(\'items_packed_shop\')">Items packed <span class="s o">Shopify</span></th><th onclick="sortBy(\'items_total\')">Items total</th>';
   h+='<th onclick="sortBy(\'replenished\')">Replenished <span class="s p">units</span></th>';
+  h+='<th onclick="sortBy(\'engraved\')">Engraved <span class="s eng">units</span></th>';
   if(showO)h+='<th onclick="sortBy(\'orders_picked_sh\')">Orders picked <span class=s>ShipHero</span></th><th onclick="sortBy(\'orders_packed_sh\')">Orders packed <span class=s>ShipHero</span></th><th onclick="sortBy(\'orders_packed_shop\')">Orders packed <span class="s o">Shopify</span></th>';
   h+='</tr>';
   const arr=ppl.map(p=>({...p,items_total:p.items_picked_sh+p.items_packed_sh+p.items_packed_shop}));
   arr.sort((a,b)=>((a[sortKey]>b[sortKey]?1:-1)*sortDir));
-  const T={pk_i:0,psh:0,psp:0,it:0,rp:0,po:0,pso:0,pspo:0};
-  arr.forEach(p=>{T.pk_i+=p.items_picked_sh;T.psh+=p.items_packed_sh;T.psp+=p.items_packed_shop;T.it+=p.items_total;T.rp+=p.replenished;T.po+=p.orders_picked_sh;T.pso+=p.orders_packed_sh;T.pspo+=p.orders_packed_shop;
+  const T={pk_i:0,psh:0,psp:0,it:0,rp:0,en:0,po:0,pso:0,pspo:0};
+  arr.forEach(p=>{T.pk_i+=p.items_picked_sh;T.psh+=p.items_packed_sh;T.psp+=p.items_packed_shop;T.it+=p.items_total;T.rp+=p.replenished;T.en+=p.engraved;T.po+=p.orders_picked_sh;T.pso+=p.orders_packed_sh;T.pspo+=p.orders_packed_shop;
     h+='<tr><td class=name>'+p.person+'</td><td><span class="badge '+(p.type==='Intern'?'in':'ft')+'">'+(p.type==='Intern'?'Intern':(p.type?'Full-timer':'—'))+'</span></td><td>—</td>';
     if(showI)h+='<td>'+fmt(p.items_picked_sh)+'</td><td>'+fmt(p.items_packed_sh)+'</td><td class=o>'+fmt(p.items_packed_shop)+'</td><td><b>'+fmt(p.items_total)+'</b></td>';
-    h+='<td class=p>'+fmt(p.replenished)+'</td>';
+    h+='<td class=p>'+fmt(p.replenished)+'</td><td class=eng>'+fmt(p.engraved)+'</td>';
     if(showO)h+='<td>'+fmt(p.orders_picked_sh)+'</td><td>'+fmt(p.orders_packed_sh)+'</td><td class=o>'+fmt(p.orders_packed_shop)+'</td>';
     h+='</tr>';});
   h+='<tr class=tot><td>Total</td><td></td><td></td>';
   if(showI)h+='<td>'+fmt(T.pk_i)+'</td><td>'+fmt(T.psh)+'</td><td class=o>'+fmt(T.psp)+'</td><td>'+fmt(T.it)+'</td>';
-  h+='<td class=p>'+fmt(T.rp)+'</td>';
+  h+='<td class=p>'+fmt(T.rp)+'</td><td class=eng>'+fmt(T.en)+'</td>';
   if(showO)h+='<td>'+fmt(T.po)+'</td><td>'+fmt(T.pso)+'</td><td class=o>'+fmt(T.pspo)+'</td>';
   h+='</tr></table>';
   document.getElementById('detail').innerHTML=h;}
@@ -315,7 +328,7 @@ function drawFloor(){const f=[...DATA.floor].filter(x=>DATA.people.find(p=>p.per
   let h='<table><tr><th>Person</th><th>First (ET)</th><th>Last (ET)</th><th>On floor</th><th>Biggest gap (ET)</th><th style=text-align:left>Activity mix</th></tr>';
   f.forEach(r=>{const span=r.first_ts&&r.last_ts?(new Date(r.last_ts)-new Date(r.first_ts))/60000:0;
     const lunch=r.gap_min>=25&&r.gap_min<=90?'<span class=lunch>lunch?</span>':'';
-    const mix=[r.mix.pick?'pick '+r.mix.pick:'',r.mix.pack?'pack '+r.mix.pack:'',r.mix.move?'move '+r.mix.move:'',r.mix.fulfill?'fulfill '+r.mix.fulfill:'',r.mix.count?'count '+r.mix.count:''].filter(Boolean).join(' · ');
+    const mix=[r.mix.pick?'pick '+r.mix.pick:'',r.mix.pack?'pack '+r.mix.pack:'',r.mix.move?'move '+r.mix.move:'',r.mix.fulfill?'fulfill '+r.mix.fulfill:'',r.mix.count?'count '+r.mix.count:'',r.mix.engrave?'engrave '+r.mix.engrave:''].filter(Boolean).join(' · ');
     h+='<tr><td class=name>'+r.person+'</td><td>'+ampm(r.first_ts)+'</td><td>'+ampm(r.last_ts)+'</td><td>~'+fmtmin(Math.round(span))+'</td>'+
       '<td style=text-align:left><span class=red>'+fmtmin(r.gap_min)+'</span> <span style=color:#9ca3af>'+ampm(r.gap_from)+'–'+ampm(r.gap_to)+'</span>'+lunch+'</td><td style=text-align:left>'+mix+'</td></tr>';});
   h+='</table>';document.getElementById('floortable').innerHTML=h;}
@@ -330,7 +343,7 @@ function dl(kind){const ppl=DATA.people.filter(teamFilter);let blob,name;
     const lines=[hdr.join(',')].concat(ppl.map(p=>[p.person,p.type,p.items_picked_sh,p.items_packed_sh,p.items_packed_shop,p.replenished,p.orders_picked_sh,p.orders_packed_sh,p.orders_packed_shop].join(',')));
     blob=new Blob([lines.join('\n')],{type:'text/csv'});name='warehouse.csv';}
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();}
-document.getElementById('from').value=etToday();document.getElementById('to').value=etToday();
+document.getElementById('from').value=etAgo(7);document.getElementById('to').value=etToday();
 load();
 </script></body></html>"""
 
