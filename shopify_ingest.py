@@ -19,17 +19,37 @@ Rule (identical to reference/dashboard.html fetchDirect):
 Each qualifying event becomes a stage='pack', source='shopify' row keyed by
 order+createdAt (idempotent). The read API then dedups orders across sources.
 
-Backfill:  SHOPIFY_ADMIN_TOKEN=... DATABASE_URL=... python shopify_ingest.py 2026-07-01 2026-07-15
+Env: SHOPIFY_SHOP, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET, DATABASE_URL
+Backfill:  python shopify_ingest.py 2026-07-01 2026-07-15
 Live cron: python shopify_ingest.py                 (defaults: last 3 days ET -> now)
 """
-import os, sys, re, json, time, html, urllib.request, urllib.error, datetime as dt
+import os, sys, re, json, time, html, urllib.request, urllib.error, urllib.parse, datetime as dt
 from db import connect
 
-SHOP  = os.environ.get("SHOPIFY_SHOP", "ikigai-cases.myshopify.com")
-TOKEN = os.environ.get("SHOPIFY_ADMIN_TOKEN", "")
-APIV  = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
-URL   = f"https://{SHOP}/admin/api/{APIV}/graphql.json"
+# Auth (2026 model): legacy custom-app shpat_ tokens are gone. A Dev Dashboard app
+# gives a Client ID + Client Secret, which we exchange for a short-lived (24h) token
+# via the client-credentials grant on every run. Works because the app + store are in
+# the same Shopify org. Docs: shopify.dev/docs/apps/build/dev-dashboard/get-api-access-tokens
+SHOP   = os.environ.get("SHOPIFY_SHOP", "ikigai-cases.myshopify.com")
+CLIENT_ID     = os.environ.get("SHOPIFY_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
+APIV   = os.environ.get("SHOPIFY_API_VERSION", "2025-01")
+URL    = f"https://{SHOP}/admin/api/{APIV}/graphql.json"
+TOKEN_URL = f"https://{SHOP}/admin/oauth/access_token"
 PAGE_SLEEP = float(os.environ.get("SHOPIFY_PAGE_SLEEP", "0.4"))
+
+_TOKEN = {"val": None}
+def get_token():
+    if _TOKEN["val"]:
+        return _TOKEN["val"]
+    body = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET}).encode()
+    req = urllib.request.Request(TOKEN_URL, data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        _TOKEN["val"] = json.loads(r.read())["access_token"]
+    return _TOKEN["val"]
 
 # --- Name reconciliation: Shopify staff names differ from ShipHero/DB names ---
 # The DB's canonical person names come from ShipHero (e.g. "Nic Cox", "Manu Bekele").
@@ -75,7 +95,7 @@ def _post(body, tries=6):
     data = json.dumps(body).encode()
     for attempt in range(tries):
         req = urllib.request.Request(URL, data=data, headers={
-            "Content-Type": "application/json", "X-Shopify-Access-Token": TOKEN})
+            "Content-Type": "application/json", "X-Shopify-Access-Token": get_token()})
         try:
             with urllib.request.urlopen(req, timeout=90) as r:
                 return json.loads(r.read())
@@ -143,8 +163,8 @@ INS = ("INSERT INTO event (ts,person,stage,station,action,order_number,sku,quant
        "'hand_fulfillment','shopify',%s,%s) ON CONFLICT (dedup_key) DO NOTHING")
 
 def run(df, dt_):
-    if not TOKEN:
-        raise SystemExit("SHOPIFY_ADMIN_TOKEN not set")
+    if not (CLIENT_ID and CLIENT_SECRET):
+        raise SystemExit("SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET not set")
     start = _ms(df + "T00:00:00Z")
     end   = _ms(dt_ + "T23:59:59Z")
     qrange = f"updated_at:>={df}T00:00:00Z updated_at:<={dt_}T23:59:59Z"
