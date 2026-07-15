@@ -267,6 +267,14 @@ th:hover{color:var(--ink-2)}
 th .s{color:#b8c0cc;font-weight:500;text-transform:none;letter-spacing:0}
 tr:hover td{background:#f8fafc}
 td.name{font-weight:600;color:var(--ink)}
+.tablewrap{overflow-x:auto;overflow-y:hidden}
+.tablewrap>table{margin-top:6px}
+.tablewrap td:first-child,.tablewrap th:first-child{position:sticky;left:0;z-index:2;background:var(--surface);box-shadow:1px 0 0 var(--line-2)}
+.tablewrap tr:hover td:first-child{background:#f8fafc}
+.tablewrap tr.tot td:first-child{background:#fcfcfd}
+.tablewrap::-webkit-scrollbar{height:8px}
+.tablewrap::-webkit-scrollbar-thumb{background:#d7dbe2;border-radius:8px}
+.tablewrap::-webkit-scrollbar-track{background:transparent}
 .badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:10.5px;font-weight:600}
 .badge.ft{background:var(--accent-weak);color:var(--accent)}.badge.in{background:#f3f0ff;color:var(--violet)}
 .o{color:var(--amber)}.p{color:var(--violet);font-weight:600}.eng{color:var(--teal);font-weight:600}
@@ -511,7 +519,7 @@ function drawDetail(ppl,unit,v){
   if(v.repl)h+='<td class=p>'+fmt(Tt.replenished||0)+'</td>';
   ocols.forEach(c=>h+='<td>'+fmt(Tt[c[0]]||0)+'</td>');
   h+='</tr></table>';
-  document.getElementById('detail').innerHTML=h;
+  document.getElementById('detail').innerHTML='<div class=tablewrap>'+h+'</div>';
 }
 function sortBy(k){if(sortKey===k)sortDir*=-1;else{sortKey=k;sortDir=-1;}render();}
 function drawFloor(){const f=[...DATA.floor].filter(x=>DATA.people.find(p=>p.person===x.person&&teamFilter(p)));
@@ -522,7 +530,7 @@ function drawFloor(){const f=[...DATA.floor].filter(x=>DATA.people.find(p=>p.per
     const mix=[r.mix.pick?'pick '+r.mix.pick:'',r.mix.pack?'pack '+r.mix.pack:'',r.mix.move?'replenish '+r.mix.move:'',r.mix.fulfill?'shopify '+r.mix.fulfill:'',r.mix.engrave?'engrave '+r.mix.engrave:''].filter(Boolean).join(' · ');
     h+='<tr><td class=name>'+r.person+'</td><td>'+ampm(r.first_ts)+'</td><td>'+ampm(r.last_ts)+'</td><td>~'+fmtmin(Math.round(span))+'</td>'+
       '<td style=text-align:left><span class=red>'+fmtmin(r.gap_min)+'</span> <span style=color:#9ca3af>'+ampm(r.gap_from)+'–'+ampm(r.gap_to)+'</span>'+lunch+'</td><td style=text-align:left>'+mix+'</td></tr>';});
-  h+='</table>';document.getElementById('floortable').innerHTML=h;}
+  h+='</table>';document.getElementById('floortable').innerHTML='<div class=tablewrap>'+h+'</div>';}
 function drawAnalytics(ppl,v){const arr=ppl.map(p=>fulItems(p,v)).sort((a,b)=>a-b);
   const sum=arr.reduce((a,b)=>a+b,0),mean=arr.length?Math.round(sum/arr.length):0,med=arr.length?arr[Math.floor(arr.length/2)]:0;
   document.getElementById('analytics').innerHTML='<div class=cards>'+card('People','active','s-sel',ppl.length)+card('Mean items','fulfillment','s-sel',mean)+card('Median items','fulfillment','s-sel',med)+card('Total items','fulfillment','s-sel',sum)+card('Replenished','separate','s-repl',ppl.reduce((a,p)=>a+(v.repl?p.replenished:0),0))+'</div>';}
@@ -584,7 +592,7 @@ function renderSpeed(){
   // ---- assignment matrix ----
   const all=new Set();SP_STAGES.forEach(s=>(S[s]||[]).forEach(r=>all.add(r.person)));
   const order=[...all].sort((a,b)=>spActiveMin(S,b)-spActiveMin(S,a));
-  let x='<table class=matrix><tr><th style=text-align:left>Person</th><th>Type</th>'+SP_STAGES.map(s=>'<th>'+cap(s)+'</th>').join('')+'<th>Best fit</th><th>Active hrs<span class=s> tracked</span></th></tr>';
+  let x='<div class=tablewrap><table class=matrix><tr><th style=text-align:left>Person</th><th>Type</th>'+SP_STAGES.map(s=>'<th>'+cap(s)+'</th>').join('')+'<th>Best fit</th><th>Active hrs<span class=s> tracked</span></th></tr>';
   order.forEach(person=>{
     const pr=pct[person]||{};let best=null;SP_STAGES.forEach(s=>{if(pr[s]&&(!best||pr[s].p>pr[best].p))best=s;});
     const ty=spType(S,person);
@@ -597,7 +605,7 @@ function renderSpeed(){
     x+='<td>'+(best?'<span class=pill2 style="background:#dcfce7;color:#166534">'+cap(best)+'</span>':'<span class=ins>—</span>')+'</td>';
     x+='<td>'+(spActiveMin(S,person)/60).toFixed(1)+'</td></tr>';
   });
-  x+='</table>';
+  x+='</table></div>';
   x+='<div class=sub style=margin-top:8px><b>Active hrs (tracked)</b> = time between scans, breaks removed — a floor, not a full timesheet (off-scanner work isn&rsquo;t counted).</div>';
   document.getElementById('speed_matrix').innerHTML=x;
 }
