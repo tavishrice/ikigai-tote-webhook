@@ -123,15 +123,21 @@ INV_REASONS = ("transfer", "receiv", "restock", "replenish", "putaway",
                "cycle count", "adjust", "return")
 
 def inv_kind(reason, delta, cycle):
-    """Return the inventory-work kind, or None to DROP. Picks/shipments and any
-    reason outside the tracked families (e.g. CSV initial-stock loads) are dropped."""
+    """Return the inventory-work kind, or None to DROP. Dropped: picks/shipments
+    (fulfillment) and CSV bulk uploads (administrative data-entry, NOT floor labor
+    -- these were inflating a data-entry person to #1). MOVE is checked BEFORE
+    receive so an "Inventory transfer of N from bin Receiving to <pick bin>" is a
+    replenishment move, not a PO receive (the source bin is just named 'Receiving').
+    'receive' = genuine PO receiving; the caller books it to a separate stage that
+    the dashboard does not show."""
     r = (reason or "").lower()
     if "picked into" in r or "pick type:" in r or "shipped" in r: return None   # fulfillment
+    if "csv" in r:                                             return None   # bulk data-entry, not labor
     if not any(k in r for k in INV_REASONS):                   return None   # not tracked inv labor
     if cycle or "cycle count" in r:                            return "count"
-    if re.search(r"receiv|purchase order|\bpo\b|vendor", r):   return "receive"
+    if re.search(r"moved|move to|transfer|relocat", r):        return "move"       # before receive (bin name)
+    if re.search(r"received from|purchase order|\bpo\b|vendor", r): return "receive"
     if re.search(r"return|rma|exchange", r):                   return "return"
-    if re.search(r"moved|move to|transfer|relocat", r):        return "move"
     if re.search(r"replenish|restock|put ?away|added|created", r): return "restock"
     return "restock" if (delta or 0) > 0 else "adjust"          # catch-all within a matched family
 
@@ -204,11 +210,15 @@ def run(df, dt_):
     for (ts, uid, kind, sku, qty, reason, eid) in inv_all:
         person = id2name.get(uid) or (f"User-{uid}" if uid else "Unknown")
         if uid and uid not in id2name: unknown.add(uid)
+        # PO receiving is its own category, kept in the DB but NOT part of the
+        # dashboard's "Replenished" metric; everything else is replenishment.
+        stg = "receive" if kind == "receive" else "replenish"
         raw = json.dumps({"reason": reason, "kind": kind})
-        inv_rows.append((ts, person, "replenish", kind, None, sku, qty, kind, eid, "shiphero|"+eid, raw))
+        inv_rows.append((ts, person, stg, kind, None, sku, qty, kind, eid, "shiphero|"+eid, raw))
     with connect() as c, c.cursor() as cur:
         if inv_rows:
             cur.executemany(INS, inv_rows)
+        # re-credit any older User-<id> rows now that id2name is complete
         fix_historical(cur, id2name)
         for d in sorted(inv_days):
             _refresh_day(cur, d)
