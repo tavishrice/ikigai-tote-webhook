@@ -12,7 +12,7 @@ CORRECTED 2026-07-15 (frontend presentation):
     actually filter the chart AND the detail table (previously only the summary line).
   - /warehouse now returns engraved ITEMS (sum quantity) per person, not just a tote count.
 """
-import os, json
+import os, json, datetime as dt
 from flask import Flask, request, jsonify, Response
 from psycopg.rows import tuple_row
 from db import connect
@@ -197,6 +197,92 @@ def speed():
              gate=SPEED_GATE, unit=SPEED_UNIT, source=SPEED_SRC, rate=SPEED_RATE)
     return jsonify(range={"from":frm,"to":to}, config=cfg, stages=rows_by_stage)
 
+# ---------------- Watch List (metric-based flags) ----------------
+# A single metric always lies: pace ignores whether you showed up; hours ignore whether you worked.
+# So this looks at pace + hours + UTILIZATION (active/floor) + output + attendance + consistency together,
+# and raises specific, evidence-bearing flags. It is a lead, not a verdict (a low number can be legit —
+# e.g. waiting on restock). Scan-only for now; scheduled-shift adherence is a planned add-on.
+WATCH_IDLE = 900   # gap (s) beyond which floor time is idle, for the active-time part
+# Standard: everyone is expected to work 50h/week = 10h/day x 5 days (can be split up).
+WATCH = {"util_low":50, "min_floor_hr":6, "target_day_hr":10, "target_days_wk":5, "short_day_hr":7,
+         "pace_hi_pct":67, "out_lo_pct":33, "out_bottom_pct":25, "incon_ratio":2.5}
+# Engravers are shown in a SEPARATE, un-flagged group for now: engraving time isn't cleanly tracked,
+# so their utilization / hours / output read artificially low and shouldn't be flagged yet.
+WATCH_ENGRAVERS = {"Manu Bekele","Maurice Williams","Halil Gurler"}
+
+@app.route("/watch")
+def watch():
+    frm, to = _range()
+    try:
+        wdays=(dt.date.fromisoformat(to)-dt.date.fromisoformat(frm)).days+1
+    except Exception:
+        wdays=7
+    exp_days=max(1, round(wdays*WATCH["target_days_wk"]/7.0))       # expected work-days in this window
+    exp_hours=WATCH["target_day_hr"]*exp_days                       # expected floor hours in this window
+    with connect() as c, c.cursor(row_factory=tuple_row) as cur:
+        cur.execute("""
+        WITH ev AS (
+          SELECT person, ts, quantity, stage,
+            EXTRACT(epoch FROM (ts - lag(ts) OVER (PARTITION BY person,
+                  (ts AT TIME ZONE 'America/New_York')::date ORDER BY ts))) gap
+          FROM event
+          WHERE ((source='shiphero' AND stage IN ('pick','pack','replenish'))
+                 OR (source='logger' AND stage='engrave'))
+            AND et_day(ts) BETWEEN %s AND %s),
+        perday AS (
+          SELECT person, (ts AT TIME ZONE 'America/New_York')::date d,
+            EXTRACT(epoch FROM (max(ts)-min(ts))) span_sec,
+            sum(CASE WHEN gap>0 AND gap<=%s THEN gap ELSE 0 END) active_sec,
+            sum(CASE WHEN stage IN ('pick','pack','engrave') THEN quantity ELSE 0 END) outp
+          FROM ev GROUP BY person,(ts AT TIME ZONE 'America/New_York')::date)
+        SELECT person, count(*) days, sum(span_sec) span_sec, sum(active_sec) active_sec,
+          sum(outp) output, percentile_cont(0.5) WITHIN GROUP (ORDER BY outp) med_day, max(outp) best_day
+        FROM perday GROUP BY person""", [frm, to, WATCH_IDLE])
+        rows = cur.fetchall()
+    ppl = []
+    for (person,days,span,active,output,med,best) in rows:
+        span=float(span or 0); active=float(active or 0); output=int(output or 0); days=int(days)
+        ppl.append(dict(person=person, type=PERSON_TYPE.get(person,""), days=days,
+            floor_hr=round(span/3600,1), active_hr=round(active/3600,1),
+            util=(round(100*active/span) if span>0 else 0),
+            avg_span=(round(span/days/3600,1) if days else 0),
+            output=output, pace=(round(output/(active/3600)) if active>0 else 0),
+            med_day=round(float(med or 0)), best_day=round(float(best or 0))))
+    cohort=[p for p in ppl if p["person"] not in WATCH_ENGRAVERS and p["days"]>=2 and p["active_hr"]>=1]
+    def pct(vals,v):
+        s=sorted(vals)
+        if len(s)<=1: return 100
+        return round(100*sum(1 for x in s if x<v)/(len(s)-1))
+    paces=[p["pace"] for p in cohort]; outs=[p["output"] for p in cohort]
+    for p in ppl:
+        eng = p["person"] in WATCH_ENGRAVERS
+        inc = p in cohort
+        p["engraver"]=eng; p["cohort"]=inc
+        p["pace_pct"]=pct(paces,p["pace"]) if inc else None
+        p["out_pct"]=pct(outs,p["output"]) if inc else None
+        f=[]
+        if not eng:   # engravers exempt for now (engraving time not cleanly tracked)
+            if p["floor_hr"]>=WATCH["min_floor_hr"] and p["util"]<WATCH["util_low"]:
+                f.append(dict(t="Bursty / idle", d=f"on floor {p['floor_hr']}h but active only {p['active_hr']}h ({p['util']}%)", sev="r"))
+            if p["floor_hr"] < 0.7*exp_hours and (p["days"]>=2 or exp_days<=2):
+                f.append(dict(t="Under hours", d=f"~{p['floor_hr']}h on floor vs ~{exp_hours}h target (50h/wk) — verify vs PTO", sev="r"))
+            if p["days"]>=2 and p["avg_span"]<WATCH["short_day_hr"]:
+                f.append(dict(t="Short shifts", d=f"averages {p['avg_span']}h/day vs 10h target", sev="r"))
+            if exp_days>=3 and p["days"] < exp_days-1:
+                f.append(dict(t="Missed days", d=f"present {p['days']} of ~{exp_days} expected days — check PTO app", sev="r"))
+            if inc and p["out_pct"]<=WATCH["out_bottom_pct"] and p["floor_hr"]>=WATCH["min_floor_hr"]:
+                f.append(dict(t="Low output", d=f"{p['output']} items — bottom {WATCH['out_bottom_pct']}% despite {p['floor_hr']}h on floor", sev="r"))
+            if inc and p["pace_pct"]>=WATCH["pace_hi_pct"] and p["out_pct"]<=WATCH["out_lo_pct"]:
+                f.append(dict(t="Fast but low total", d=f"top-tier pace but low total output ({p['output']})", sev="a"))
+            if p["days"]>=3 and p["med_day"]>0 and p["best_day"]>=WATCH["incon_ratio"]*p["med_day"]:
+                f.append(dict(t="Inconsistent", d=f"best day {p['best_day']} vs typical {p['med_day']}/day", sev="a"))
+        p["flags"]=f
+    hard=lambda p:sum(1 for x in p["flags"] if x["sev"]=="r")
+    ppl.sort(key=lambda p:(0 if p["flags"] else 1, -hard(p), -len(p["flags"]), p["util"]))
+    return jsonify(range={"from":frm,"to":to},
+        config=dict(idle_min=WATCH_IDLE//60, exp_days=exp_days, exp_hours=exp_hours,
+                    engravers=sorted(WATCH_ENGRAVERS), **WATCH), people=ppl)
+
 @app.route("/")
 def dashboard():
     return Response(DASHBOARD_HTML, mimetype="text/html")
@@ -296,6 +382,11 @@ tr.tot td{font-weight:700;color:var(--ink);border-top:1.5px solid var(--line);ba
 .spbar>i{display:block;height:5px;border-radius:4px}
 .best{background:#f0fdf4;outline:1.5px solid #86efac;border-radius:8px}
 .ins{color:var(--muted)}
+.wchip{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10.5px;font-weight:600;margin:2px 4px 2px 0;white-space:nowrap;cursor:default}
+.wchip.r{background:#fef2f2;color:#b91c1c}
+.wchip.a{background:#fffbeb;color:#b45309}
+.wok{color:var(--green);font-weight:600;font-size:12px}
+.ured{color:var(--red);font-weight:700}.uamb{color:var(--amber);font-weight:700}.ugrn{color:var(--green);font-weight:700}
 @media(max-width:1100px){.cards{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:900px){.spgrid{grid-template-columns:1fr}.wrap{padding:20px 16px 80px}}
 </style></head><body><div class=wrap>
@@ -306,6 +397,7 @@ tr.tot td{font-weight:700;color:var(--ink);border-top:1.5px solid var(--line);ba
   <div class=tab data-tab=floor onclick="tab('floor')">Floor Time</div>
   <div class=tab data-tab=an onclick="tab('an')">Analytics</div>
   <div class=tab data-tab=speed onclick="tab('speed')">Speed &amp; Rankings</div>
+  <div class=tab data-tab=watch onclick="tab('watch')">Watch List</div>
 </div>
 <div class=ctl>
   <button class=pill data-preset=today onclick="preset('today')">Today</button>
@@ -373,6 +465,8 @@ tr.tot td{font-weight:700;color:var(--ink);border-top:1.5px solid var(--line);ba
   </div>
 </div>
 
+<div id=watch class=hide><div id=watch_body></div></div>
+
 <div class=foot>
   <b>Chart colours:</b> <span class=s-sh>Picked&middot;ShipHero</span>, <span style=color:#16a34a>Packed&middot;ShipHero</span>, <span class=s-shop>Packed&middot;Shopify</span>, <span class=s-eng>Engraved</span> &mdash; these four stack into the <b>Fulfillment</b> bar. <span class=s-repl>Replenished</span> is drawn as its own separate bar (a parallel track, never added into the fulfillment/items total).
 </div>
@@ -386,9 +480,9 @@ function etAgo(n){return new Date(Date.now()-4*3600*1000-n*86400000).toISOString
 function segval(id){return document.querySelector('#'+id+' button.on').dataset.v;}
 function seg(id,v){document.querySelectorAll('#'+id+' button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));render();}
 document.querySelectorAll('.seg').forEach(s=>s.addEventListener('click',e=>{if(e.target.dataset.v){seg(s.id,e.target.dataset.v);}}));
-function tab(t){['dash','floor','an','speed'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
+function tab(t){['dash','floor','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
   document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('on',el.dataset.tab===t));
-  if(t==='speed')loadSpeed();}
+  if(t==='speed')loadSpeed();if(t==='watch')loadWatch();}
 function preset(p){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.toggle('on',b.dataset.preset===p));
   let f=etToday(),t=etToday();
   if(p==='yest'){f=t=etAgo(1);}else if(p==='7'){f=etAgo(6);}else if(p==='30'){f=etAgo(29);}
@@ -400,6 +494,7 @@ async function load(){document.getElementById('status').textContent='loading…'
   try{DATA=await getj('/warehouse?from='+document.getElementById('from').value+'&to='+document.getElementById('to').value);
   document.getElementById('status').textContent='';render();
   if(!document.getElementById('speed').classList.contains('hide')){speedKey=null;loadSpeed();}
+  if(!document.getElementById('watch').classList.contains('hide')){watchKey=null;loadWatch();}
   }catch(e){document.getElementById('status').textContent='could not reach API';}}
 function fmt(n){return (n||0).toLocaleString();}
 function fmtmin(m){if(m==null)return '—';const h=Math.floor(m/60),x=Math.round(m%60);return h?h+'h '+x+'m':x+'m';}
@@ -608,6 +703,40 @@ function renderSpeed(){
   x+='</table></div>';
   x+='<div class=sub style=margin-top:8px><b>Active hrs (tracked)</b> = time between scans, breaks removed — a floor, not a full timesheet (off-scanner work isn&rsquo;t counted).</div>';
   document.getElementById('speed_matrix').innerHTML=x;
+}
+// ---------------- Watch List tab ----------------
+let WATCH=null, watchKey=null;
+async function loadWatch(){
+  const f=document.getElementById('from').value,t=document.getElementById('to').value,k=f+'|'+t;
+  if(WATCH&&watchKey===k){renderWatch();return;}
+  document.getElementById('watch_body').innerHTML='<div class=sub>loading…</div>';
+  try{WATCH=await getj('/watch?from='+f+'&to='+t);watchKey=k;renderWatch();}
+  catch(e){document.getElementById('watch_body').innerHTML='<div class=sub>could not load watch data</div>';}
+}
+function utilCls(u){return u<50?'ured':(u<65?'uamb':'ugrn');}
+function esc(s){return (''+s).replace(/"/g,'&quot;');}
+function renderWatch(){
+  if(!WATCH)return;const c=WATCH.config,P=WATCH.people;
+  const eng=P.filter(p=>p.engraver), main=P.filter(p=>!p.engraver&&(p.cohort||p.flags.length)), insuff=P.filter(p=>!p.engraver&&!p.cohort&&!p.flags.length);
+  let h='<div class=mbox><h3>How to read this — leads, not verdicts</h3>';
+  h+='A single metric always lies: fast pace hides that someone barely showed up; long hours hide that they were idle. This weighs <b>pace + hours + utilization + output + attendance</b> together and flags specific patterns with the evidence. A flag is a place to <b>look</b>, not a verdict — a low number can be legit (e.g. waiting on restock). Investigate anyone flagged with the activity-audit / performance-review tools.<br>';
+  h+='<b>Standard:</b> 50h/week = 10h/day × 5 days. This window&rsquo;s target: ~<b>'+c.exp_days+' work-days / '+c.exp_hours+'h</b>. <b>Utilization</b> = active scan time ÷ time on floor.<br>';
+  h+='<b>Flags:</b> Bursty/idle (util &lt;'+c.util_low+'%) · Under hours (&lt;70% of target) · Short shifts (avg &lt;'+c.short_day_hr+'h/day) · Missed days (check the <b>PTO app</b>) · Low output (bottom '+c.out_bottom_pct+'%) · Fast-but-low-total · Inconsistent.<br>';
+  h+='<b>Presence</b> comes from scan timestamps (a lower bound on real clock time) and does not yet cross-check the PTO app or scheduled shifts — so verify hours/attendance flags there. <b>Engravers ('+c.engravers.join(', ')+')</b> are shown separately and un-flagged for now, since engraving time isn&rsquo;t cleanly tracked.</div>';
+  h+='<div class=card><h2>Flags &amp; profiles</h2><div class=sub style=margin:0>Most-flagged first. Hover a chip for the evidence. Util is coloured (red &lt;50%, amber 50–65%, green &gt;65%).</div>';
+  h+='<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th>Type</th><th>Output</th><th>Pace<span class=s> /act-hr</span></th><th>Active h</th><th>Floor h</th><th>Util</th><th>Days</th><th>Avg/day</th><th style=text-align:left>Flags</th></tr>';
+  main.forEach(p=>{
+    h+='<tr><td class=name>'+p.person+'</td><td><span class="badge '+(p.type==='Intern'?'in':'ft')+'">'+(p.type==='Intern'?'Intern':(p.type?'FT':'—'))+'</span></td>';
+    h+='<td>'+fmt(p.output)+'</td><td>'+fmt(p.pace)+'</td><td>'+p.active_hr+'</td><td>'+p.floor_hr+'</td><td class='+utilCls(p.util)+'>'+p.util+'%</td><td>'+p.days+'</td><td>'+p.avg_span+'h</td>';
+    h+='<td style=text-align:left>'+(p.flags.length?p.flags.map(x=>'<span class="wchip '+x.sev+'" title="'+esc(x.d)+'">'+x.t+'</span>').join(''):'<span class=wok>✓ clear</span>')+'</td></tr>';
+  });
+  h+='</table></div></div>';
+  if(eng.length){h+='<div class=card style=margin-top:16px><h2>Engravers <span style="color:#94a3b8;font-weight:400">— separate; engraving time not fully tracked, not flagged yet</span></h2>';
+    h+='<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th>Output</th><th>Pace</th><th>Active h</th><th>Floor h</th><th>Util</th><th>Days</th></tr>';
+    eng.forEach(p=>{h+='<tr><td class=name>'+p.person+'</td><td>'+fmt(p.output)+'</td><td>'+fmt(p.pace)+'</td><td>'+p.active_hr+'</td><td>'+p.floor_hr+'</td><td>'+p.util+'%</td><td>'+p.days+'</td></tr>';});
+    h+='</table></div></div>';}
+  if(insuff.length)h+='<div class=note style=margin-top:14px><b>Not enough data to assess:</b> '+insuff.map(p=>p.person+' <span class=ins>('+p.days+' day'+(p.days===1?'':'s')+')</span>').join(', ')+'</div>';
+  document.getElementById('watch_body').innerHTML=h;
 }
 document.getElementById('from').value=etAgo(7);document.getElementById('to').value=etToday();
 load();
