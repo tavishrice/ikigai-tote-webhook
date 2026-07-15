@@ -206,7 +206,7 @@ tr.tot td{font-weight:700;border-top:2px solid #e5e7eb}
   <div class=note>Cards + chart + table all follow the Unit / Stage / Source toggles. <b>Fulfillment items total = Picked + Packed + Engraved</b> for the selected filters. Replenishment is a separate track and is never added into that total.</div>
   <div class=card style=margin-top:8px>
     <h2>Contribution by person</h2>
-    <div class=sub style=margin:0>Left bar = <b>Fulfillment</b> (Picked&middot;ShipHero + Packed&middot;ShipHero + Packed&middot;Shopify + Engraved) &mdash; its height is the Items total. Right bar = <b>Replenished</b> (separate track). Click a bar for that person.</div>
+    <div class=sub style=margin:0>Left bar = <b>Fulfillment</b> (Picked + Packed + Engraved) &mdash; its height is the total for the selected <b>Unit</b>, sorted most&rarr;least. Right bar = <b>Replenished</b> (separate track, Items view only; Orders has no engraving/replenishment). Click a bar for that person.</div>
     <div class=chartwrap><canvas id=chart></canvas></div>
   </div>
   <div class=card style=margin-top:16px>
@@ -300,20 +300,36 @@ function render(){if(!DATA)return;
 }
 function card(k,s,cls,val){return '<div class="card stat"><div class=k>'+k+' <span class="s '+cls+'">'+s+'</span></div><div class=v>'+fmt(val)+'</div></div>';}
 function drawChart(ppl,v){
-  const arr=[...ppl].sort((a,b)=>fulItems(b,v)-fulItems(a,v));
+  const ord=segval('unit')==='orders';            // chart follows the Items/Orders toggle
+  // per-component value, honoring Stage/Source toggles AND the Items/Orders unit.
+  // Orders has no notion of engraving or replenishment, so those drop out in orders mode.
+  const val=(p,c)=>{
+    if(ord){ if(c==='pick')return v.pick?p.orders_picked_sh:0;
+             if(c==='packsh')return v.packsh?p.orders_packed_sh:0;
+             if(c==='packshop')return v.packshop?p.orders_packed_shop:0; return 0; }
+    if(c==='pick')return v.pick?p.items_picked_sh:0;
+    if(c==='packsh')return v.packsh?p.items_packed_sh:0;
+    if(c==='packshop')return v.packshop?p.items_packed_shop:0;
+    if(c==='eng')return v.eng?p.engraved_items:0;
+    if(c==='repl')return v.repl?p.replenished:0; return 0; };
+  const ftot=p=>val(p,'pick')+val(p,'packsh')+val(p,'packshop')+(ord?0:val(p,'eng'));
+  const arr=[...ppl].sort((a,b)=>ftot(b)-ftot(a));  // most -> least, left -> right
   const labels=arr.map(p=>p.person);
   const ds=[
-    {label:'Picked · ShipHero',stack:'ful',backgroundColor:C.pick,data:arr.map(p=>v.pick?p.items_picked_sh:0)},
-    {label:'Packed · ShipHero',stack:'ful',backgroundColor:C.pack,data:arr.map(p=>v.packsh?p.items_packed_sh:0)},
-    {label:'Packed · Shopify',stack:'ful',backgroundColor:C.fulfill,data:arr.map(p=>v.packshop?p.items_packed_shop:0)},
-    {label:'Engraved',stack:'ful',backgroundColor:C.engrave,data:arr.map(p=>v.eng?p.engraved_items:0)},
-    {label:'Replenished (separate track)',stack:'repl',backgroundColor:C.repl,data:arr.map(p=>v.repl?p.replenished:0)}];
+    {label:'Picked · ShipHero',stack:'ful',backgroundColor:C.pick,data:arr.map(p=>val(p,'pick'))},
+    {label:'Packed · ShipHero',stack:'ful',backgroundColor:C.pack,data:arr.map(p=>val(p,'packsh'))},
+    {label:'Packed · Shopify',stack:'ful',backgroundColor:C.fulfill,data:arr.map(p=>val(p,'packshop'))}];
+  if(!ord){
+    ds.push({label:'Engraved',stack:'ful',backgroundColor:C.engrave,data:arr.map(p=>val(p,'eng'))});
+    ds.push({label:'Replenished (separate track)',stack:'repl',backgroundColor:C.repl,data:arr.map(p=>val(p,'repl'))});
+  }
+  const ulbl=ord?'orders':'items';
   if(chart)chart.destroy();
   chart=new Chart(document.getElementById('chart'),{type:'bar',data:{labels,datasets:ds},
     options:{responsive:true,maintainAspectRatio:false,
       scales:{x:{stacked:true,grid:{display:false}},y:{stacked:true,beginAtZero:true}},
       plugins:{legend:{position:'bottom'},tooltip:{callbacks:{footer:(items)=>{
-        let f=0;items.forEach(i=>{if(i.dataset.stack==='ful')f+=i.parsed.y;});return f?'Fulfillment items: '+f:'';}}}}}});
+        let f=0;items.forEach(i=>{if(i.dataset.stack==='ful')f+=i.parsed.y;});return f?'Fulfillment '+ulbl+': '+f:'';}}}}}});
 }
 function drawDetail(ppl,unit,v){
   const showI=unit!=='orders',showO=unit!=='items';
