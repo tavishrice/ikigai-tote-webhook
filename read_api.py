@@ -108,6 +108,95 @@ def warehouse():
         shipped=dict(total=shipped[0], shiphero=shipped[1], shopify_only=shipped[2], both=shipped[3]),
         totals=tot, people=people, floor=floor)
 
+# ---------------- Speed & Rankings ----------------
+# How fast each person works at each activity, so the right people get assigned to the right task.
+# Method (all params visible on the page): sort each person's scans for a stage in time; the gap to the
+# next scan is the time to do that unit of work. A gap LONGER than the stage's BREAK threshold means they
+# stopped (lunch / switched task / stepped away) and is dropped from active time — so absence never looks
+# like slowness, but many small gaps (genuine slowness) do count. Near-simultaneous scans (<=5s apart) are
+# collapsed into one "chunk" first, which fixes replenishment (bulk pallet scans stamped at the same second).
+# Break thresholds are set just above each task's normal per-item time, from that task's own gap distribution.
+SPEED_IDLE = {"pick":300, "pack":1200, "engrave":600, "replenish":600}   # seconds; gap beyond = a break
+SPEED_SRC  = {"pick":"shiphero","pack":"shiphero","replenish":"shiphero","engrave":"logger"}
+SPEED_BURST = 5          # scans within this many seconds = one physical action (chunk)
+SPEED_GATE = {"min_intervals":30, "min_days":2, "min_active_min":15}  # ranked only if all three met
+SPEED_UNIT = {"pick":"items","pack":"items","engrave":"totes","replenish":"boxes"}
+# Rate mode: "units" = units per active hour (pick/pack/engrave). "moves" = discrete actions per active
+# hour — replenish is ranked as BOXES/hr, because a 40-unit box isn't 40x the work of a 1-unit move, so
+# units/hr would just rank box size, not speed.
+SPEED_RATE = {"pick":"units","pack":"units","engrave":"units","replenish":"moves"}
+# Per-stage row filter (a raw SQL fragment built ONLY from these constants — never user input).
+# Replenish counts only real boxes moved in (bin transfers); the qty=1 tote moves (98% of replenish rows)
+# aren't replenishment and are excluded.
+SPEED_FILTER = {"replenish":"AND (raw->>'reason') NOT ILIKE '%%tote%%' AND quantity>1"}
+
+@app.route("/speed")
+def speed():
+    """Per person x stage working speed (units per ACTIVE hour) for the selected window."""
+    frm, to = _range()
+    rows_by_stage = {}
+    with connect() as c, c.cursor(row_factory=tuple_row) as cur:
+        for stage, idle in SPEED_IDLE.items():
+            flt = SPEED_FILTER.get(stage, "")   # constant-only SQL fragment (see SPEED_FILTER)
+            cur.execute(f"""
+            WITH r AS (
+              SELECT person, quantity, ts,
+                EXTRACT(epoch FROM (ts - lag(ts) OVER (PARTITION BY person ORDER BY ts))) g
+              FROM event WHERE stage=%s AND source=%s {flt} AND et_day(ts) BETWEEN %s AND %s),
+            ch AS (  -- collapse <=5s bursts into one chunk (one physical action)
+              SELECT person, quantity, ts,
+                sum(CASE WHEN g IS NULL OR g > %s THEN 1 ELSE 0 END)
+                    OVER (PARTITION BY person ORDER BY ts) cid
+              FROM r),
+            chunks AS (SELECT person, cid, sum(quantity) units, min(ts) st
+                       FROM ch GROUP BY person, cid),
+            iv AS (  -- gap between consecutive chunks = time to process one chunk/box
+              SELECT person, units,
+                EXTRACT(epoch FROM (st - lag(st) OVER (PARTITION BY person ORDER BY st))) gap,
+                (st AT TIME ZONE 'America/New_York')::date d
+              FROM chunks)
+            SELECT person,
+              count(*)              FILTER (WHERE gap>0 AND gap<=%s)                         n,
+              round(sum(gap)        FILTER (WHERE gap>0 AND gap<=%s)/60.0, 1)                active_min,
+              sum(units)            FILTER (WHERE gap>0 AND gap<=%s)                         units,
+              count(DISTINCT d)     FILTER (WHERE gap>0 AND gap<=%s)                         days,
+              round(3600.0*sum(units) FILTER (WHERE gap>0 AND gap<=%s)
+                    / nullif(sum(gap) FILTER (WHERE gap>0 AND gap<=%s),0), 0)               uph,
+              round(percentile_cont(0.5) WITHIN GROUP (ORDER BY gap/nullif(units,0))
+                    FILTER (WHERE gap>0 AND gap<=%s)::numeric, 0)                           med_spi,
+              round(percentile_cont(0.5) WITHIN GROUP (ORDER BY gap)
+                    FILTER (WHERE gap>0 AND gap<=%s)::numeric, 0)                           med_move
+            FROM iv GROUP BY person""",
+            [stage, SPEED_SRC[stage], frm, to, SPEED_BURST] + [idle]*8)
+            movemode = (SPEED_RATE[stage]=="moves")
+            out = []
+            for (person,n,amin,units,days,uph,med_spi,med_move) in cur.fetchall():
+                if not n: continue
+                ranked = (n>=SPEED_GATE["min_intervals"] and (days or 0)>=SPEED_GATE["min_days"]
+                          and (amin or 0)>=SPEED_GATE["min_active_min"])
+                reason = ""
+                if not ranked:
+                    bits=[]
+                    if n<SPEED_GATE["min_intervals"]: bits.append(f"only {n} sample"+("s" if n!=1 else ""))
+                    if (days or 0)<SPEED_GATE["min_days"]: bits.append(f"only {days or 0} day"+("s" if (days or 0)!=1 else ""))
+                    if (amin or 0)<SPEED_GATE["min_active_min"]: bits.append(f"only {amin or 0} active min")
+                    reason=", ".join(bits)
+                if movemode:                              # replenish -> boxes/hr, median sec/box
+                    rate = round(n*60.0/float(amin)) if amin else 0
+                    med  = int(med_move) if med_move is not None else None
+                else:                                     # pick/pack/engrave -> units/hr, median sec/item
+                    rate = int(uph) if uph is not None else 0
+                    med  = int(med_spi) if med_spi is not None else None
+                out.append(dict(person=person, type=PERSON_TYPE.get(person,""),
+                    uph=rate, med_spi=med, n=int(n),
+                    active_min=float(amin) if amin is not None else 0.0,
+                    days=int(days or 0), units=int(units) if units is not None else 0,
+                    moves=int(n), ranked=ranked, reason=reason))
+            rows_by_stage[stage]=out
+    cfg=dict(idle_min={s:v//60 for s,v in SPEED_IDLE.items()}, burst_s=SPEED_BURST,
+             gate=SPEED_GATE, unit=SPEED_UNIT, source=SPEED_SRC, rate=SPEED_RATE)
+    return jsonify(range={"from":frm,"to":to}, config=cfg, stages=rows_by_stage)
+
 @app.route("/")
 def dashboard():
     return Response(DASHBOARD_HTML, mimetype="text/html")
@@ -168,6 +257,17 @@ tr.tot td{font-weight:700;border-top:2px solid #e5e7eb}
 .foot b{color:#6b7280}
 #status{color:#6b7280;font-size:13px;margin-left:8px}
 .hide{display:none}
+.mbox{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:14px 16px;font-size:13px;color:#374151;margin-bottom:14px;line-height:1.55}
+.mbox h3{margin:0 0 6px;font-size:13px;color:#111827}
+.mbox code{background:#eef2f7;padding:1px 5px;border-radius:5px;font-size:12px}
+.spgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+.pill2{display:inline-block;padding:2px 9px;border-radius:20px;font-size:11px;font-weight:700}
+.matrix td.cell{text-align:center}
+.spbar{height:6px;border-radius:4px;background:#eceff3;margin-top:3px}
+.spbar>i{display:block;height:6px;border-radius:4px}
+.best{background:#f0fdf4;outline:2px solid #16a34a;border-radius:6px}
+.ins{color:#9ca3af}
+@media(max-width:900px){.spgrid{grid-template-columns:1fr}}
 </style></head><body><div class=wrap>
 <h1>Warehouse Picking &amp; Packing</h1>
 <div class=sub>Live contribution from ShipHero <b>+ direct-in-Shopify fulfillments + engraving</b>, PTO-aware. <b>Fulfillment</b> (pick + pack + engrave) and <b>Replenishment</b> are two separate tracks.</div>
@@ -175,6 +275,7 @@ tr.tot td{font-weight:700;border-top:2px solid #e5e7eb}
   <div class="tab on" data-tab=dash onclick="tab('dash')">Dashboard</div>
   <div class=tab data-tab=floor onclick="tab('floor')">Floor Time</div>
   <div class=tab data-tab=an onclick="tab('an')">Analytics</div>
+  <div class=tab data-tab=speed onclick="tab('speed')">Speed &amp; Rankings</div>
 </div>
 <div class=ctl>
   <button class=pill data-preset=today onclick="preset('today')">Today</button>
@@ -228,6 +329,20 @@ tr.tot td{font-weight:700;border-top:2px solid #e5e7eb}
   <div class=card><h2>Analytics</h2><div id=analytics></div></div>
 </div>
 
+<div id=speed class=hide>
+  <div id=speed_method></div>
+  <div class=card>
+    <h2>Speed leaderboards <span style="color:#9ca3af;font-weight:400">&mdash; units per active hour, fastest first</span></h2>
+    <div class=sub style=margin:0>Only people with enough data are ranked; everyone else is listed as &ldquo;insufficient&rdquo; with the reason. Uses the date range above.</div>
+    <div id=speed_boards class=spgrid style=margin-top:12px></div>
+  </div>
+  <div class=card style=margin-top:16px>
+    <h2>Who&rsquo;s best at what &mdash; assignment matrix</h2>
+    <div class=sub style=margin:0>Each cell = units/active-hr with a percentile bar within that activity (green = fast). <b>Best fit</b> = the activity where the person ranks highest. Grey dot = has some data but not enough to rank; blank = never did it.</div>
+    <div id=speed_matrix style=margin-top:8px></div>
+  </div>
+</div>
+
 <div class=foot>
   <b>Chart colours:</b> <span class=s-sh>Picked&middot;ShipHero</span>, <span style=color:#16a34a>Packed&middot;ShipHero</span>, <span class=s-shop>Packed&middot;Shopify</span>, <span class=s-eng>Engraved</span> &mdash; these four stack into the <b>Fulfillment</b> bar. <span class=s-repl>Replenished</span> is drawn as its own separate bar (a parallel track, never added into the fulfillment/items total).
 </div>
@@ -240,8 +355,9 @@ function etAgo(n){return new Date(Date.now()-4*3600*1000-n*86400000).toISOString
 function segval(id){return document.querySelector('#'+id+' button.on').dataset.v;}
 function seg(id,v){document.querySelectorAll('#'+id+' button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));render();}
 document.querySelectorAll('.seg').forEach(s=>s.addEventListener('click',e=>{if(e.target.dataset.v){seg(s.id,e.target.dataset.v);}}));
-function tab(t){['dash','floor','an'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
-  document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('on',el.dataset.tab===t));}
+function tab(t){['dash','floor','an','speed'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
+  document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('on',el.dataset.tab===t));
+  if(t==='speed')loadSpeed();}
 function preset(p){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.toggle('on',b.dataset.preset===p));
   let f=etToday(),t=etToday();
   if(p==='yest'){f=t=etAgo(1);}else if(p==='7'){f=etAgo(6);}else if(p==='30'){f=etAgo(29);}
@@ -251,7 +367,9 @@ async function getj(u){for(let i=0;i<8;i++){try{const r=await fetch(u);if(r.ok)r
   document.getElementById('status').textContent='waking server ('+(i+1)+')…';await new Promise(s=>setTimeout(s,4000));}throw 0;}
 async function load(){document.getElementById('status').textContent='loading…';
   try{DATA=await getj('/warehouse?from='+document.getElementById('from').value+'&to='+document.getElementById('to').value);
-  document.getElementById('status').textContent='';render();}catch(e){document.getElementById('status').textContent='could not reach API';}}
+  document.getElementById('status').textContent='';render();
+  if(!document.getElementById('speed').classList.contains('hide')){speedKey=null;loadSpeed();}
+  }catch(e){document.getElementById('status').textContent='could not reach API';}}
 function fmt(n){return (n||0).toLocaleString();}
 function fmtmin(m){if(m==null)return '—';const h=Math.floor(m/60),x=Math.round(m%60);return h?h+'h '+x+'m':x+'m';}
 function ampm(iso){if(!iso)return '';return new Date(iso).toLocaleTimeString([], {hour:'numeric',minute:'2-digit',timeZone:'America/New_York'})+' ET';}
@@ -393,6 +511,73 @@ function dl(kind){const ppl=DATA.people.filter(teamFilter);let blob,name;
     const lines=[hdr.join(',')].concat(ppl.map(p=>[p.person,p.type,p.items_picked_sh,p.items_packed_sh,p.items_packed_shop,p.engraved_items,(p.items_picked_sh+p.items_packed_sh+p.items_packed_shop+p.engraved_items),p.replenished,p.orders_picked_sh,p.orders_packed_sh,p.orders_packed_shop].join(',')));
     blob=new Blob([lines.join('\n')],{type:'text/csv'});name='warehouse.csv';}
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();}
+// ---------------- Speed & Rankings tab ----------------
+let SPEED=null, speedKey=null;
+const SP_STAGES=['pick','pack','engrave','replenish'];
+function cap(s){return s[0].toUpperCase()+s.slice(1);}
+function pctColor(p){return 'hsl('+Math.round(p*1.2)+',68%,40%)';}  // 0=red(slow) -> 100=green(fast)
+async function loadSpeed(){
+  const f=document.getElementById('from').value,t=document.getElementById('to').value,k=f+'|'+t;
+  if(SPEED&&speedKey===k){renderSpeed();return;}
+  document.getElementById('speed_method').innerHTML='';
+  document.getElementById('speed_boards').innerHTML='<div class=sub>loading…</div>';
+  document.getElementById('speed_matrix').innerHTML='';
+  try{SPEED=await getj('/speed?from='+f+'&to='+t);speedKey=k;renderSpeed();}
+  catch(e){document.getElementById('speed_boards').innerHTML='<div class=sub>could not load speed data</div>';}
+}
+function spType(S,person){for(const st of SP_STAGES){const r=(S[st]||[]).find(x=>x.person===person);if(r&&r.type)return r.type;}return '';}
+function spActiveMin(S,person){let m=0;SP_STAGES.forEach(st=>{const r=(S[st]||[]).find(x=>x.person===person);if(r)m+=r.active_min;});return m;}
+function renderSpeed(){
+  if(!SPEED)return;const cfg=SPEED.config,S=SPEED.stages,g=cfg.gate;
+  // ---- methodology (all assumptions visible) ----
+  let m='<div class=mbox><h3>How this is measured — read me</h3>';
+  m+='Speed = <b>units per ACTIVE hour</b>. The gap between your consecutive scans of a task is the time to do that unit of work. ';
+  m+='A gap longer than the task&rsquo;s <b>break threshold</b> means you stopped — lunch, switched task, or stepped away — and is removed, so time off never counts as slowness. But many small gaps (genuinely slow work) <b>do</b> count. Scans within <code>'+cfg.burst_s+'s</code> of each other are merged into one action.<br>';
+  m+='<b>Break thresholds (a gap bigger than this = not working):</b> '+SP_STAGES.map(s=>cap(s)+' <code>&gt;'+cfg.idle_min[s]+' min</code>').join(' &middot; ')+'. Set just above each task&rsquo;s normal per-item time, from its own data.<br>';
+  m+='<b>Replenishment</b> is ranked as <b>boxes moved per active hour</b> (each bin transfer = one box, any size) — not units/hr, which would just rank box size. The single-unit tote moves (98% of replenish scans) aren&rsquo;t replenishment and are excluded.<br>';
+  m+='<b>Sample size — ranked only if</b> a person has <code>&ge;'+g.min_intervals+' samples</code> across <code>&ge;'+g.min_days+' days</code> with <code>&ge;'+g.min_active_min+' active min</code>; otherwise shown as &ldquo;insufficient&rdquo; with the reason. A &ldquo;sample&rdquo; = one timed unit-of-work.<br>';
+  m+='<b>Window:</b> uses the date range above (<b>'+SPEED.range.from+' → '+SPEED.range.to+'</b>). Early-July data is less reliable — prefer a recent window and enough days.<br>';
+  m+='<b>Scans only:</b> pick/pack/replenish from ShipHero, engraving from the logger. Shopify hand-fulfillment timing isn&rsquo;t granular enough for pace, and off-scanner work isn&rsquo;t captured.';
+  m+='</div>';
+  document.getElementById('speed_method').innerHTML=m;
+  // ---- percentiles per stage (among ranked) ----
+  const pct={};
+  SP_STAGES.forEach(s=>{const rk=(S[s]||[]).filter(r=>r.ranked).sort((a,b)=>a.uph-b.uph);
+    rk.forEach((r,i)=>{const p=rk.length>1?Math.round(100*i/(rk.length-1)):100;
+      (pct[r.person]=pct[r.person]||{})[s]={uph:r.uph,p,med:r.med_spi,n:r.n,days:r.days};});});
+  // ---- leaderboards ----
+  let b='';
+  SP_STAGES.forEach(s=>{
+    const rows=S[s]||[],rk=rows.filter(r=>r.ranked).sort((a,b)=>b.uph-a.uph),un=rows.filter(r=>!r.ranked);
+    b+='<div class=card style="padding:14px 16px"><div style="font-weight:700">'+cap(s)+' <span class=sub style="font-weight:400">('+cfg.unit[s]+'/active-hr · break &gt;'+cfg.idle_min[s]+'m)</span></div>';
+    if(!rk.length)b+='<div class=sub style=margin-top:6px>No one has enough data yet in this window.</div>';
+    else{b+='<table style=margin-top:6px><tr><th>#</th><th style=text-align:left>Person</th><th>'+cfg.unit[s]+'/hr</th><th>med s/ea</th><th>samples</th><th>days</th></tr>';
+      rk.forEach((r,i)=>{b+='<tr><td>'+(i+1)+'</td><td class=name style=text-align:left>'+r.person+'</td><td><b style="color:'+pctColor(pct[r.person][s].p)+'">'+fmt(r.uph)+'</b></td><td>'+(r.med_spi==null?'—':r.med_spi)+'</td><td>'+r.n+'</td><td>'+r.days+'</td></tr>';});
+      b+='</table>';}
+    if(un.length)b+='<div class=sub style=margin-top:8px><b>Insufficient:</b> '+un.map(r=>r.person+' <span class=ins>('+r.reason+')</span>').join(', ')+'</div>';
+    b+='</div>';
+  });
+  document.getElementById('speed_boards').innerHTML=b;
+  // ---- assignment matrix ----
+  const all=new Set();SP_STAGES.forEach(s=>(S[s]||[]).forEach(r=>all.add(r.person)));
+  const order=[...all].sort((a,b)=>spActiveMin(S,b)-spActiveMin(S,a));
+  let x='<table class=matrix><tr><th style=text-align:left>Person</th><th>Type</th>'+SP_STAGES.map(s=>'<th>'+cap(s)+'</th>').join('')+'<th>Best fit</th><th>Active hrs<span class=s> tracked</span></th></tr>';
+  order.forEach(person=>{
+    const pr=pct[person]||{};let best=null;SP_STAGES.forEach(s=>{if(pr[s]&&(!best||pr[s].p>pr[best].p))best=s;});
+    const ty=spType(S,person);
+    x+='<tr><td class=name>'+person+'</td><td><span class="badge '+(ty==='Intern'?'in':'ft')+'">'+(ty==='Intern'?'Intern':(ty?'Full-timer':'—'))+'</span></td>';
+    SP_STAGES.forEach(s=>{
+      if(pr[s]){const c=pctColor(pr[s].p);
+        x+='<td class="cell'+(s===best?' best':'')+'" title="'+pr[s].p+'th pct · '+pr[s].n+' samples · '+pr[s].days+' days"><b style="color:'+c+'">'+fmt(pr[s].uph)+'</b><div class=spbar><i style="width:'+Math.max(4,pr[s].p)+'%;background:'+c+'"></i></div></td>';}
+      else{const row=(S[s]||[]).find(r=>r.person===person);x+='<td class="cell ins" title="'+(row?row.reason.replace(/"/g,''):'never did this task')+'">'+(row?'·':'')+'</td>';}
+    });
+    x+='<td>'+(best?'<span class=pill2 style="background:#dcfce7;color:#166534">'+cap(best)+'</span>':'<span class=ins>—</span>')+'</td>';
+    x+='<td>'+(spActiveMin(S,person)/60).toFixed(1)+'</td></tr>';
+  });
+  x+='</table>';
+  x+='<div class=sub style=margin-top:8px><b>Active hrs (tracked)</b> = time between scans, breaks removed — a floor, not a full timesheet (off-scanner work isn&rsquo;t counted).</div>';
+  document.getElementById('speed_matrix').innerHTML=x;
+}
 document.getElementById('from').value=etAgo(7);document.getElementById('to').value=etToday();
 load();
 </script></body></html>"""
