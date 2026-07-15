@@ -47,8 +47,13 @@ def get_token():
         "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET}).encode()
     req = urllib.request.Request(TOKEN_URL, data=body,
         headers={"Content-Type": "application/x-www-form-urlencoded"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        _TOKEN["val"] = json.loads(r.read())["access_token"]
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            _TOKEN["val"] = json.loads(r.read())["access_token"]
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:400]
+        raise SystemExit(f"[shopify] token request failed HTTP {e.code}: {detail}  "
+                         f"(check: app installed on this store? read_orders scope? same org?)")
     return _TOKEN["val"]
 
 # --- Name reconciliation: Shopify staff names differ from ShipHero/DB names ---
