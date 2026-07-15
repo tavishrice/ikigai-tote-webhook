@@ -1,23 +1,24 @@
 """
-Shopify -> Postgres `event` ingest, using the ARTIFACT method (order timeline),
-so hand-fulfillments are attributed to the real staffer and deduped vs ShipHero.
+Shopify -> Postgres `event` ingest, using the ORDER TIMELINE so hand-fulfillments
+are attributed to the real staffer and deduped vs ShipHero.
 
-Why the timeline (not the fulfillments API): every fulfilled order shows a
-"Manual" fulfillment, so the fulfillments field cannot tell ShipHero-pushed from
-hand-done, and it hides that ONE order is often split -- a staffer hand-fulfills
-some items in Shopify AND ShipHero fulfills the rest. The order timeline exposes
-this: each `fulfillment_success` event's message says WHO did it.
+============================ CORRECTED 2026-07-15 (attribution fix) ============================
+Three kinds of `fulfillment_success` events appear on Ikigai orders:
+  1. "ShipHero Inventory & Shipping marked N items ..."  -> already counted in ShipHero packs. SKIP.
+  2. "Shopify marked N items as fulfilled" (no user)     -> whoever PURCHASED THE SHIPPING LABEL
+                                                            physically packed & shipped it. CREDIT them.
+  3. "<Person> marked N items as fulfilled" (a user)     -> the "double check engravings" / QC /
+                                                            archival close-out step. NOT packing labor. DROP.
 
-Rule (identical to reference/dashboard.html fetchDirect):
-  - skip events whose message starts with "ShipHero"   (already counted via ShipHero packs)
-  - "<Name> marked N items as fulfilled" + attributeToUser  -> credit <Name>, N items (hand pack)
-  - "Shopify marked N items as fulfilled" (no user) -> credit the nearest
-        "shipping_label_created_success" purchaser ("<Name> purchased a ...")
-  - anything we cannot attribute to a person is DROPPED (finished inside Shopify,
-        no human -> not warehouse labor)
-
-Each qualifying event becomes a stage='pack', source='shopify' row keyed by
-order+createdAt (idempotent). The read API then dedups orders across sources.
+The previous version credited (3) as a pack. That produced large phantom credit for people who only
+ever do the QC mark and never buy a label (e.g. Breton Rice, credited ~752 phantom items; also inflated
+Shambria/Kadil/Esra/Simay/Maurice). Verified against live order timelines on 2026-07-15: person-"marked
+as fulfilled" events are the engraving/QC handling of the personalised line items, while the actual
+Shopify hand-pack is signalled by the shipping-label purchase (kind 2). So we now credit ONLY kind 2.
+If Tavish later confirms some person-marks ARE genuine solo hand-packs, re-add a guarded branch that
+credits a person-mark only when that SAME person also bought the label on the order and there was no
+prior system fulfillment. (See test_shopify_attribution.py for the fixtures proving this behaviour.)
+===============================================================================================
 
 Env: SHOPIFY_SHOP, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET, DATABASE_URL
 Backfill:  python shopify_ingest.py 2026-07-01 2026-07-15
@@ -26,10 +27,6 @@ Live cron: python shopify_ingest.py                 (defaults: last 3 days ET ->
 import os, sys, re, json, time, html, urllib.request, urllib.error, urllib.parse, datetime as dt
 from db import connect
 
-# Auth (2026 model): legacy custom-app shpat_ tokens are gone. A Dev Dashboard app
-# gives a Client ID + Client Secret, which we exchange for a short-lived (24h) token
-# via the client-credentials grant on every run. Works because the app + store are in
-# the same Shopify org. Docs: shopify.dev/docs/apps/build/dev-dashboard/get-api-access-tokens
 SHOP   = os.environ.get("SHOPIFY_SHOP", "ikigai-cases.myshopify.com")
 CLIENT_ID     = os.environ.get("SHOPIFY_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "")
@@ -57,16 +54,10 @@ def get_token():
     return _TOKEN["val"]
 
 # --- Name reconciliation: Shopify staff names differ from ShipHero/DB names ---
-# The DB's canonical person names come from ShipHero (e.g. "Nic Cox", "Manu Bekele").
-# Shopify shows the staffer's own account name (e.g. "Nicholas Cox", "Manuhe Bekele").
-# We match tolerantly to the warehouse roster: same LAST name + first-name is a prefix
-# of the other (the rule the warehouse skill uses: "Manu Bekele" <-> "Manuhe Bekele").
-# ROSTER = the canonical names the DB already uses for pick/pack (keep in sync w/ read_api).
 ROSTER = ["Nic Cox", "Halil Gurler", "Jeffrey Kwan", "Kadil Ladson", "Manu Bekele",
           "Maurice Williams", "Shambria Green", "Breton Rice", "Broghan Rice",
           "Esra Altug", "Simay Guner", "Cindy Lin", "Brennen Myrick", "Lara Nielsen",
           "Patrick Robin", "Daniella Gross"]
-# Explicit overrides for anything the tolerant rule can't resolve. Add pairs as found.
 NAME_ALIASES = {}
 _UNKNOWN = set()
 
@@ -85,14 +76,13 @@ def canon(name):
             if last == rl and (first.startswith(rf) or rf.startswith(first)):
                 return r
     if name not in ROSTER:
-        _UNKNOWN.add(name)     # surfaced at end of run so we can add an alias
+        _UNKNOWN.add(name)
     return name
 
 TAG = re.compile(r"<[^>]+>")
 def strip_tags(s):
     return html.unescape(TAG.sub("", s or "")).strip()
 
-RE_MARK  = re.compile(r"^(.+?) marked (\d+) items? as fulfilled")
 RE_SHOP  = re.compile(r"^Shopify marked (\d+) items? as fulfilled")
 RE_LABEL = re.compile(r"^(.+?) purchased a")
 
@@ -124,8 +114,18 @@ def gql(q, tries=8):
         raise RuntimeError(f"Shopify GraphQL error: {errs}")
     raise RuntimeError("Shopify throttled past retry budget")
 
+def _ms(iso):
+    if not iso:
+        return None
+    return int(dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000)
+
 def parse_order(order, start, end):
-    """Yield (created_iso, person, qty, order_name) for hand-fulfillment events."""
+    """Yield (created_iso, person, qty, order_name) for REAL Shopify hand-pack events only.
+
+    Kind 2 ("Shopify marked N") -> credit the nearest shipping-label purchaser (the packer).
+    Kind 1 ("ShipHero ...")     -> skip (counted in ShipHero packs).
+    Kind 3 ("<Person> marked N")-> DROP: engraving/QC/archival close-out, not packing.
+    """
     name = order["name"]
     evs = ((order.get("events") or {}).get("nodes")) or []
     labelers = []
@@ -143,25 +143,15 @@ def parse_order(order, start, end):
             continue
         msg = strip_tags(e.get("message"))
         if re.match(r"^ShipHero", msg, re.I):
+            continue                                    # kind 1
+        a = RE_SHOP.match(msg)
+        if a and labelers:                              # kind 2 -> real hand-pack by label purchaser
+            qty = int(a.group(1))
+            person = min(labelers, key=lambda l: abs(l[1] - t))[0]
+            out.append((e["createdAt"], canon(person), qty, name))
             continue
-        person = None; qty = 0
-        m = RE_MARK.match(msg)
-        if m and e.get("attributeToUser"):
-            person = m.group(1).strip(); qty = int(m.group(2))
-        else:
-            a = RE_SHOP.match(msg)
-            if a and labelers:
-                qty = int(a.group(1))
-                person = min(labelers, key=lambda l: abs(l[1] - t))[0]
-        if not person or qty <= 0:
-            continue
-        out.append((e["createdAt"], canon(person), qty, name))
+        # kind 3 ("<Person> marked N items as fulfilled") -> intentionally DROPPED (QC / close-out)
     return out
-
-def _ms(iso):
-    if not iso:
-        return None
-    return int(dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000)
 
 INS = ("INSERT INTO event (ts,person,stage,station,action,order_number,sku,quantity,"
        "subtype,source,ext_id,dedup_key) VALUES (%s,%s,'pack',NULL,'pack',%s,NULL,%s,"
@@ -173,7 +163,7 @@ def run(df, dt_):
     start = _ms(df + "T00:00:00Z")
     end   = _ms(dt_ + "T23:59:59Z")
     qrange = f"updated_at:>={df}T00:00:00Z updated_at:<={dt_}T23:59:59Z"
-    after = None; pages = 0; rows = []
+    after = None; pages = 0; rows = []; orders_seen = 0
     while pages < 400:
         q = ('{ orders(first:50, sortKey:UPDATED_AT, reverse:true, query:%s%s){ '
              'pageInfo{hasNextPage endCursor} nodes{ name events(first:15, sortKey:CREATED_AT, reverse:true){ '
@@ -182,6 +172,7 @@ def run(df, dt_):
         data = gql(q); pages += 1
         orders = (data.get("orders") or {})
         for o in (orders.get("nodes") or []):
+            orders_seen += 1
             for created, person, qty, name in parse_order(o, start, end):
                 dk = "shopify|" + name + "|" + created
                 rows.append((created, person, name, qty, name + "|" + created, dk))
@@ -190,25 +181,37 @@ def run(df, dt_):
         if not after:
             break
         time.sleep(PAGE_SLEEP)
-    # dedup within this run by dedup_key
     seen = {}
     for r in rows:
         seen[r[5]] = r
     rows = list(seen.values())
+
+    # SELF-HEALING (2026-07-15): the daily cron only INSERTs, so any phantom "person marked as
+    # fulfilled" rows written by the OLD ingest (esp. same-day close-out sweeps) would linger until a
+    # manual repair. Instead, each run REBUILDS its window: delete this window's Shopify pack rows,
+    # then re-insert the corrected set. Because the rolling cron covers the last 3 days INCLUDING
+    # today, today's phantom credit is cleaned on every 5-min tick — no separate repair needed.
+    # Safety: only rebuild if we actually fetched orders (never wipe the window on an empty/anomalous
+    # response). The whole delete+insert+refresh runs in ONE transaction, so a failure rolls back.
+    if orders_seen == 0:
+        print(f"[shopify] SKIP rebuild: 0 orders fetched for {df}..{dt_} (kept existing rows).", flush=True)
+        return
+    d0 = dt.date.fromisoformat(df); d1 = dt.date.fromisoformat(dt_)
+    win_days = [d0 + dt.timedelta(days=i) for i in range((d1 - d0).days + 1)]
     with connect() as c, c.cursor() as cur:
+        cur.execute("DELETE FROM event WHERE source='shopify' AND stage='pack' "
+                    "AND (ts AT TIME ZONE 'America/New_York')::date BETWEEN %s AND %s", (df, dt_))
+        deleted = cur.rowcount
         cur.executemany(INS, rows)
         inserted = cur.rowcount
-        cur.execute("SELECT DISTINCT (ts AT TIME ZONE 'America/New_York')::date d "
-                    "FROM event WHERE source='shopify' AND (ts AT TIME ZONE 'America/New_York')::date "
-                    "BETWEEN %s AND %s", (df, dt_))
-        days = [list(x.values())[0] if isinstance(x, dict) else x[0] for x in cur.fetchall()]
-        for d in days:
+        for d in win_days:            # refresh EVERY day in the window so cleaned days recompute
             cur.execute("SELECT refresh_stage_contribution_day(%s)", (d,))
             cur.execute("SELECT refresh_contribution_day(%s)", (d,))
             cur.execute("SELECT refresh_shift_day(%s)", (d,))
         c.commit()
-    print(f"[shopify] pages={pages} events={len(rows)} newly_inserted={inserted} "
-          f"days_refreshed={len(days)} window={df}..{dt_}", flush=True)
+    print(f"[shopify] pages={pages} orders_seen={orders_seen} corrected_rows={len(rows)} "
+          f"deleted_old={deleted} inserted={inserted} days_refreshed={len(win_days)} "
+          f"window={df}..{dt_}", flush=True)
     if _UNKNOWN:
         print("[shopify] WARN unmatched fulfiller names (add to NAME_ALIASES): "
               + ", ".join(sorted(_UNKNOWN)), flush=True)
