@@ -137,9 +137,12 @@ ACTIVE_BREAK = 2700  # seconds = 45 min. ONE definition of "active time" app-wid
 # locations. So the GAP BEFORE a replenish scan is real work, not a break — but it must be capped so that a
 # 2.5h gap before a single box isn't credited as 2.5h of replenishing. We credit min(gap, cap) where the cap
 # scales with the box size (units placed): a full 40-unit box ~= 14 min, a 1-unit tote move ~= 2 min.
-REPL_BASE = 120      # sec: fixed handling per replenish action (walk to it, open the box, log it)
-REPL_PER_UNIT = 18   # sec per unit placed on the shelf (40-unit box => 120 + 720 = 840s = 14 min)
-REPL_MAX = 1800      # sec: absolute ceiling of credited work before any one replenish scan (30 min)
+REPL_BASE = 120           # sec: fixed handling per box (walk to it, open it, log it)
+REPL_PER_UNIT = 18        # sec per unit placed on the shelf (40-unit box => 120 + 720 = 840s = 14 min)
+REPL_BURST_WINDOW = 600   # sec: replenish scans within 10 min of each other are ONE batch (worked together,
+                          # then logged in a burst). So the long gap before the batch is credited to the
+                          # WHOLE batch's fair time, not just the first box's.
+REPL_BURST_MAX = 3600     # sec: ceiling on the work credited before any one batch (60 min)
 
 @app.route("/floor")
 def floor_stats():
@@ -152,20 +155,31 @@ def floor_stats():
           FROM event WHERE is_floor_labor(stage,subtype) AND et_day(ts) BETWEEN %s AND %s),
         seq AS (
           SELECT person, d, ts, stage, quantity,
-            EXTRACT(epoch FROM (ts - lag(ts) OVER (PARTITION BY person,d ORDER BY ts))) gap
-          FROM ev),
+            EXTRACT(epoch FROM (ts - lag(ts) OVER w)) gap,
+            lag(stage) OVER w prev_stage
+          FROM ev WINDOW w AS (PARTITION BY person,d ORDER BY ts)),
+        brs AS (   -- a replenish scan starts a new BATCH if the previous scan wasn't replenish or was long ago
+          SELECT *, CASE WHEN stage='replenish' AND (prev_stage IS DISTINCT FROM 'replenish' OR gap >= %s)
+                         THEN 1 ELSE 0 END bstart
+          FROM seq),
+        bid AS (SELECT *, sum(bstart) OVER (PARTITION BY person,d ORDER BY ts) batch FROM brs),
+        capd AS (   -- fair work time for a whole batch = sum of per-box time over its replenish scans
+          SELECT *, sum(CASE WHEN stage='replenish' THEN %s + %s*COALESCE(quantity,0) ELSE 0 END)
+                        OVER (PARTITION BY person,d,batch) batch_cap
+          FROM bid),
         cred AS (   -- active seconds = sum of credited gaps between consecutive scans.
                     -- Any sub-break gap counts fully (identical to the old session-span model for everyone).
-                    -- The ONLY change: a >= 45-min gap that lands right BEFORE a replenish scan is the
-                    -- physical box work (find/cut/place, logged after), so instead of discarding it as a
-                    -- break we credit it up to a per-box cap that scales with units placed. Big-gap-before-
-                    -- one-box can never be credited as hours; a break before pick/pack is still a break.
+                    -- The ONLY change: a >= 45-min gap that lands right before the FIRST scan of a replenish
+                    -- batch is the physical box work (find/cut/place, logged in a burst afterward), so instead
+                    -- of discarding it as a break we credit it up to the whole batch's fair time (scaled by the
+                    -- units placed across the batch, capped). A break before pick/pack is still a break, and a
+                    -- long gap before one small box can never be credited as hours.
           SELECT person, d, sum(CASE
               WHEN gap IS NULL THEN 0
+              WHEN stage='replenish' AND bstart=1 AND gap >= %s THEN LEAST(gap, LEAST(%s, batch_cap))
               WHEN gap < %s THEN gap
-              WHEN stage='replenish' THEN LEAST(gap, LEAST(%s, %s + %s*COALESCE(quantity,0)))
               ELSE 0 END) active_s
-          FROM seq GROUP BY person,d),
+          FROM capd GROUP BY person,d),
         it AS (
           SELECT person, d,
             COALESCE(sum(quantity) FILTER (WHERE stage IN ('pick','pack','engrave')),0) ful,
@@ -176,7 +190,7 @@ def floor_stats():
                COALESCE(sp.active_s,0), it.ful, it.repl, it.first_ts, it.last_ts,
                EXTRACT(epoch FROM (it.last_ts-it.first_ts)) span_s
         FROM it LEFT JOIN cred sp USING (person,d) ORDER BY it.person, it.d""",
-        [frm, to, ACTIVE_BREAK, REPL_MAX, REPL_BASE, REPL_PER_UNIT])
+        [frm, to, REPL_BURST_WINDOW, REPL_BASE, REPL_PER_UNIT, ACTIVE_BREAK, REPL_BURST_MAX, ACTIVE_BREAK])
         rows = cur.fetchall()
         cur.execute("SELECT id,person,d,hours,note,author FROM floor_note WHERE d BETWEEN %s AND %s "
                     "ORDER BY d, id", [frm, to])
