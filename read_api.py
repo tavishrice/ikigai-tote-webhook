@@ -734,6 +734,12 @@ td.sub2{color:var(--muted)}
 .rosck{cursor:pointer;width:15px;height:15px}
 .asgpick{background:#eaf1ff;color:#1e40af;border-radius:6px;padding:2px 9px;font-size:11px;font-weight:700}
 .asgpack{background:#eafaf0;color:#166534;border-radius:6px;padding:2px 9px;font-size:11px;font-weight:700}
+.plout{opacity:.42}
+.plbn td{background:#fff7ed}
+.plhrs{width:58px;text-align:center;padding:5px 6px}
+.plsel{padding:5px 8px;border:1px solid var(--line);border-radius:7px;font-size:12.5px;font-family:inherit;background:#fff;cursor:pointer}
+.plsel:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak)}
+.plin{width:15px;height:15px;cursor:pointer}
 /* Log off-scanner time card */
 .logcard{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:#fbfcfe;margin-top:16px}
 .logtitle{font-size:13px;font-weight:700;color:var(--ink-2);margin-bottom:10px}
@@ -904,21 +910,18 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 
 <div id=plan class=hide>
   <div class=card>
-    <h2>Staffing planner <span style="color:#9ca3af;font-weight:400">&mdash; turn an order forecast into hours &amp; people</span></h2>
-    <div class=sub style=margin:0>Enter the orders you plan to ship. The planner converts that into items per activity, then into labor <b>hours</b> and <b>people</b>, using pace learned from your recent data. Rates default from the date range above and are editable &mdash; you own the assumption. Pick + pack are needed on essentially every order; engraving only on the share that historically gets engraved.</div>
+    <h2>Day plan <span style="color:#9ca3af;font-weight:400">&mdash; who&rsquo;s in, where they go, and will we clear the orders</span></h2>
+    <div class=sub style=margin:0>Set who&rsquo;s on the floor today and their hours (10 is a full day here). <b>Auto-assign</b> finds the pick/pack split that <b>maximizes total orders</b> &mdash; it uses each person&rsquo;s own all-time pace and comparative advantage (a 300-pick / 56-pack rep is worth far more on pick than a 170 / 30 rep), not team averages. Override any <b>station</b> yourself, flip anyone <b>in/out</b>, or change <b>hours</b>, and the orders, bottleneck and verdict recompute live. Restock / receiving / returns &rarr; set the person to <b>Other</b>.</div>
     <div class=planbar>
-      <div class=lf><label>Orders to ship</label><input id=pl_orders type=number min=0 step=10 oninput=planCompute()></div>
-      <div class=lf><label>Hours / person</label><input id=pl_shift type=number min=1 max=14 step=0.5 value=8 oninput=planCompute()></div>
-      <div class=lf><label>People available <span class=s>(optional)</span></label><input id=pl_people type=number min=0 step=1 placeholder="—" oninput=planCompute()></div>
-      <div class=lf><label>&nbsp;</label><button class=pill onclick="planReset()">Reset rates to data</button></div>
+      <div class=lf><label>Order target</label><input id=pl_orders type=number min=0 step=10 oninput=planCompute()></div>
+      <div class=lf><label>Default hours</label><input id=pl_defhrs type=number min=1 max=14 step=0.5 value=10 oninput=planCompute()></div>
+      <div class=lf><label>&nbsp;</label><button class=pill onclick="planAllHours()">Set all to default</button></div>
+      <div class=lf><label>&nbsp;</label><button class="pill add" onclick="planRecommend()">Auto-assign</button></div>
     </div>
-    <div id=plan_out></div>
-  </div>
-  <div class=card style="margin-top:16px">
-    <h2>Who does what <span style="color:#9ca3af;font-weight:400">&mdash; best assignment for the people you have</span></h2>
-    <div class=sub style=margin:0>Tick who&rsquo;s on the floor. Because the same person is a different speed picking vs packing, the optimizer places each one where they balance the line and ship the most orders. Everyone is planned at the hours set above; engraving is a separate pool.</div>
-    <div id=plan_roster style="margin-top:12px"></div>
-    <div id=plan_opt></div>
+    <div id=plan_verdict></div>
+    <div id=plan_stations></div>
+    <div id=plan_roster></div>
+    <div class=logptr style="margin-top:12px">Rates are each person&rsquo;s own typical pace from <span class=tablink onclick="tab('speed')">Speed &amp; Rankings</span>; a &ldquo;&middot;&rdquo; means we don&rsquo;t have enough data to rate them at that station yet. Watch a person ramp on <span class=tablink onclick="tab('trend')">Trends</span>.</div>
   </div>
 </div>
 
@@ -1259,9 +1262,10 @@ async function addNote(){
   }catch(e){st.textContent='could not save';st.className='nstat err';}}
 async function delNote(id){try{await fetch('/note/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});FLOOR=null;floorKey=null;loadFloor();}catch(e){}}
 
-// ===== Staffing planner: order forecast -> items -> hours -> people, with a suggested lineup =====
-let PLAN=null;
-function planStages(){return [['pick','Pick'],['pack','Pack'],['engrave','Engrave']];}
+// ===== Day plan: roster-based staffing — who's in, their hours, their station, and the orders we clear =====
+// Rates come from ALL-TIME pace (PSPEED), not the dashboard's date range — you plan with every rep's full
+// track record, so everyone is rated even if they didn't work the selected window.
+let PLAN=null, PSPEED=null, pspeedKey=null;
 function planDaysInRange(){if(!DATA||!DATA.range)return 1;var a=new Date(DATA.range.from+'T00:00'),b=new Date(DATA.range.to+'T00:00');return Math.max(1,Math.round((b-a)/86400000)+1);}
 function planItemsOrders(){var o={pick:{i:0,o:0},pack:{i:0,o:0},engrave:{i:0,o:0}};
   (DATA.people||[]).forEach(function(p){
@@ -1269,104 +1273,91 @@ function planItemsOrders(){var o={pick:{i:0,o:0},pack:{i:0,o:0},engrave:{i:0,o:0
     o.pack.i+=(p.items_packed_sh||0)+(p.items_packed_shop||0); o.pack.o+=(p.orders_packed_sh||0)+(p.orders_packed_shop||0);
     o.engrave.i+=p.engraved_items||0; o.engrave.o+=p.engraved_orders||0;});
   return o;}
-function planRateFromSpeed(stage){if(!SPEED||!SPEED.stages||!SPEED.stages[stage])return 0;
-  var u=0,mins=0; SPEED.stages[stage].forEach(function(r){u+=r.units||0;mins+=r.active_min||0;});
-  return mins>0?Math.round(u/(mins/60)):0;}
-async function loadPlanner(){var out=document.getElementById('plan_out');
-  if(!DATA){out.innerHTML='<div class=sub>loading…</div>';return;}
-  var f=document.getElementById('from').value,t=document.getElementById('to').value,k=f+'|'+t;
-  if(!(SPEED&&speedKey===k)){out.innerHTML='<div class=sub>learning your recent pace…</div>';
-    try{SPEED=await getj('/speed?from='+f+'&to='+t);speedKey=k;}catch(e){}}
-  planDefaults();planRender();}
-function planDefaults(){var io=planItemsOrders();var shipped=(DATA.shipped&&DATA.shipped.total)||0;var days=planDaysInRange();
-  var fallback={pick:110,pack:120,engrave:45};
-  PLAN={shipped:shipped, days:days, avgDaily:Math.round(shipped/days),
-    act:planStages().map(function(s){var key=s[0];
-      return {key:key,label:s[1],items_total:io[key].i,orders_total:io[key].o,
-        ipo:(shipped>0?io[key].i/shipped:0), rate:(planRateFromSpeed(key)||fallback[key])};})};}
-function num(id,d){var v=parseFloat((document.getElementById(id)||{}).value);return isFinite(v)?v:(d||0);}
-// Build the skeleton ONCE (rate inputs must persist so typing doesn't lose focus); planCompute only writes numbers.
-function planRender(){var oi=document.getElementById('pl_orders'); if(oi&&!oi.value)oi.value=PLAN.avgDaily||'';
-  var rows=PLAN.act.map(function(a){return '<tr><td class=name style=text-align:left>'+a.label+'</td>'+
-    '<td id=pli_'+a.key+'></td>'+
-    '<td><input class="nin plan-rate" id=pl_rate_'+a.key+' type=number min=1 step=5 value='+Math.round(a.rate)+' oninput=planCompute()></td>'+
-    '<td id=plh_'+a.key+'></td><td id=plp_'+a.key+'></td></tr>';}).join('');
-  document.getElementById('plan_out').innerHTML=
-    '<div id=pl_hero></div><div id=pl_cmp></div>'+
-    '<div class=sub style="margin:14px 0 6px">The funnel &mdash; orders &rarr; items &rarr; hours &rarr; people. Edit any rate and it flows through instantly; the activity with the most hours is your bottleneck.</div>'+
-    '<table class=plantbl><tr><th style=text-align:left>Activity</th><th>Items</th><th>Rate <span class=s>items/hr</span></th><th>Hours</th><th>People</th></tr>'+
-    rows+'<tr class=tot><td style=text-align:left>Total</td><td id=pl_titems></td><td></td><td id=pl_thrs></td><td id=pl_tppl></td></tr></table>'+
-    '<div id=pl_lineup></div>';
-  document.getElementById('pl_lineup').innerHTML=planLineup();
-  planCompute();planRenderRoster();}
-// Per-person assignment optimizer: place each available person on pick or pack to balance the line.
-function planRate(person,stage){if(!SPEED||!SPEED.stages||!SPEED.stages[stage])return 0;
-  var r=(SPEED.stages[stage]||[]).find(function(x){return x.person===person;});
-  if(!r)return 0; return r.ranked?(r.pace||r.throughput||0):(r.throughput||r.pace||0);}
-function planRosterPeople(){var set={};['pick','pack'].forEach(function(s){((SPEED&&SPEED.stages&&SPEED.stages[s])||[]).forEach(function(r){if(planRate(r.person,'pick')||planRate(r.person,'pack'))set[r.person]=1;});});
+function planRate(person,stage){if(!PSPEED||!PSPEED.stages||!PSPEED.stages[stage])return 0;
+  var r=(PSPEED.stages[stage]||[]).find(function(x){return x.person===person;});
+  if(!r)return 0; return Math.round(r.ranked?(r.pace||r.throughput||0):(r.throughput||r.pace||0));}
+function planTeamRate(stage){if(!PSPEED||!PSPEED.stages||!PSPEED.stages[stage])return 0;
+  var u=0,m=0;PSPEED.stages[stage].forEach(function(r){u+=r.units||0;m+=r.active_min||0;});return m>0?Math.round(u/(m/60)):0;}
+function planRosterPeople(){var set={};['pick','pack','engrave'].forEach(function(s){((PSPEED&&PSPEED.stages&&PSPEED.stages[s])||[]).forEach(function(r){set[r.person]=1;});});
   return Object.keys(set).sort();}
-function planRenderRoster(){var host=document.getElementById('plan_roster');if(!host)return;
-  var ppl=planRosterPeople();PLAN.roster=ppl;
-  if(!ppl.length){host.innerHTML='<div class=sub>Not enough Speed data yet to optimize by person.</div>';document.getElementById('plan_opt').innerHTML='';return;}
-  var h='<table class=plantbl><tr><th>On floor</th><th style=text-align:left>Person</th><th>Pick /hr</th><th>Pack /hr</th><th>Assign</th><th>Items/day</th></tr>';
-  ppl.forEach(function(p,i){h+='<tr><td><input type=checkbox class=rosck data-p="'+p.replace(/"/g,'&quot;')+'" checked onchange="planOptimize()"></td>'+
-    '<td class=name style=text-align:left>'+p+'</td>'+
-    '<td>'+(planRate(p,'pick')||'<span class=dmt>·</span>')+'</td><td>'+(planRate(p,'pack')||'<span class=dmt>·</span>')+'</td>'+
-    '<td id=asg_'+i+'></td><td id=asgi_'+i+'></td></tr>';});
-  host.innerHTML=h+'</table>';planOptimize();}
-function planOptimize(){if(!PLAN||!PLAN.roster)return;
-  var N=num('pl_orders',0), shift=num('pl_shift',8)||8;
-  var avail=[];document.querySelectorAll('.rosck').forEach(function(ck){if(ck.checked)avail.push(ck.dataset.p);});
-  var aPick=PLAN.act.filter(function(a){return a.key==='pick';})[0], aPack=PLAN.act.filter(function(a){return a.key==='pack';})[0];
-  var ipoP=(aPick&&aPick.ipo)||0.001, ipoK=(aPack&&aPack.ipo)||0.001;
-  var cap={pick:0,pack:0}, assign={}, un=avail.slice(), guard=0;
-  while(un.length&&guard++<200){
-    var oP=cap.pick/ipoP, oK=cap.pack/ipoK, stage=oP<=oK?'pick':'pack';
-    var bi=-1,br=-1;un.forEach(function(p,idx){var r=planRate(p,stage);if(r>br){br=r;bi=idx;}});
-    if(bi<0||br<=0){stage=(stage==='pick')?'pack':'pick';bi=-1;br=-1;un.forEach(function(p,idx){var r=planRate(p,stage);if(r>br){br=r;bi=idx;}});if(bi<0||br<=0)break;}
-    var person=un.splice(bi,1)[0]; assign[person]=stage; cap[stage]+=br*shift;}
-  var oPick=cap.pick/ipoP, oPack=cap.pack/ipoK, orders=Math.floor(Math.min(oPick,oPack));
-  var bneck=oPick<oPack?'pick':'pack';
-  PLAN.roster.forEach(function(p,i){var a=assign[p];
-    set('asg_'+i, a?('<span class=asg'+a+'>'+a+'</span>'):'<span class=dmt>—</span>');
-    set('asgi_'+i, a?fmt(Math.round(planRate(p,a)*shift)):'');});
-  var nP=0,nK=0;for(var k in assign){if(assign[k]==='pick')nP++;else nK++;}
-  var opt=document.getElementById('plan_opt');
-  if(!avail.length){opt.innerHTML='<div class="plancmp short" style="margin-top:12px">Tick at least one person.</div>';return;}
-  opt.innerHTML='<div class="plancmp '+(N&&orders>=N?'ok':(N?'short':'ok'))+'" style="margin-top:14px">'+
-    'With these <b>'+avail.length+'</b> people at '+shift+'h ('+nP+' picking, '+nK+' packing) you can ship about <b>'+fmt(orders)+'</b> orders/day. Bottleneck: <b>'+bneck+'</b>'+
-    (N?(orders>=N?' &mdash; clears your '+fmt(N)+'-order target.':' &mdash; <b>'+fmt(N-orders)+'</b> short of your '+fmt(N)+'-order target; add a '+bneck+'er or more hours.'):'')+'</div>';}
+function num(id,d){var v=parseFloat((document.getElementById(id)||{}).value);return isFinite(v)?v:(d||0);}
 function set(id,html){var el=document.getElementById(id);if(el)el.innerHTML=html;}
+async function loadPlanner(){var host=document.getElementById('plan_roster');if(!host)return;
+  if(!DATA){host.innerHTML='<div class=sub>loading…</div>';return;}
+  var to=etToday(), k='all|'+to;   // ALL-TIME pace, independent of the dashboard date range
+  if(!(PSPEED&&pspeedKey===k)){host.innerHTML='<div class=sub>learning each person&rsquo;s all-time pace…</div>';
+    try{PSPEED=await getj('/speed?from=2020-01-01&to='+to);pspeedKey=k;}catch(e){}}
+  if(!PLAN||PLAN.key!==k)planInit(k);
+  planRenderRoster();planCompute();}
+function planInit(k){var io=planItemsOrders(),shipped=(DATA.shipped&&DATA.shipped.total)||1,days=planDaysInRange();
+  var def=num('pl_defhrs',10)||10;
+  PLAN={key:k, ipo:{pick:io.pick.i/shipped, pack:io.pack.i/shipped, engrave:io.engrave.i/shipped}, avgDaily:Math.round(shipped/days),
+    people:planRosterPeople().map(function(p){return {person:p, pick:planRate(p,'pick'), pack:planRate(p,'pack'), eng:planRate(p,'engrave'), hours:def, inn:true, assign:'Other'};})};
+  var oi=document.getElementById('pl_orders'); if(oi&&!oi.value)oi.value=PLAN.avgDaily||'';
+  planRecommend(true);}
+function planStationOpts(p,sel){var opts=[['Pick',p.pick],['Pack',p.pack]]; if(p.eng>0)opts.push(['Engrave',p.eng]); opts.push(['Other',0]);
+  return opts.map(function(o){return '<option'+(o[0]===sel?' selected':'')+'>'+o[0]+'</option>';}).join('');}
+function planRenderRoster(){var host=document.getElementById('plan_roster');if(!host||!PLAN)return;
+  if(!PLAN.people.length){host.innerHTML='<div class=sub>Not enough Speed data yet to build a roster.</div>';return;}
+  var h='<table class=plantbl id=plros><tr><th>In</th><th style=text-align:left>Person</th><th>Hours</th><th>Pick/hr</th><th>Pack/hr</th><th>Eng/hr</th><th style=text-align:left>Station</th><th>Their output</th></tr>';
+  PLAN.people.forEach(function(p,i){h+='<tr class="'+(p.inn?'':'plout')+'">'+
+    '<td><input type=checkbox class=plin id=plin_'+i+' '+(p.inn?'checked':'')+' onchange="planToggleIn('+i+')"></td>'+
+    '<td class=name style=text-align:left>'+p.person+'</td>'+
+    '<td><input class="nin plhrs" id=plhrs_'+i+' type=number min=0 max=14 step=0.5 value='+p.hours+' oninput="planEdit()"></td>'+
+    '<td>'+(p.pick||'<span class=dmt>·</span>')+'</td><td>'+(p.pack||'<span class=dmt>·</span>')+'</td><td>'+(p.eng||'<span class=dmt>·</span>')+'</td>'+
+    '<td style=text-align:left><select class=plsel id=plsel_'+i+' onchange="planEdit()">'+planStationOpts(p,p.assign)+'</select></td>'+
+    '<td id=plout_'+i+'></td></tr>';});
+  host.innerHTML=h+'</table>';}
+function planToggleIn(i){PLAN.people[i].inn=document.getElementById('plin_'+i).checked;
+  var tr=document.getElementById('plros').rows[i+1];if(tr)tr.className=PLAN.people[i].inn?'':'plout';planCompute();}
+function planEdit(){PLAN.people.forEach(function(p,i){var hv=document.getElementById('plhrs_'+i);if(hv)p.hours=parseFloat(hv.value)||0;
+  var sv=document.getElementById('plsel_'+i);if(sv)p.assign=sv.value;});planCompute();}
+function planAllHours(){var def=num('pl_defhrs',10)||10;PLAN.people.forEach(function(p,i){p.hours=def;var el=document.getElementById('plhrs_'+i);if(el)el.value=def;});planCompute();}
+// Auto-assign finds the pick/pack split that maximizes orders (min of the two stage capacities) — the true
+// optimum by comparative advantage, not an average. Exact search when the crew is small; greedy if huge.
+function planRecommend(silent){if(!PLAN)return;
+  var ipoP=PLAN.ipo.pick||0.001, ipoK=PLAN.ipo.pack||0.001;
+  var R=[];PLAN.people.forEach(function(p,i){if(p.inn){p.assign='Other';R.push(i);}});
+  if(R.length){
+    if(R.length<=18){var nC=1<<R.length, best=null;
+      for(var m=0;m<nC;m++){var pc=0,kc=0;
+        for(var j=0;j<R.length;j++){var p=PLAN.people[R[j]];if(m&(1<<j))pc+=p.pick*p.hours; else kc+=p.pack*p.hours;}
+        var ord=Math.min(pc/ipoP,kc/ipoK); if(best===null||ord>best.o)best={o:ord,m:m};}
+      for(var j2=0;j2<R.length;j2++)PLAN.people[R[j2]].assign=(best.m&(1<<j2))?'Pick':'Pack';
+    }else{var cap={Pick:0,Pack:0}, un=R.slice(), g=0;
+      while(un.length&&g++<500){var oP=cap.Pick/ipoP,oK=cap.Pack/ipoK,st=oP<=oK?'Pick':'Pack',rk=st==='Pick'?'pick':'pack';
+        var bi=-1,br=-1;un.forEach(function(i,jj){var r=PLAN.people[i][rk];if(r>br){br=r;bi=jj;}});
+        if(bi<0)break; var pi=un.splice(bi,1)[0];PLAN.people[pi].assign=st;cap[st]+=PLAN.people[pi][rk]*PLAN.people[pi].hours;}}}
+  if(!silent){planRenderRoster();planCompute();}}
 function planCompute(){if(!PLAN)return;
-  var N=num('pl_orders',0), shift=num('pl_shift',8)||8, pv=document.getElementById('pl_people').value;
-  var people=(pv===''||pv==null)?null:parseFloat(pv);
-  var totH=0, totItems=0, maxH=0;
-  PLAN.act.forEach(function(a){var rate=num('pl_rate_'+a.key,a.rate)||a.rate;
-    var items=Math.round(N*a.ipo), hrs=rate>0?items/rate:0; totH+=hrs; totItems+=items; if(hrs>maxH)maxH=hrs;});
-  PLAN.act.forEach(function(a){var rate=num('pl_rate_'+a.key,a.rate)||a.rate;
-    var items=Math.round(N*a.ipo), hrs=rate>0?items/rate:0;
-    set('pli_'+a.key,fmt(items)); set('plh_'+a.key,'<b>'+hrs.toFixed(1)+'</b>'+(hrs>=maxH&&maxH>0?' <span class=s style=color:#b45309>bottleneck</span>':'')); set('plp_'+a.key,(hrs/shift).toFixed(1));});
-  var ppl=totH/shift;
-  set('pl_titems',fmt(totItems)); set('pl_thrs','<b>'+totH.toFixed(1)+'</b>'); set('pl_tppl','<b>'+ppl.toFixed(1)+'</b>');
-  set('pl_hero','<div class=planhero><div><div class=phn>'+totH.toFixed(0)+'</div><div class=phl>labor hours</div></div>'+
-    '<div><div class=phn>'+ppl.toFixed(1)+'</div><div class=phl>people @ '+shift+'h</div></div>'+
-    '<div class=phd>to ship <b>'+fmt(N)+'</b> orders&ensp;<span class=sub style=font-weight:400>(&asymp;'+fmt(totItems)+' items handled)</span></div></div>');
+  var N=num('pl_orders',0);
+  var cap={Pick:0,Pack:0,Engrave:0}, hrs={Pick:0,Pack:0,Engrave:0,Other:0}, nA={Pick:0,Pack:0,Engrave:0,Other:0};
+  PLAN.people.forEach(function(p,i){var out=0;
+    if(p.inn){var a=p.assign, rate=(a==='Pick'?p.pick:a==='Pack'?p.pack:a==='Engrave'?p.eng:0);
+      out=Math.round(rate*p.hours); if(cap[a]!=null)cap[a]+=out; if(hrs[a]!=null)hrs[a]+=p.hours; nA[a]=(nA[a]||0)+1;}
+    set('plout_'+i, p.inn?(out?fmt(out)+' items':'<span class=dmt>—</span>'):'<span class=dmt>out</span>');});
+  var ipoP=PLAN.ipo.pick||0.001, ipoK=PLAN.ipo.pack||0.001, ipoE=PLAN.ipo.engrave||0;
+  var oPick=cap.Pick/ipoP, oPack=cap.Pack/ipoK, orders=Math.floor(Math.min(oPick,oPack));
+  var bneck=oPick<=oPack?'Pick':'Pack';
+  var engNeed=Math.round(orders*ipoE), engHave=Math.round(cap.Engrave), engOK=(engHave>=engNeed)||engNeed===0;
+  var stat='<table class=plantbl style="margin:8px 0 4px"><tr><th style=text-align:left>Station</th><th>People</th><th>Hours</th><th>Item capacity</th><th>Orders it supports</th></tr>';
+  [['Pick',oPick],['Pack',oPack]].forEach(function(r){var isb=(r[0]===bneck);
+    stat+='<tr'+(isb?' class=plbn':'')+'><td style=text-align:left>'+r[0]+(isb?' <span class=s style=color:#b45309>&larr; bottleneck</span>':'')+'</td><td>'+(nA[r[0]]||0)+'</td><td>'+hrs[r[0]].toFixed(1)+'</td><td>'+fmt(Math.round(cap[r[0]]))+'</td><td><b>'+fmt(Math.floor(r[1]))+'</b></td></tr>';});
+  stat+='<tr><td style=text-align:left>Engrave</td><td>'+(nA.Engrave||0)+'</td><td>'+hrs.Engrave.toFixed(1)+'</td><td>'+fmt(engHave)+'</td><td>'+(engNeed?(engOK?'<span style="color:#15803d">keeps pace ('+fmt(engNeed)+' needed)</span>':'<span style="color:#b91c1c">short '+fmt(engNeed-engHave)+' items &mdash; assign an engraver</span>'):'<span class=dmt>none needed</span>')+'</td></tr>';
+  if(nA.Other)stat+='<tr><td style=text-align:left>Other <span class=s>restock / returns / off-line</span></td><td>'+nA.Other+'</td><td>'+hrs.Other.toFixed(1)+'</td><td class=dmt colspan=2>not on the order line</td></tr>';
+  stat+='</table>';set('plan_stations',stat);
+  var inN=0;PLAN.people.forEach(function(p){if(p.inn)inN++;});
+  var totH=hrs.Pick+hrs.Pack+hrs.Engrave+hrs.Other;
+  var v='<div class=planhero><div><div class=phn>'+fmt(orders)+'</div><div class=phl>orders/day this crew ships</div></div>'+
+    '<div><div class=phn>'+inN+'</div><div class=phl>on the floor &middot; '+totH.toFixed(0)+'h</div></div>'+
+    '<div class=phd>bottleneck: <b>'+bneck+'</b></div></div>';
   var cmp='';
-  if(people!=null&&people>0){var avail=people*shift, gap=totH-avail;
-    cmp='<div class="plancmp '+(gap>0.5?'short':'ok')+'">With <b>'+people+'</b> people at '+shift+'h you have <b>'+avail.toFixed(0)+'h</b>. '+
-      (gap>0.5?('The plan needs <b>'+gap.toFixed(1)+'h</b> more &mdash; about '+(gap/shift).toFixed(1)+' more person'+((gap/shift)>=1.5?'s':'')+', or move the deadline / trim scope.'):
-       (Math.abs(gap)<=0.5?'That lines up almost exactly.':('You have <b>'+(-gap).toFixed(1)+'h</b> of slack &mdash; about '+((-gap)/shift).toFixed(1)+' person to spare or redeploy.')))+'</div>';}
-  set('pl_cmp',cmp);}
-function planLineup(){if(!SPEED||!SPEED.stages)return '';
-  var h='<div class=sub style="margin:18px 0 8px"><b>Suggested lineup</b> &mdash; your fastest hands per activity (typical pace, from Speed &amp; Rankings). Assign top-down to cover the people above.</div><div class=lineup>';
-  planStages().forEach(function(s){var key=s[0];
-    var rk=(SPEED.stages[key]||[]).filter(function(r){return r.ranked;}).sort(function(a,b){return b.pace-a.pace;}).slice(0,5);
-    h+='<div class=lncol><div class=lnh>'+s[1]+'</div>';
-    if(!rk.length)h+='<div class=sub style=font-size:11px>not enough ranked data yet</div>';
-    rk.forEach(function(r,i){h+='<div class=lnrow><span>'+(i+1)+'. '+r.person+'</span><b>'+fmt(r.pace)+'<span class=s>/hr</span></b></div>';});
-    h+='</div>';});
-  return h+'</div>';}
-function planReset(){if(!PLAN)return;PLAN.act.forEach(function(a){var el=document.getElementById('pl_rate_'+a.key);if(el)el.value=Math.round(a.rate);});planCompute();}
+  if(N>0){ if(orders>=N){var xtra=(orders>N)?(' &mdash; room for <b>'+fmt(orders-N)+'</b> more'):'';
+      cmp='<div class="plancmp ok">Clears your target of <b>'+fmt(N)+'</b> orders'+xtra+'.'+(engNeed&&!engOK?' But engraving is short &mdash; put someone on Engrave.':'')+'</div>';}
+    else{var ipoB=(bneck==='Pick'?ipoP:ipoK), capB=cap[bneck], need=N*ipoB, extra=need-capB;
+      var avgB=hrs[bneck]>0?capB/hrs[bneck]:(planTeamRate(bneck.toLowerCase())||1), addH=avgB>0?extra/avgB:0;
+      cmp='<div class="plancmp short"><b>'+fmt(N-orders)+'</b> short of your <b>'+fmt(N)+'</b>-order target. Bottleneck is <b>'+bneck+'</b> &mdash; you need about <b>'+addH.toFixed(1)+'h</b> more '+bneck.toLowerCase()+' capacity: move a picker to '+bneck.toLowerCase()+', extend hours, or add a person.'+(engNeed&&!engOK?' Engraving is also short.':'')+'</div>';}}
+  set('plan_verdict', v+cmp);}
 
 // ===== Individual trends: one person's weekly pace per activity =====
 let TREND=null, trendChartObj=null;
