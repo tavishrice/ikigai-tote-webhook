@@ -158,6 +158,12 @@ def floor_stats():
         FROM it LEFT JOIN span sp USING (person,d) ORDER BY it.person, it.d""",
         [frm, to, ACTIVE_BREAK])
         rows = cur.fetchall()
+        cur.execute("SELECT id,person,d,hours,note,author FROM floor_note WHERE d BETWEEN %s AND %s "
+                    "ORDER BY d, id", [frm, to])
+        note_rows = cur.fetchall()
+    notes = {}
+    for (nid,person,nd,nh,note,author) in note_rows:
+        notes.setdefault(person, []).append(dict(id=nid, d=str(nd), hours=float(nh or 0), note=note, author=author or ""))
     ppl = {}
     for (person,d,dow,active_s,ful,repl,first,last,span_s) in rows:
         p = ppl.setdefault(person, dict(person=person, type=PERSON_TYPE.get(person,""),
@@ -182,9 +188,17 @@ def floor_stats():
         p["items_per_hr"]=round(items/hrs) if hrs>0 else 0
         p["util"]=round(100*p["active_s"]/p["span_s"]) if p["span_s"]>0 else 0
         p["avg_span"]=round(p["span_s"]/p["active_days"]/3600.0,1) if p["active_days"] else 0   # typical first->last window/day
+        nl=notes.get(p["person"],[]); p["notes"]=nl; p["proj_hours"]=round(sum(x["hours"] for x in nl),1)
         del p["active_s"]; del p["span_s"]; del p["ful"]; del p["repl"]
         out.append(p)
-    out.sort(key=lambda x:-x["hours"])
+    seen={p["person"] for p in out}   # people with ONLY logged project time (no scans) still show up
+    for person,nl in notes.items():
+        if person in seen: continue
+        out.append(dict(person=person, type=PERSON_TYPE.get(person,""), active_days=0,
+            first_in="", last_out="", hours=0, hours_per_day=0, items=0, ful_items=0, repl_items=0,
+            items_per_day=0, items_per_hr=0, util=0, avg_span=0, days=[],
+            notes=nl, proj_hours=round(sum(x["hours"] for x in nl),1)))
+    out.sort(key=lambda x:-(x["hours"]+x.get("proj_hours",0)))
     return jsonify(range={"from":frm,"to":to}, days=_daylist(frm,to), people=out)
 
 @app.route("/engraving")
@@ -220,6 +234,34 @@ def engraving():
         out.append(p)
     out.sort(key=lambda x:-x["items"])
     return jsonify(range={"from":frm,"to":to}, days=_daylist(frm,to), engravers=out)
+
+# ---------------- Leader annotations (special-project / off-scanner time) ----------------
+@app.route("/note", methods=["POST"])
+def add_note():
+    d = request.get_json(silent=True) or {}
+    person=(d.get("person") or "").strip()[:80]
+    day=(d.get("date") or "").strip()[:10]
+    note=(d.get("note") or "").strip()[:500]
+    author=(d.get("author") or "").strip()[:80]
+    try: hours=float(d.get("hours") or 0)
+    except Exception: hours=0.0
+    hours=max(0.0, min(24.0, hours))
+    try: dt.date.fromisoformat(day)
+    except Exception: return jsonify(ok=False, error="bad date"), 400
+    if not person or (hours<=0 and not note):
+        return jsonify(ok=False, error="need a person and hours or a note"), 400
+    with connect() as c, c.cursor() as cur:
+        cur.execute("INSERT INTO floor_note (person,d,hours,note,author) VALUES (%s,%s,%s,%s,%s) RETURNING id",
+                    (person, day, hours, note, author)); nid=cur.fetchone()[0]; c.commit()
+    return jsonify(ok=True, id=nid)
+
+@app.route("/note/delete", methods=["POST"])
+def del_note():
+    nid=(request.get_json(silent=True) or {}).get("id")
+    if not nid: return jsonify(ok=False), 400
+    with connect() as c, c.cursor() as cur:
+        cur.execute("DELETE FROM floor_note WHERE id=%s", (int(nid),)); c.commit()
+    return jsonify(ok=True)
 
 # ---------------- Speed & Rankings ----------------
 # How fast each person works at each activity, so the right people get assigned to the right task.
@@ -522,6 +564,16 @@ td.dcell>b{font-size:12px;color:var(--ink)}
 th.dsep,td.dsep{width:10px;min-width:10px;max-width:10px;padding:0;background:#f2f5f9}
 td.mix{white-space:nowrap;font-size:12px}
 .mlid{color:#2563eb;font-weight:700}.mipe{color:#0d9488;font-weight:700}.mdotw{color:#b45309;font-weight:700}
+.nbox{border:1px solid var(--line);border-radius:10px;padding:10px 14px;background:#fbfcfe}
+.nbox summary{cursor:pointer;font-size:12.5px;font-weight:600;color:var(--ink-2)}
+.nbox summary .s{color:var(--muted);font-weight:400}
+.nrow{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+.nin{padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;font-family:inherit;background:#fff}
+.nin:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak)}
+.nhrs{width:78px}.nnote{flex:1;min-width:220px}
+.notechip{display:inline-flex;align-items:center;gap:6px;background:#eef2ff;color:#3730a3;border-radius:8px;padding:3px 9px;font-size:11.5px;margin:8px 6px 0 0}
+.notechip b{color:#1e1b4b}.notechip .x{cursor:pointer;color:#818cf8;font-weight:700;margin-left:2px}
+.projh{color:#4338ca;font-weight:700}
 .wchip{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10.5px;font-weight:600;margin:2px 4px 2px 0;white-space:nowrap;cursor:default}
 .wchip.r{background:#fef2f2;color:#b91c1c}
 .wchip.a{background:#fffbeb;color:#b45309}
@@ -586,8 +638,20 @@ td.mix{white-space:nowrap;font-size:12px}
     <h2>Floor Time <span style="color:#9ca3af;font-weight:400">&mdash; the effectiveness auditor: hours &amp; output, by day</span></h2>
     <div class=sub style=margin:0><b>Active hours</b> = from a person&rsquo;s first scan of the day to their last, minus any gap of 45+ minutes (a break). <b>Utilization</b> = active ÷ time-on-floor. <b>Items/hr</b> is the units-per-labor-hour (UPLH) benchmark. All floor work (pick + pack + engrave + restock), Eastern time.</div>
     <div id=floortable></div>
+    <details class=nbox style=margin-top:14px>
+      <summary>&#43; Log special-project / off-scanner time <span class=s>(returns, entryway cleanup, meetings &mdash; work that doesn&rsquo;t scan)</span></summary>
+      <div class=nrow>
+        <input id=n_person list=roster placeholder="Person" class=nin autocomplete=off>
+        <input id=n_date type=date class=nin>
+        <input id=n_hours type=number step=0.5 min=0 max=24 placeholder="Hours" class="nin nhrs">
+        <input id=n_note placeholder="What were they doing?" class="nin nnote">
+        <button class=pill onclick="addNote()">Add</button><span id=n_status class=sub></span>
+      </div>
+      <div id=n_list></div>
+    </details>
   </div>
 </div>
+<datalist id=roster></datalist>
 
 <div id=engt class=hide>
   <div class=card>
@@ -813,23 +877,44 @@ function renderFloor(){if(!FLOOR)return;
   let h='<table><tr>'+th('person','Person','')+'<th>Type</th>'+
     '<th>First in</th><th>Last out</th>'+th('active_days','Days','active')+
     th('hours','Hours','active')+th('hours_per_day','Hrs/day','avg')+th('avg_span','Span/day','first→last')+th('util','Util','active÷span')+
-    th('items','Items','all work')+th('items_per_day','Items/day','')+th('items_per_hr','Items/hr','UPLH');
+    th('items','Items','all work')+th('items_per_day','Items/day','')+th('items_per_hr','Items/hr','UPLH')+th('proj_hours','Proj h','off-scanner');
   if(showDays)h+='<th class=dsep></th>'+days.map(dhead).join('');
   h+='</tr>';const T={hours:0,items:0};const pad='<td></td><td></td>';
   arr.forEach(p=>{const m={};p.days.forEach(x=>m[x.d]=x);
+    const projT=(p.notes||[]).map(n=>n.d+' · '+n.hours+'h · '+(n.note||'')).join(' | ').replace(/"/g,'&quot;');
     h+='<tr><td class=name>'+p.person+'</td><td>'+badge(p.type)+'</td>'+
       '<td>'+(p.first_in||'—')+'</td><td>'+(p.last_out||'—')+'</td>'+
       '<td>'+p.active_days+'</td><td><b>'+p.hours.toFixed(1)+'</b></td><td>'+p.hours_per_day.toFixed(1)+'</td><td>'+p.avg_span.toFixed(1)+'</td>'+
-      '<td>'+chip(p.util)+'</td><td><b>'+fmt(p.items)+'</b></td><td>'+fmt(p.items_per_day)+'</td><td><b>'+fmt(p.items_per_hr)+'</b></td>';
+      '<td>'+chip(p.util)+'</td><td><b>'+fmt(p.items)+'</b></td><td>'+fmt(p.items_per_day)+'</td><td><b>'+fmt(p.items_per_hr)+'</b></td>'+
+      '<td>'+(p.proj_hours?'<span class=projh title="'+projT+'">'+p.proj_hours.toFixed(1)+'</span>':'<span class=dmt>·</span>')+'</td>';
     if(showDays)h+='<td class=dsep></td>'+days.map(d=>{const x=m[d.d];
       if(!x||(!x.hours&&!x.ful&&!x.repl))return '<td class="dcell'+(d.dow>=6?' wknd':'')+'"><span class=dmt>·</span></td>';
       return '<td class="dcell'+(d.dow>=6?' wknd':'')+'" title="'+(x.first||'')+'–'+(x.last||'')+' · '+x.util+'% util"><b>'+x.hours.toFixed(1)+'h</b><div class=dsub>'+fmt(x.ful+x.repl)+'</div></td>';}).join('');
     h+='</tr>';T.hours+=p.hours;T.items+=p.items;});
-  h+='<tr class=tot><td>Team</td><td></td>'+pad+'<td></td><td><b>'+T.hours.toFixed(1)+'</b></td><td></td><td></td><td></td><td><b>'+fmt(T.items)+'</b></td><td></td><td><b>'+fmt(T.hours>0?Math.round(T.items/T.hours):0)+'</b></td>'+(showDays?'<td class=dsep></td>'+days.map(()=>'<td></td>').join(''):'')+'</tr>';
+  h+='<tr class=tot><td>Team</td><td></td>'+pad+'<td></td><td><b>'+T.hours.toFixed(1)+'</b></td><td></td><td></td><td></td><td><b>'+fmt(T.items)+'</b></td><td></td><td><b>'+fmt(T.hours>0?Math.round(T.items/T.hours):0)+'</b></td><td></td>'+(showDays?'<td class=dsep></td>'+days.map(()=>'<td></td>').join(''):'')+'</tr>';
   h+='</table>';
-  const note='<div class=sub style=margin-top:8px>Sorted by '+floorSort.replace(/_/g,' ')+'. <b>First in / Last out</b> = earliest and latest scan in the window. '+(showDays?'Each day cell = <b>hours</b> over <b>items</b> (hover for first–last &amp; utilization).':'Switch <b>Detail → Detailed</b> above for the day-by-day grid.')+' <b>Util</b> under 55% (red) = long idle stretches inside the on-floor window.</div>';
-  document.getElementById('floortable').innerHTML='<div class=tablewrap>'+h+'</div>'+note;}
+  const note='<div class=sub style=margin-top:8px>Sorted by '+floorSort.replace(/_/g,' ')+'. <b>First in / Last out</b> = earliest &amp; latest scan; <b>Span/day</b> = typical first→last window (Hours removes 45-min+ breaks from it). <b>Proj h</b> = off-scanner project time you&rsquo;ve logged below (hover for detail). '+(showDays?'Day cell = <b>hours</b> over <b>items</b>.':'Switch <b>Detail → Detailed</b> for the day-by-day grid.')+'</div>';
+  document.getElementById('floortable').innerHTML='<div class=tablewrap>'+h+'</div>'+note;
+  // roster + existing-notes list for the annotation panel
+  if(DATA){const dl=document.getElementById('roster');if(dl)dl.innerHTML=DATA.people.map(p=>'<option value="'+p.person+'">').join('');}
+  const allNotes=[];FLOOR.people.forEach(p=>(p.notes||[]).forEach(n=>allNotes.push(Object.assign({person:p.person},n))));
+  allNotes.sort((a,b)=>a.d<b.d?1:-1);
+  const nl=document.getElementById('n_list');
+  if(nl)nl.innerHTML=allNotes.length?('<div style=margin-top:6px>'+allNotes.map(n=>'<span class=notechip><b>'+n.person+'</b> '+n.d+(n.hours?' · '+n.hours+'h':'')+(n.note?' · '+n.note:'')+' <span class=x title="delete" onclick="delNote('+n.id+')">✕</span></span>').join('')+'</div>'):'';}
 
+async function addNote(){
+  const person=document.getElementById('n_person').value.trim();
+  const date=document.getElementById('n_date').value||document.getElementById('to').value;
+  const hours=document.getElementById('n_hours').value, note=document.getElementById('n_note').value.trim();
+  const st=document.getElementById('n_status');
+  if(!person||(!hours&&!note)){st.textContent=' need a person + hours or a note';return;}
+  st.textContent=' saving…';
+  try{const r=await fetch('/note',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({person,date,hours,note})});
+    const j=await r.json();
+    if(j.ok){st.textContent=' added ✓';document.getElementById('n_hours').value='';document.getElementById('n_note').value='';FLOOR=null;floorKey=null;loadFloor();}
+    else st.textContent=' '+(j.error||'error');
+  }catch(e){st.textContent=' could not save';}}
+async function delNote(id){try{await fetch('/note/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});FLOOR=null;floorKey=null;loadFloor();}catch(e){}}
 async function loadEngraving(){const f=document.getElementById('from').value,t=document.getElementById('to').value,k=f+'|'+t;
   if(ENGR&&engKey===k){renderEngraving();return;}
   document.getElementById('engtable').innerHTML='<div class=sub>loading…</div>';
