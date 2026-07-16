@@ -25,7 +25,7 @@ FALLBACK_HR = 12    # if nothing at/just-before the scan, take the nearest batch
 
 UPDATE_SQL = f"""
 WITH b AS (   -- the batch received_at we attribute each scan to
-  SELECT e.id, e.tote_barcode, e.ts,
+  SELECT e.id, e.person, e.tote_barcode, e.ts,
     COALESCE(
       (SELECT max(t.received_at) FROM tote_content t
          WHERE t.tote_barcode=e.tote_barcode AND t.received_at <= e.ts + interval '{GRACE_MIN} minutes'),
@@ -43,15 +43,19 @@ a AS (   -- resolve order(s), item count and line breakdown for that batch
     (SELECT sum(t.quantity) FROM tote_content t
        WHERE t.tote_barcode=b.tote_barcode AND t.received_at=b.bt) items,
     (SELECT jsonb_agg(jsonb_build_object('order',t.order_number,'sku',t.sku,'qty',t.quantity,'type',t.engraving_type))
-       FROM tote_content t WHERE t.tote_barcode=b.tote_barcode AND t.received_at=b.bt) lines
+       FROM tote_content t WHERE t.tote_barcode=b.tote_barcode AND t.received_at=b.bt) lines,
+    -- DEDUPE re-scans: within one person + tote_barcode + batch, only the FIRST scan carries the item
+    -- count; any re-scan of the same tote-occupancy carries 0 items (it's the same physical engraving,
+    -- not new work). Distinct-tote count and the scan/action record are untouched.
+    row_number() OVER (PARTITION BY b.person, b.tote_barcode, b.bt ORDER BY b.ts, b.id) AS rn
   FROM b
 )
 UPDATE event e SET
-  quantity     = COALESCE(a.items, 1),
+  quantity     = CASE WHEN a.rn > 1 THEN 0 ELSE COALESCE(a.items, 1) END,
   order_number = NULLIF(split_part(COALESCE(a.orders,''), ', ', 1), ''),
-  raw = CASE WHEN a.bt IS NULL THEN '{{"matched":false}}'::jsonb
+  raw = CASE WHEN a.bt IS NULL THEN jsonb_build_object('matched',false,'dup',a.rn>1)
              ELSE jsonb_build_object('matched',true,'batch_ts',a.bt,'orders',a.orders,
-                                     'items',a.items,'lines',a.lines) END
+                                     'items',a.items,'lines',a.lines,'dup',a.rn>1) END
 FROM a WHERE e.id=a.id
 """
 
