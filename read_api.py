@@ -677,6 +677,12 @@ td.sub2{color:var(--muted)}
 .gr{color:#6d28d9;background:#f3eeff}
 th.gsep,td.gsep{width:16px;min-width:16px;max-width:16px;padding:0;border-bottom:none;background:transparent}
 tr:hover td.gsep{background:transparent}
+/* whole-column group tints (the eye follows the band down the table) */
+td.gct,th.gct{background:#f4f6fa}
+td.gcf,th.gcf{background:#eff5ff}
+td.gcr,th.gcr{background:#f7f3ff}
+tr:hover td.gct{background:#eaeef4}tr:hover td.gcf{background:#e5eeff}tr:hover td.gcr{background:#efe8ff}
+tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{background:#efe7ff}
 .wchip{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10.5px;font-weight:600;margin:2px 4px 2px 0;white-space:nowrap;cursor:default}
 .wchip.r{background:#fef2f2;color:#b91c1c}
 .wchip.a{background:#fffbeb;color:#b45309}
@@ -731,7 +737,7 @@ tr:hover td.gsep{background:transparent}
   </div>
   <div class=card style=margin-top:16px>
     <h2>Per-person detail</h2>
-    <div class=sub style=margin:0>Three groups, left to right: <b>On the clock</b> (days &amp; hours worked, so you can see whether someone's ahead just because they put in more time), <b>Fulfillment</b> (pick + pack + engrave, one figure), and <b>Restocking</b> (separate). Click any column header to sort. <b>Worked</b> = active hours (breaks removed); <b>Since 1st</b> = clock time from first to last scan.</div>
+    <div class=sub style=margin:0>Three groups, left to right: <b>On the clock</b> (days &amp; hours worked, so you can see whether someone's ahead just because they put in more time), <b>Fulfillment</b> (pick + pack + engrave, one figure), and <b>Restocking</b> (separate). Click any column header to sort. <b>Hours</b> = clock time from first to last scan &mdash; the default &ldquo;hours worked,&rdquo; since gaps may be special-project time rather than idle. <b>Active</b> = that same window minus 45-min+ breaks (the stricter, calculated number).</div>
     <div id=detail></div>
   </div>
 </div>
@@ -942,6 +948,8 @@ function drawDetail(ppl,unit,v){
   const arw=k=>sortKey===k?'<span class=arw>'+(sortDir<0?'▼':'▲')+'</span>':'';
   const th=(k,lab,sub)=>'<th class="srt'+(sortKey===k?' act':'')+'" onclick="sortBy(\''+k+'\')">'+lab+(sub?' <span class=s>'+sub+'</span>':'')+arw(k)+'</th>';
   const nful=det?6:3;   // items,[pick,pack,eng],share,orders
+  // sortable header with a per-group tint class (gct/gcf/gcr) so the whole column band is coloured
+  const thg=(g,k,l,s)=>'<th class="srt '+g+(sortKey===k?' act':'')+'" onclick="sortBy(\''+k+'\')">'+l+(s?' <span class=s>'+s+'</span>':'')+arw(k)+'</th>';
   // group-title header row
   let h='<table><tr class=grp>'+
     '<th></th><th></th>'+
@@ -954,42 +962,42 @@ function drawDetail(ppl,unit,v){
   // column header row
   h+='<tr>'+th('person','Person','')+
     '<th class=srt onclick="sortBy(\'type\')">Type'+arw('type')+'</th>'+
-    th('active_days','Days',(wd?'of '+wd:'active'))+
-    th('worked_h','Worked','h active')+
-    th('span_h','Since 1st','h span')+
+    thg('gct','active_days','Days',(wd?'of '+wd:'active'))+
+    thg('gct','span_h','Hours','1st&rarr;last')+
+    thg('gct','worked_h','Active','breaks out')+
     '<th class=gsep></th>'+
-    th('items_total','Items','pick+pack+engrave')+
-    (det? th('_pick','Picked','ShipHero')+th('_pack','Packed','SH + Shopify')+th('_eng','Engraved','logger') : '')+
-    th('share','Share','of team')+
-    th('orders_total','Orders','fulfillment')+
+    thg('gcf','items_total','Items','pick+pack+engrave')+
+    (det? thg('gcf','_pick','Picked','ShipHero')+thg('gcf','_pack','Packed','SH + Shopify')+thg('gcf','_eng','Engraved','logger') : '')+
+    thg('gcf','share','Share','of team')+
+    thg('gcf','orders_total','Orders','fulfillment')+
     '<th class=gsep></th>'+
-    th('replenished','Units','')+
-    th('rshare','Share','of team')+
+    thg('gcr','replenished','Units','')+
+    thg('gcr','rshare','Share','of team')+
     '</tr>';
   const T={items:0,orders:0,restock:0,_pick:0,_pack:0,_eng:0,worked:0,span:0};
   arr.forEach(p=>{
     const dstr=p.active_days?(p.active_days+(wd?' / '+wd:'')):'&mdash;';
     h+='<tr><td class=name>'+p.person+'</td><td>'+badge(p.type)+'</td>'+
-      '<td>'+dstr+'</td>'+
-      '<td><b>'+(p.worked_h?p.worked_h.toFixed(1):'&mdash;')+'</b></td>'+
-      '<td class=sub2>'+(p.span_h?p.span_h.toFixed(1):'&mdash;')+'</td>'+
+      '<td class=gct>'+dstr+'</td>'+
+      '<td class=gct><b>'+(p.span_h?p.span_h.toFixed(1):'&mdash;')+'</b></td>'+
+      '<td class="gct sub2">'+(p.worked_h?p.worked_h.toFixed(1):'&mdash;')+'</td>'+
       '<td class=gsep></td>'+
-      '<td class=fi><b>'+fmt(p.items)+'</b></td>'+
-      (det? '<td>'+fmt(p._pick)+'</td><td>'+fmt(p._pack)+'</td><td class=eng>'+fmt(p._eng)+'</td>' : '')+
-      '<td class=shr>'+p.share+'%</td>'+
-      '<td>'+fmt(p.orders)+'</td>'+
+      '<td class="gcf fi"><b>'+fmt(p.items)+'</b></td>'+
+      (det? '<td class=gcf>'+fmt(p._pick)+'</td><td class=gcf>'+fmt(p._pack)+'</td><td class="gcf eng">'+fmt(p._eng)+'</td>' : '')+
+      '<td class="gcf shr">'+p.share+'%</td>'+
+      '<td class=gcf>'+fmt(p.orders)+'</td>'+
       '<td class=gsep></td>'+
-      '<td class=p><b>'+fmt(p.restock)+'</b></td>'+
-      '<td class=shr>'+(p.restock?p.rshare+'%':'&mdash;')+'</td></tr>';
+      '<td class="gcr p"><b>'+fmt(p.restock)+'</b></td>'+
+      '<td class="gcr shr">'+(p.restock?p.rshare+'%':'&mdash;')+'</td></tr>';
     T.items+=p.items;T.orders+=p.orders;T.restock+=p.restock;T._pick+=p._pick;T._pack+=p._pack;T._eng+=p._eng;T.worked+=p.worked_h;T.span+=p.span_h;});
   h+='<tr class=tot><td>Total</td><td></td>'+
-    '<td></td><td><b>'+(T.worked?T.worked.toFixed(0):'')+'</b></td><td class=sub2>'+(T.span?T.span.toFixed(0):'')+'</td>'+
+    '<td class=gct></td><td class=gct><b>'+(T.span?T.span.toFixed(0):'')+'</b></td><td class="gct sub2">'+(T.worked?T.worked.toFixed(0):'')+'</td>'+
     '<td class=gsep></td>'+
-    '<td><b>'+fmt(T.items)+'</b></td>'+
-    (det? '<td>'+fmt(T._pick)+'</td><td>'+fmt(T._pack)+'</td><td>'+fmt(T._eng)+'</td>' : '')+
-    '<td>100%</td><td>'+fmt(T.orders)+'</td>'+
+    '<td class=gcf><b>'+fmt(T.items)+'</b></td>'+
+    (det? '<td class=gcf>'+fmt(T._pick)+'</td><td class=gcf>'+fmt(T._pack)+'</td><td class=gcf>'+fmt(T._eng)+'</td>' : '')+
+    '<td class=gcf>100%</td><td class=gcf>'+fmt(T.orders)+'</td>'+
     '<td class=gsep></td>'+
-    '<td class=p><b>'+fmt(T.restock)+'</b></td><td>100%</td></tr>';
+    '<td class="gcr p"><b>'+fmt(T.restock)+'</b></td><td class=gcr>100%</td></tr>';
   h+='</table>';
   document.getElementById('detail').innerHTML='<div class=tablewrap>'+h+'</div>';
 }
