@@ -181,6 +181,7 @@ def floor_stats():
         p["items_per_day"]=round(items/p["active_days"]) if p["active_days"] else 0
         p["items_per_hr"]=round(items/hrs) if hrs>0 else 0
         p["util"]=round(100*p["active_s"]/p["span_s"]) if p["span_s"]>0 else 0
+        p["avg_span"]=round(p["span_s"]/p["active_days"]/3600.0,1) if p["active_days"] else 0   # typical first->last window/day
         del p["active_s"]; del p["span_s"]; del p["ful"]; del p["repl"]
         out.append(p)
     out.sort(key=lambda x:-x["hours"])
@@ -608,6 +609,11 @@ td.mix{white-space:nowrap;font-size:12px}
     <div id=speed_boards class=spgrid style=margin-top:12px></div>
   </div>
   <div class=card style=margin-top:16px>
+    <h2>Where the time goes <span style="color:#9ca3af;font-weight:400">&mdash; tracked hours by activity, per person</span></h2>
+    <div class=sub style=margin:0>Hours actively spent on each task (continuous same-task scans, breaks removed). Answers &ldquo;how much of the week did each person spend picking vs packing vs engraving.&rdquo; A floor, not a full timesheet.</div>
+    <div id=speed_hours style=margin-top:8px></div>
+  </div>
+  <div class=card style=margin-top:16px>
     <h2>Who&rsquo;s best at what &mdash; assignment matrix</h2>
     <div class=sub style=margin:0>Each cell = units/active-hr with a percentile bar within that activity (green = fast). <b>Best fit</b> = the activity where the person ranks highest. Grey dot = has some data but not enough to rank; blank = never did it.</div>
     <div id=speed_matrix style=margin-top:8px></div>
@@ -806,20 +812,20 @@ function renderFloor(){if(!FLOOR)return;
   const th=(k,l,s)=>'<th class="srt'+(floorSort===k?' act':'')+'" onclick="floorSortBy(\''+k+'\')">'+l+(s?' <span class=s>'+s+'</span>':'')+arw(k)+'</th>';
   let h='<table><tr>'+th('person','Person','')+'<th>Type</th>'+
     '<th>First in</th><th>Last out</th>'+th('active_days','Days','active')+
-    th('hours','Hours','active')+th('hours_per_day','Hrs/day','avg')+th('util','Util','active÷floor')+
+    th('hours','Hours','active')+th('hours_per_day','Hrs/day','avg')+th('avg_span','Span/day','first→last')+th('util','Util','active÷span')+
     th('items','Items','all work')+th('items_per_day','Items/day','')+th('items_per_hr','Items/hr','UPLH');
   if(showDays)h+='<th class=dsep></th>'+days.map(dhead).join('');
   h+='</tr>';const T={hours:0,items:0};const pad='<td></td><td></td>';
   arr.forEach(p=>{const m={};p.days.forEach(x=>m[x.d]=x);
     h+='<tr><td class=name>'+p.person+'</td><td>'+badge(p.type)+'</td>'+
       '<td>'+(p.first_in||'—')+'</td><td>'+(p.last_out||'—')+'</td>'+
-      '<td>'+p.active_days+'</td><td><b>'+p.hours.toFixed(1)+'</b></td><td>'+p.hours_per_day.toFixed(1)+'</td>'+
+      '<td>'+p.active_days+'</td><td><b>'+p.hours.toFixed(1)+'</b></td><td>'+p.hours_per_day.toFixed(1)+'</td><td>'+p.avg_span.toFixed(1)+'</td>'+
       '<td>'+chip(p.util)+'</td><td><b>'+fmt(p.items)+'</b></td><td>'+fmt(p.items_per_day)+'</td><td><b>'+fmt(p.items_per_hr)+'</b></td>';
     if(showDays)h+='<td class=dsep></td>'+days.map(d=>{const x=m[d.d];
       if(!x||(!x.hours&&!x.ful&&!x.repl))return '<td class="dcell'+(d.dow>=6?' wknd':'')+'"><span class=dmt>·</span></td>';
       return '<td class="dcell'+(d.dow>=6?' wknd':'')+'" title="'+(x.first||'')+'–'+(x.last||'')+' · '+x.util+'% util"><b>'+x.hours.toFixed(1)+'h</b><div class=dsub>'+fmt(x.ful+x.repl)+'</div></td>';}).join('');
     h+='</tr>';T.hours+=p.hours;T.items+=p.items;});
-  h+='<tr class=tot><td>Team</td><td></td>'+pad+'<td></td><td><b>'+T.hours.toFixed(1)+'</b></td><td></td><td></td><td><b>'+fmt(T.items)+'</b></td><td></td><td><b>'+fmt(T.hours>0?Math.round(T.items/T.hours):0)+'</b></td>'+(showDays?'<td class=dsep></td>'+days.map(()=>'<td></td>').join(''):'')+'</tr>';
+  h+='<tr class=tot><td>Team</td><td></td>'+pad+'<td></td><td><b>'+T.hours.toFixed(1)+'</b></td><td></td><td></td><td></td><td><b>'+fmt(T.items)+'</b></td><td></td><td><b>'+fmt(T.hours>0?Math.round(T.items/T.hours):0)+'</b></td>'+(showDays?'<td class=dsep></td>'+days.map(()=>'<td></td>').join(''):'')+'</tr>';
   h+='</table>';
   const note='<div class=sub style=margin-top:8px>Sorted by '+floorSort.replace(/_/g,' ')+'. <b>First in / Last out</b> = earliest and latest scan in the window. '+(showDays?'Each day cell = <b>hours</b> over <b>items</b> (hover for first–last &amp; utilization).':'Switch <b>Detail → Detailed</b> above for the day-by-day grid.')+' <b>Util</b> under 55% (red) = long idle stretches inside the on-floor window.</div>';
   document.getElementById('floortable').innerHTML='<div class=tablewrap>'+h+'</div>'+note;}
@@ -941,6 +947,18 @@ function renderSpeed(){
     b+='</div>';
   });
   document.getElementById('speed_boards').innerHTML=b;
+  // ---- hours by activity (where each person's time went) ----
+  const HB={};
+  SP_STAGES.forEach(s=>(S[s]||[]).forEach(r=>{(HB[r.person]=HB[r.person]||{type:r.type})[s]=(r.active_min||0)/60;}));
+  const hrows=Object.entries(HB).map(([person,o])=>({person,type:o.type,
+    pick:o.pick||0,pack:o.pack||0,engrave:o.engrave||0,replenish:o.replenish||0,
+    total:(o.pick||0)+(o.pack||0)+(o.engrave||0)+(o.replenish||0)}))
+    .filter(r=>r.total>0 && (segval('team')==='all'||r.type===segval('team'))).sort((a,b)=>b.total-a.total);
+  const hcell=v=>v>0?v.toFixed(1):'<span class=dmt>·</span>';
+  let hh='<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th>Type</th><th>Pick h</th><th>Pack h</th><th>Engrave h</th><th>Restock h</th><th>Total h</th></tr>';
+  hrows.forEach(r=>{hh+='<tr><td class=name>'+r.person+'</td><td>'+badge(r.type)+'</td><td>'+hcell(r.pick)+'</td><td>'+hcell(r.pack)+'</td><td>'+hcell(r.engrave)+'</td><td>'+hcell(r.replenish)+'</td><td><b>'+r.total.toFixed(1)+'</b></td></tr>';});
+  hh+='</table></div>';
+  document.getElementById('speed_hours').innerHTML=hrows.length?hh:'<div class=sub>No tracked activity in this window.</div>';
   // ---- assignment matrix ----
   const all=new Set();SP_STAGES.forEach(s=>(S[s]||[]).forEach(r=>all.add(r.person)));
   const order=[...all].sort((a,b)=>spActiveMin(S,b)-spActiveMin(S,a));
