@@ -35,10 +35,10 @@ def cors(resp):
 def _range():
     return request.args.get("from"), request.args.get("to")
 
+_ET = dt.timezone(dt.timedelta(hours=-4))   # ET (EDT) for the summer window
 def _ampm(ts):
     if not ts: return ""
-    et = ts.astimezone(dt.timezone(dt.timedelta(hours=-4)))   # ET (EDT) for the summer window
-    return et.strftime("%-I:%M %p")
+    return ts.astimezone(_ET).strftime("%-I:%M %p")
 
 def _daylist(frm, to):
     out=[]; d=dt.date.fromisoformat(frm); end=dt.date.fromisoformat(to)
@@ -167,19 +167,24 @@ def floor_stats():
     ppl = {}
     for (person,d,dow,active_s,ful,repl,first,last,span_s) in rows:
         p = ppl.setdefault(person, dict(person=person, type=PERSON_TYPE.get(person,""),
-            active_days=0, active_s=0.0, span_s=0.0, ful=0, repl=0, days=[], _first=None, _last=None))
+            active_days=0, active_s=0.0, span_s=0.0, ful=0, repl=0, days=[], _fi=(None,""), _lo=(None,"")))
         active_s=float(active_s or 0); span_s=float(span_s or 0)
         p["active_days"]+=1; p["active_s"]+=active_s; p["span_s"]+=span_s
         p["ful"]+=int(ful or 0); p["repl"]+=int(repl or 0)
-        if first and (p["_first"] is None or first < p["_first"]): p["_first"]=first
-        if last  and (p["_last"]  is None or last  > p["_last"]):  p["_last"]=last
+        # earliest/latest by TIME OF DAY (ET), not chronologically — "how early do they start, how late finish"
+        if first:
+            ft=first.astimezone(_ET).time()
+            if p["_fi"][0] is None or ft < p["_fi"][0]: p["_fi"]=(ft,_ampm(first))
+        if last:
+            lt=last.astimezone(_ET).time()
+            if p["_lo"][0] is None or lt > p["_lo"][0]: p["_lo"]=(lt,_ampm(last))
         p["days"].append(dict(d=str(d), dow=dow, hours=round(active_s/3600.0,2),
             ful=int(ful or 0), repl=int(repl or 0),
             first=_ampm(first), last=_ampm(last),
             util=(round(100*active_s/span_s) if span_s>0 else 0)))
     out=[]
     for p in ppl.values():
-        p["first_in"]=_ampm(p.pop("_first",None)); p["last_out"]=_ampm(p.pop("_last",None))
+        p["first_in"]=p.pop("_fi")[1]; p["last_out"]=p.pop("_lo")[1]
         hrs=p["active_s"]/3600.0; items=p["ful"]+p["repl"]
         p["hours"]=round(hrs,2)
         p["hours_per_day"]=round(hrs/p["active_days"],2) if p["active_days"] else 0
