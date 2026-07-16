@@ -35,6 +35,17 @@ def cors(resp):
 def _range():
     return request.args.get("from"), request.args.get("to")
 
+def _ampm(ts):
+    if not ts: return ""
+    et = ts.astimezone(dt.timezone(dt.timedelta(hours=-4)))   # ET (EDT) for the summer window
+    return et.strftime("%-I:%M %p")
+
+def _daylist(frm, to):
+    out=[]; d=dt.date.fromisoformat(frm); end=dt.date.fromisoformat(to)
+    while d<=end:
+        out.append(dict(d=str(d), dow=d.isoweekday())); d+=dt.timedelta(days=1)
+    return out
+
 @app.route("/health")
 def health():
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
@@ -65,6 +76,7 @@ def warehouse():
           count(*) FILTER (WHERE stage='replenish')                          move_cnt,
           count(*) FILTER (WHERE stage='count')                              count_cnt,
           count(DISTINCT tote_barcode) FILTER (WHERE stage='engrave')        eng_cnt,
+          count(DISTINCT et_day(ts)) FILTER (WHERE is_floor_labor(stage,subtype)) active_days,
           min(ts)  FILTER (WHERE is_floor_labor(stage,subtype))              first_ts,
           max(ts)  FILTER (WHERE is_floor_labor(stage,subtype))              last_ts
         FROM e GROUP BY person""", [frm, to])
@@ -91,8 +103,8 @@ def warehouse():
     people, floor = [], []
     tot = dict(pk_i=0,packsh_i=0,packshop_i=0,eng_i=0,pk_o=0,packsh_o=0,packshop_o=0,eng_o=0,repl=0)
     for r in rows:
-        (person,pk_i,pk_o,psh_i,psh_o,psp_i,psp_o,repl,eng_i,eng_o,pick_c,pack_c,ful_c,mov_c,cnt_c,eng_c,first,last)=r
-        people.append(dict(person=person, type=PERSON_TYPE.get(person,""),
+        (person,pk_i,pk_o,psh_i,psh_o,psp_i,psp_o,repl,eng_i,eng_o,pick_c,pack_c,ful_c,mov_c,cnt_c,eng_c,adays,first,last)=r
+        people.append(dict(person=person, type=PERSON_TYPE.get(person,""), active_days=int(adays or 0),
             items_picked_sh=pk_i, items_packed_sh=psh_i, items_packed_shop=psp_i,
             engraved_items=eng_i, engraved_totes=eng_c, engraved_orders=eng_o, replenished=repl,
             orders_picked_sh=pk_o, orders_packed_sh=psh_o, orders_packed_shop=psp_o))
@@ -109,15 +121,112 @@ def warehouse():
         shipped=dict(total=shipped[0], shiphero=shipped[1], shopify_only=shipped[2], both=shipped[3]),
         totals=tot, people=people, floor=floor)
 
+ACTIVE_BREAK = 2700  # seconds = 45 min. ONE definition of "active time" app-wide: from a person's first
+                     # scan to their last, with any gap >= 45 min removed as a break (Floor Time, Speed,
+                     # engraving hours all use it).
+
+@app.route("/floor")
+def floor_stats():
+    """Effectiveness auditor: per person, active hours (45-min-break session spans) and items, by day."""
+    frm, to = _range()
+    with connect() as c, c.cursor(row_factory=tuple_row) as cur:
+        cur.execute("""
+        WITH ev AS (
+          SELECT person, ts, (ts AT TIME ZONE 'America/New_York')::date d, stage, quantity
+          FROM event WHERE is_floor_labor(stage,subtype) AND et_day(ts) BETWEEN %s AND %s),
+        seq AS (
+          SELECT person, d, ts,
+            EXTRACT(epoch FROM (ts - lag(ts) OVER (PARTITION BY person,d ORDER BY ts))) gap
+          FROM ev),
+        sess AS (
+          SELECT person, d, ts,
+            sum(CASE WHEN gap IS NULL OR gap >= %s THEN 1 ELSE 0 END)
+                OVER (PARTITION BY person,d ORDER BY ts) sid FROM seq),
+        span AS (   -- active seconds = sum of session spans (breaks removed)
+          SELECT person, d, sum(sp) active_s FROM (
+            SELECT person, d, sid, EXTRACT(epoch FROM (max(ts)-min(ts))) sp
+            FROM sess GROUP BY person,d,sid) x GROUP BY person,d),
+        it AS (
+          SELECT person, d,
+            COALESCE(sum(quantity) FILTER (WHERE stage IN ('pick','pack','engrave')),0) ful,
+            COALESCE(sum(quantity) FILTER (WHERE stage='replenish'),0) repl,
+            min(ts) first_ts, max(ts) last_ts
+          FROM ev GROUP BY person,d)
+        SELECT it.person, it.d, EXTRACT(isodow FROM it.d)::int dow,
+               COALESCE(sp.active_s,0), it.ful, it.repl, it.first_ts, it.last_ts,
+               EXTRACT(epoch FROM (it.last_ts-it.first_ts)) span_s
+        FROM it LEFT JOIN span sp USING (person,d) ORDER BY it.person, it.d""",
+        [frm, to, ACTIVE_BREAK])
+        rows = cur.fetchall()
+    ppl = {}
+    for (person,d,dow,active_s,ful,repl,first,last,span_s) in rows:
+        p = ppl.setdefault(person, dict(person=person, type=PERSON_TYPE.get(person,""),
+            active_days=0, active_s=0.0, span_s=0.0, ful=0, repl=0, days=[]))
+        active_s=float(active_s or 0); span_s=float(span_s or 0)
+        p["active_days"]+=1; p["active_s"]+=active_s; p["span_s"]+=span_s
+        p["ful"]+=int(ful or 0); p["repl"]+=int(repl or 0)
+        p["days"].append(dict(d=str(d), dow=dow, hours=round(active_s/3600.0,2),
+            ful=int(ful or 0), repl=int(repl or 0),
+            first=_ampm(first), last=_ampm(last),
+            util=(round(100*active_s/span_s) if span_s>0 else 0)))
+    out=[]
+    for p in ppl.values():
+        hrs=p["active_s"]/3600.0; items=p["ful"]+p["repl"]
+        p["hours"]=round(hrs,2)
+        p["hours_per_day"]=round(hrs/p["active_days"],2) if p["active_days"] else 0
+        p["items"]=items; p["ful_items"]=p["ful"]; p["repl_items"]=p["repl"]
+        p["items_per_day"]=round(items/p["active_days"]) if p["active_days"] else 0
+        p["items_per_hr"]=round(items/hrs) if hrs>0 else 0
+        p["util"]=round(100*p["active_s"]/p["span_s"]) if p["span_s"]>0 else 0
+        del p["active_s"]; del p["span_s"]; del p["ful"]; del p["repl"]
+        out.append(p)
+    out.sort(key=lambda x:-x["hours"])
+    return jsonify(range={"from":frm,"to":to}, days=_daylist(frm,to), people=out)
+
+@app.route("/engraving")
+def engraving():
+    """Detailed engraving view, from the daily rollup (per engraver per day)."""
+    frm, to = _range()
+    with connect() as c, c.cursor(row_factory=tuple_row) as cur:
+        cur.execute("""SELECT person, et_day, scans, totes, matched_totes, dotw, lid, ipe,
+                              eng_units, orders, hours
+                       FROM contribution_daily WHERE stage='engrave' AND et_day BETWEEN %s AND %s
+                       ORDER BY person, et_day""", [frm, to])
+        rows = cur.fetchall()
+    ppl={}
+    for (person,d,scans,totes,matched,dotw,lid,ipe,units,orders,hours) in rows:
+        if not scans: continue
+        p=ppl.setdefault(person, dict(person=person, type=PERSON_TYPE.get(person,""),
+            active_days=0, scans=0, totes=0, matched=0, dotw=0, lid=0, ipe=0, items=0, orders=0, hours=0.0, days=[]))
+        h=float(hours or 0)
+        p["active_days"]+=1; p["scans"]+=int(scans); p["totes"]+=int(totes); p["matched"]+=int(matched or 0)
+        p["dotw"]+=int(dotw or 0); p["lid"]+=int(lid or 0); p["ipe"]+=int(ipe or 0)
+        p["items"]+=int(units or 0); p["orders"]+=int(orders or 0); p["hours"]+=h
+        p["days"].append(dict(d=str(d), dow=d.isoweekday(), totes=int(totes), items=int(units or 0),
+            hours=round(h,2), lid=int(lid or 0), ipe=int(ipe or 0), dotw=int(dotw or 0)))
+    out=[]
+    for p in ppl.values():
+        hrs=p["hours"]
+        p["hours"]=round(hrs,2)
+        p["items_per_hr"]=round(p["items"]/hrs) if hrs>0 else 0
+        p["totes_per_hr"]=round(p["totes"]/hrs,1) if hrs>0 else 0
+        p["items_per_day"]=round(p["items"]/p["active_days"]) if p["active_days"] else 0
+        p["items_per_tote"]=round(p["items"]/p["totes"],2) if p["totes"] else 0
+        p["match_rate"]=round(100*p["matched"]/p["totes"]) if p["totes"] else 0
+        out.append(p)
+    out.sort(key=lambda x:-x["items"])
+    return jsonify(range={"from":frm,"to":to}, days=_daylist(frm,to), engravers=out)
+
 # ---------------- Speed & Rankings ----------------
 # How fast each person works at each activity, so the right people get assigned to the right task.
-# Method (all params visible on the page): sort each person's scans for a stage in time; the gap to the
-# next scan is the time to do that unit of work. A gap LONGER than the stage's BREAK threshold means they
-# stopped (lunch / switched task / stepped away) and is dropped from active time — so absence never looks
-# like slowness, but many small gaps (genuine slowness) do count. Near-simultaneous scans (<=5s apart) are
-# collapsed into one "chunk" first, which fixes replenishment (bulk pallet scans stamped at the same second).
-# Break thresholds are set just above each task's normal per-item time, from that task's own gap distribution.
-SPEED_IDLE = {"pick":300, "pack":1200, "engrave":600, "replenish":600}   # seconds; gap beyond = a break
+# ACTIVE HOURS (one clear definition, same as Floor Time & engraving hours): from a person's FIRST scan of
+# a task to their LAST, with any gap of 45+ minutes removed as a break (lunch / switched task / stepped
+# away). Equivalently: sum of the gaps between consecutive scans that are UNDER 45 min. Gaps under 45 min
+# DO count as active time, so genuinely slow stretches count against the rate, but time away never does.
+# Speed = units done in that active time ÷ active hours. Near-simultaneous scans (<=5s) merge into one
+# "chunk" first (fixes replenishment bulk pallet scans stamped at the same second).
+SPEED_STAGES = ["pick", "pack", "engrave", "replenish"]
+SPEED_BREAK  = 2700   # seconds = 45 min: a gap this long or longer splits active time (a break)
 SPEED_SRC  = {"pick":"shiphero","pack":"shiphero","replenish":"shiphero","engrave":"logger"}
 SPEED_BURST = 5          # scans within this many seconds = one physical action (chunk)
 SPEED_GATE = {"min_intervals":30, "min_days":2, "min_active_min":15}  # ranked only if all three met
@@ -137,7 +246,8 @@ def speed():
     frm, to = _range()
     rows_by_stage = {}
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
-        for stage, idle in SPEED_IDLE.items():
+        for stage in SPEED_STAGES:
+            idle = SPEED_BREAK   # one uniform 45-min break for every activity
             flt = SPEED_FILTER.get(stage, "")   # constant-only SQL fragment (see SPEED_FILTER)
             cur.execute(f"""
             WITH r AS (
@@ -194,7 +304,7 @@ def speed():
                     days=int(days or 0), units=int(units) if units is not None else 0,
                     moves=int(n), ranked=ranked, reason=reason))
             rows_by_stage[stage]=out
-    cfg=dict(idle_min={s:v//60 for s,v in SPEED_IDLE.items()}, burst_s=SPEED_BURST,
+    cfg=dict(break_min=SPEED_BREAK//60, burst_s=SPEED_BURST,
              gate=SPEED_GATE, unit=SPEED_UNIT, source=SPEED_SRC, rate=SPEED_RATE)
     return jsonify(range={"from":frm,"to":to}, config=cfg, stages=rows_by_stage)
 
@@ -203,7 +313,7 @@ def speed():
 # So this looks at pace + hours + UTILIZATION (active/floor) + output + attendance + consistency together,
 # and raises specific, evidence-bearing flags. It is a lead, not a verdict (a low number can be legit —
 # e.g. waiting on restock). Scan-only for now; scheduled-shift adherence is a planned add-on.
-WATCH_IDLE = 900   # gap (s) beyond which floor time is idle, for the active-time part
+WATCH_IDLE = 2700  # 45 min: same active-time rule as Floor Time / Speed (a gap this long = a break)
 # Standard: everyone is expected to work 50h/week = 10h/day x 5 days (can be split up).
 WATCH = {"util_low":50, "min_floor_hr":6, "target_day_hr":10, "target_days_wk":5, "short_day_hr":7,
          "pace_hi_pct":67, "out_lo_pct":33, "out_bottom_pct":25, "incon_ratio":2.5}
@@ -388,8 +498,17 @@ th.act{color:var(--ink)}
 td.fi{line-height:1.25}
 td.fi>b{font-size:14px}
 td.fi .brk{font-size:10px;color:var(--muted);font-weight:400;margin-top:3px;letter-spacing:.2px}
-td.fi .brk .shr{color:var(--ink-2);font-weight:700}
-td.p.fi>b{color:var(--violet)}
+td.shr{color:var(--ink-2);font-weight:600}
+.dcol{text-align:center;font-size:9.5px;line-height:1.15;color:var(--muted);font-weight:700}
+.dcol .s{color:#c2c8d2;font-weight:700}
+td.dcell{text-align:center;font-size:11px;line-height:1.25;min-width:46px}
+td.dcell>b{font-size:12px;color:var(--ink)}
+.dcell .dsub{font-size:9.5px;color:var(--muted)}
+.dcell .dmt{color:#cbd2db}
+.wknd{background:#fbfbfc}
+th.dsep,td.dsep{width:10px;min-width:10px;max-width:10px;padding:0;background:#f2f5f9}
+td.mix{white-space:nowrap;font-size:12px}
+.mlid{color:#2563eb;font-weight:700}.mipe{color:#0d9488;font-weight:700}.mdotw{color:#b45309;font-weight:700}
 .wchip{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10.5px;font-weight:600;margin:2px 4px 2px 0;white-space:nowrap;cursor:default}
 .wchip.r{background:#fef2f2;color:#b91c1c}
 .wchip.a{background:#fffbeb;color:#b45309}
@@ -403,9 +522,10 @@ td.p.fi>b{color:var(--violet)}
 <div class=tabs>
   <div class="tab on" data-tab=dash onclick="tab('dash')">Dashboard</div>
   <div class=tab data-tab=floor onclick="tab('floor')">Floor Time</div>
-  <div class=tab data-tab=an onclick="tab('an')">Analytics</div>
   <div class=tab data-tab=speed onclick="tab('speed')">Speed &amp; Rankings</div>
+  <div class=tab data-tab=engt onclick="tab('engt')">Engraving</div>
   <div class=tab data-tab=watch onclick="tab('watch')">Watch List</div>
+  <div class=tab data-tab=an onclick="tab('an')">Analytics</div>
 </div>
 <div class=ctl>
   <button class=pill data-preset=today onclick="preset('today')">Today</button>
@@ -449,9 +569,17 @@ td.p.fi>b{color:var(--violet)}
 
 <div id=floor class=hide>
   <div class=card>
-    <h2>Floor Time <span style="color:#9ca3af;font-weight:400">&mdash; when each person was actually active, and their gaps</span></h2>
-    <div class=sub style=margin:0><b>Team-wide.</b> All floor activity &mdash; picking, packing, replenishing, engraving &mdash; attributed by user, in Eastern time.</div>
+    <h2>Floor Time <span style="color:#9ca3af;font-weight:400">&mdash; the effectiveness auditor: hours &amp; output, by day</span></h2>
+    <div class=sub style=margin:0><b>Active hours</b> = from a person&rsquo;s first scan of the day to their last, minus any gap of 45+ minutes (a break). <b>Utilization</b> = active ÷ time-on-floor. <b>Items/hr</b> is the units-per-labor-hour (UPLH) benchmark. All floor work (pick + pack + engrave + restock), Eastern time.</div>
     <div id=floortable></div>
+  </div>
+</div>
+
+<div id=engt class=hide>
+  <div class=card>
+    <h2>Engraving <span style="color:#9ca3af;font-weight:400">&mdash; per engraver: output, speed, mix &amp; match quality</span></h2>
+    <div class=sub style=margin:0>From the live logger, matched to each tote&rsquo;s order. <b>Totes</b> = jobs finished; <b>Items</b> = engravings (LID + IPE + DOTW); <b>Match</b> = % of totes resolved to an order. Hours use the same 45-min-break active-time rule.</div>
+    <div id=engtable></div>
   </div>
 </div>
 
@@ -488,9 +616,9 @@ function etAgo(n){return new Date(Date.now()-4*3600*1000-n*86400000).toISOString
 function segval(id){return document.querySelector('#'+id+' button.on').dataset.v;}
 function seg(id,v){document.querySelectorAll('#'+id+' button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));render();}
 document.querySelectorAll('.seg').forEach(s=>s.addEventListener('click',e=>{if(e.target.dataset.v){seg(s.id,e.target.dataset.v);}}));
-function tab(t){['dash','floor','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
+function tab(t){['dash','floor','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
   document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('on',el.dataset.tab===t));
-  if(t==='speed')loadSpeed();if(t==='watch')loadWatch();}
+  if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();}
 function preset(p){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.toggle('on',b.dataset.preset===p));
   let f=etToday(),t=etToday();
   if(p==='yest'){f=t=etAgo(1);}else if(p==='7'){f=etAgo(6);}else if(p==='30'){f=etAgo(29);}
@@ -547,8 +675,8 @@ function render(){if(!DATA)return;
   si.classList.toggle('hide',!showItems);so.classList.toggle('hide',!showOrders);
   drawChart(ppl,v);
   drawDetail(ppl,unit,v);
-  drawFloor();
-  drawAnalytics(ppl,v);
+  if(FLOOR){renderFloor();renderAnalytics();}
+  if(ENGR)renderEngraving();
 }
 function card(k,s,cls,val){return '<div class="card stat"><div class=k>'+k+' <span class="s '+cls+'">'+s+'</span></div><div class=v>'+fmt(val)+'</div></div>';}
 function drawChart(ppl,v){
@@ -609,49 +737,138 @@ function drawDetail(ppl,unit,v){
     _pack:(v.packsh?p.items_packed_sh:0)+(v.packshop?p.items_packed_shop:0),
     _eng:(v.eng?p.engraved_items:0)}));
   arr.forEach(p=>{p.share=Math.round(p.items/teamItems*100); p.rshare=Math.round(p.restock/teamRestock*100);});
-  // map legacy sort keys onto the collapsed columns
-  const K={items_total:'items',orders_total:'orders',replenished:'restock',share:'share'}[sortKey]||sortKey;
+  const K={items_total:'items',orders_total:'orders',replenished:'restock',share:'share',rshare:'rshare'}[sortKey]||sortKey;
   arr.sort((a,b)=>{const x=a[K],y=b[K];return (x>y?1:(x<y?-1:0))*sortDir;});
   const arw=k=>sortKey===k?'<span class=arw>'+(sortDir<0?'▼':'▲')+'</span>':'';
   const th=(k,lab,sub)=>'<th class="srt'+(sortKey===k?' act':'')+'" onclick="sortBy(\''+k+'\')">'+lab+(sub?' <span class=s>'+sub+'</span>':'')+arw(k)+'</th>';
   let h='<table><tr>'+
     th('person','Person','')+
     '<th class=srt onclick="sortBy(\'type\')">Type'+arw('type')+'</th>'+
-    th('items_total','Fulfillment items','pick + pack + engrave · % of team')+
+    th('items_total','Fulfillment items','pick + pack + engrave')+
+    th('share','Share','of team')+
     th('orders_total','Fulfillment orders','')+
-    th('replenished','Restocked','separate track · % of team')+
+    th('replenished','Restocked','separate')+
+    th('rshare','Share','of team')+
     '</tr>';
   const T={items:0,orders:0,restock:0};
   arr.forEach(p=>{
     const parts=[]; if(p._pick)parts.push('Pick '+fmt(p._pick)); if(p._pack)parts.push('Pack '+fmt(p._pack)); if(p._eng)parts.push('Engrave '+fmt(p._eng));
-    const fbrk='<div class=brk><b class=shr>'+p.share+'%</b> of team'+(parts.length?' &middot; '+parts.join(' &middot; '):'')+'</div>';
-    const rbrk='<div class=brk>'+(p.restock?'<b class=shr>'+p.rshare+'%</b> of team':'&mdash;')+'</div>';
+    const brk=parts.length?'<div class=brk>'+parts.join(' &middot; ')+'</div>':'';
     h+='<tr><td class=name>'+p.person+'</td>'+
       '<td><span class="badge '+(p.type==='Intern'?'in':'ft')+'">'+(p.type==='Intern'?'Intern':(p.type?'Full-timer':'—'))+'</span></td>'+
-      '<td class=fi><b>'+fmt(p.items)+'</b>'+fbrk+'</td>'+
+      '<td class=fi><b>'+fmt(p.items)+'</b>'+brk+'</td>'+
+      '<td class=shr>'+p.share+'%</td>'+
       '<td>'+fmt(p.orders)+'</td>'+
-      '<td class="p fi"><b>'+fmt(p.restock)+'</b>'+rbrk+'</td></tr>';
+      '<td class=p><b>'+fmt(p.restock)+'</b></td>'+
+      '<td class=shr>'+(p.restock?p.rshare+'%':'&mdash;')+'</td></tr>';
     T.items+=p.items;T.orders+=p.orders;T.restock+=p.restock;});
-  h+='<tr class=tot><td>Total</td><td></td>'+
-    '<td class=fi><b>'+fmt(T.items)+'</b><div class=brk>100% of team</div></td>'+
-    '<td>'+fmt(T.orders)+'</td>'+
-    '<td class="p fi"><b>'+fmt(T.restock)+'</b><div class=brk>100% of team</div></td></tr>';
+  h+='<tr class=tot><td>Total</td><td></td><td><b>'+fmt(T.items)+'</b></td><td>100%</td><td>'+fmt(T.orders)+'</td><td class=p><b>'+fmt(T.restock)+'</b></td><td>100%</td></tr>';
   h+='</table>';
   document.getElementById('detail').innerHTML='<div class=tablewrap>'+h+'</div>';
 }
 function sortBy(k){if(sortKey===k)sortDir*=-1;else{sortKey=k;sortDir=-1;}render();}
-function drawFloor(){const f=[...DATA.floor].filter(x=>DATA.people.find(p=>p.person===x.person&&teamFilter(p)));
-  f.sort((a,b)=>b.gap_min-a.gap_min);
-  let h='<table><tr><th>Person</th><th>First (ET)</th><th>Last (ET)</th><th>On floor</th><th>Biggest gap (ET)</th><th style=text-align:left>Activity mix</th></tr>';
-  f.forEach(r=>{const span=r.first_ts&&r.last_ts?(new Date(r.last_ts)-new Date(r.first_ts))/60000:0;
-    const lunch=r.gap_min>=25&&r.gap_min<=90?'<span class=lunch>lunch?</span>':'';
-    const mix=[r.mix.pick?'pick '+r.mix.pick:'',r.mix.pack?'pack '+r.mix.pack:'',r.mix.move?'replenish '+r.mix.move:'',r.mix.fulfill?'shopify '+r.mix.fulfill:'',r.mix.engrave?'engrave '+r.mix.engrave:''].filter(Boolean).join(' · ');
-    h+='<tr><td class=name>'+r.person+'</td><td>'+ampm(r.first_ts)+'</td><td>'+ampm(r.last_ts)+'</td><td>~'+fmtmin(Math.round(span))+'</td>'+
-      '<td style=text-align:left><span class=red>'+fmtmin(r.gap_min)+'</span> <span style=color:#9ca3af>'+ampm(r.gap_from)+'–'+ampm(r.gap_to)+'</span>'+lunch+'</td><td style=text-align:left>'+mix+'</td></tr>';});
-  h+='</table>';document.getElementById('floortable').innerHTML='<div class=tablewrap>'+h+'</div>';}
-function drawAnalytics(ppl,v){const arr=ppl.map(p=>fulItems(p,v)).sort((a,b)=>a-b);
-  const sum=arr.reduce((a,b)=>a+b,0),mean=arr.length?Math.round(sum/arr.length):0,med=arr.length?arr[Math.floor(arr.length/2)]:0;
-  document.getElementById('analytics').innerHTML='<div class=cards>'+card('People','active','s-sel',ppl.length)+card('Mean items','fulfillment','s-sel',mean)+card('Median items','fulfillment','s-sel',med)+card('Total items','fulfillment','s-sel',sum)+card('Replenished','separate','s-repl',ppl.reduce((a,p)=>a+(v.repl?p.replenished:0),0))+'</div>';}
+// ===== Floor Time (effectiveness auditor) & Engraving — lazy-loaded, day-by-day =====
+let FLOOR=null,floorKey=null,floorSort='items',floorDir=-1;
+let ENGR=null,engKey=null,engSort='items',engDir=-1;
+const DOWN=['','Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+function tfilter(p){const t=segval('team');return t==='all'||p.type===t;}
+function badge(ty){return '<span class="badge '+(ty==='Intern'?'in':'ft')+'">'+(ty==='Intern'?'Intern':(ty?'Full-timer':'—'))+'</span>';}
+function dhead(d){return '<th class="dcol'+(d.dow>=6?' wknd':'')+'">'+DOWN[d.dow]+'<br><span class=s>'+(+d.d.slice(8))+'</span></th>';}
+function chip(u){const c=u>=80?'ugrn':(u>=55?'uamb':'ured');return '<span class="'+c+'">'+u+'%</span>';}
+
+async function loadFloor(){const f=document.getElementById('from').value,t=document.getElementById('to').value,k=f+'|'+t;
+  if(FLOOR&&floorKey===k){renderFloor();return;}
+  document.getElementById('floortable').innerHTML='<div class=sub>loading…</div>';
+  try{FLOOR=await getj('/floor?from='+f+'&to='+t);floorKey=k;renderFloor();}
+  catch(e){document.getElementById('floortable').innerHTML='<div class=sub>could not load floor data</div>';}}
+function floorSortBy(k){if(floorSort===k)floorDir*=-1;else{floorSort=k;floorDir=-1;}renderFloor();}
+function renderFloor(){if(!FLOOR)return;
+  const days=FLOOR.days,showDays=days.length<=16;
+  const ppl=FLOOR.people.filter(tfilter);
+  const arr=[...ppl].sort((a,b)=>{const x=a[floorSort],y=b[floorSort];return (x>y?1:(x<y?-1:0))*floorDir;});
+  const arw=k=>floorSort===k?'<span class=arw>'+(floorDir<0?'▼':'▲')+'</span>':'';
+  const th=(k,l,s)=>'<th class="srt'+(floorSort===k?' act':'')+'" onclick="floorSortBy(\''+k+'\')">'+l+(s?' <span class=s>'+s+'</span>':'')+arw(k)+'</th>';
+  let h='<table><tr>'+th('person','Person','')+'<th>Type</th>'+th('active_days','Days','active')+
+    th('hours','Hours','active')+th('hours_per_day','Hrs/day','avg')+th('util','Util','active÷floor')+
+    th('items','Items','all work')+th('items_per_day','Items/day','')+th('items_per_hr','Items/hr','UPLH');
+  if(showDays)h+='<th class=dsep></th>'+days.map(dhead).join('');
+  h+='</tr>';const T={days:0,hours:0,items:0};
+  arr.forEach(p=>{const m={};p.days.forEach(x=>m[x.d]=x);
+    h+='<tr><td class=name>'+p.person+'</td><td>'+badge(p.type)+'</td>'+
+      '<td>'+p.active_days+'</td><td><b>'+p.hours.toFixed(1)+'</b></td><td>'+p.hours_per_day.toFixed(1)+'</td>'+
+      '<td>'+chip(p.util)+'</td><td><b>'+fmt(p.items)+'</b></td><td>'+fmt(p.items_per_day)+'</td><td><b>'+fmt(p.items_per_hr)+'</b></td>';
+    if(showDays)h+='<td class=dsep></td>'+days.map(d=>{const x=m[d.d];
+      if(!x||(!x.hours&&!x.ful&&!x.repl))return '<td class="dcell'+(d.dow>=6?' wknd':'')+'"><span class=dmt>·</span></td>';
+      return '<td class="dcell'+(d.dow>=6?' wknd':'')+'"><b>'+x.hours.toFixed(1)+'h</b><div class=dsub>'+fmt(x.ful+x.repl)+'</div></td>';}).join('');
+    h+='</tr>';T.days=Math.max(T.days,p.active_days);T.hours+=p.hours;T.items+=p.items;});
+  h+='<tr class=tot><td>Team</td><td></td><td></td><td><b>'+T.hours.toFixed(1)+'</b></td><td></td><td></td><td><b>'+fmt(T.items)+'</b></td><td></td><td><b>'+fmt(T.hours>0?Math.round(T.items/T.hours):0)+'</b></td>'+(showDays?'<td class=dsep></td>'+days.map(()=>'<td></td>').join(''):'')+'</tr>';
+  h+='</table>';
+  const note='<div class=sub style=margin-top:8px>Sorted by '+floorSort.replace(/_/g,' ')+'. '+(showDays?'Each day cell shows <b>hours</b> over <b>items</b>.':'Per-day breakdown hidden for ranges over ~2 weeks — narrow the dates to see it.')+' <b>Util</b> under 55% (red) means long idle stretches inside the on-floor window.</div>';
+  document.getElementById('floortable').innerHTML='<div class=tablewrap>'+h+'</div>'+note;}
+
+async function loadEngraving(){const f=document.getElementById('from').value,t=document.getElementById('to').value,k=f+'|'+t;
+  if(ENGR&&engKey===k){renderEngraving();return;}
+  document.getElementById('engtable').innerHTML='<div class=sub>loading…</div>';
+  try{ENGR=await getj('/engraving?from='+f+'&to='+t);engKey=k;renderEngraving();}
+  catch(e){document.getElementById('engtable').innerHTML='<div class=sub>could not load engraving data</div>';}}
+function engSortBy(k){if(engSort===k)engDir*=-1;else{engSort=k;engDir=-1;}renderEngraving();}
+function renderEngraving(){if(!ENGR)return;
+  const days=ENGR.days,showDays=days.length<=16;
+  const ppl=ENGR.engravers.filter(tfilter);
+  if(!ppl.length){document.getElementById('engtable').innerHTML='<div class=sub style=margin-top:8px>No engraving in this window.</div>';return;}
+  const arr=[...ppl].sort((a,b)=>{const x=a[engSort],y=b[engSort];return (x>y?1:(x<y?-1:0))*engDir;});
+  const arw=k=>engSort===k?'<span class=arw>'+(engDir<0?'▼':'▲')+'</span>':'';
+  const th=(k,l,s)=>'<th class="srt'+(engSort===k?' act':'')+'" onclick="engSortBy(\''+k+'\')">'+l+(s?' <span class=s>'+s+'</span>':'')+arw(k)+'</th>';
+  let h='<table><tr>'+th('person','Engraver','')+'<th>Type</th>'+th('active_days','Days','')+
+    th('totes','Totes','jobs')+th('items','Items','engravings')+th('hours','Hours','active')+
+    th('items_per_hr','Items/hr','')+th('totes_per_hr','Totes/hr','')+th('items_per_day','Items/day','')+
+    th('match_rate','Match','% to order')+'<th>Mix <span class=s>LID·IPE·DOTW</span></th>';
+  if(showDays)h+='<th class=dsep></th>'+days.map(dhead).join('');
+  h+='</tr>';const T={totes:0,items:0,hours:0,lid:0,ipe:0,dotw:0};
+  arr.forEach(p=>{const m={};p.days.forEach(x=>m[x.d]=x);
+    h+='<tr><td class=name>'+p.person+'</td><td>'+badge(p.type)+'</td><td>'+p.active_days+'</td>'+
+      '<td><b>'+fmt(p.totes)+'</b></td><td><b>'+fmt(p.items)+'</b></td><td>'+p.hours.toFixed(1)+'</td>'+
+      '<td><b>'+fmt(p.items_per_hr)+'</b></td><td>'+p.totes_per_hr.toFixed(1)+'</td><td>'+fmt(p.items_per_day)+'</td>'+
+      '<td>'+chip(p.match_rate)+'</td>'+
+      '<td class=mix><span class=mlid>'+fmt(p.lid)+'</span> · <span class=mipe>'+fmt(p.ipe)+'</span> · <span class=mdotw>'+fmt(p.dotw)+'</span></td>';
+    if(showDays)h+='<td class=dsep></td>'+days.map(d=>{const x=m[d.d];
+      if(!x||!x.totes)return '<td class="dcell'+(d.dow>=6?' wknd':'')+'"><span class=dmt>·</span></td>';
+      return '<td class="dcell'+(d.dow>=6?' wknd':'')+'"><b>'+fmt(x.items)+'</b><div class=dsub>'+x.hours.toFixed(1)+'h</div></td>';}).join('');
+    h+='</tr>';T.totes+=p.totes;T.items+=p.items;T.hours+=p.hours;T.lid+=p.lid;T.ipe+=p.ipe;T.dotw+=p.dotw;});
+  h+='<tr class=tot><td>Total</td><td></td><td></td><td><b>'+fmt(T.totes)+'</b></td><td><b>'+fmt(T.items)+'</b></td><td>'+T.hours.toFixed(1)+'</td><td><b>'+fmt(T.hours>0?Math.round(T.items/T.hours):0)+'</b></td><td></td><td></td><td></td><td class=mix><span class=mlid>'+fmt(T.lid)+'</span> · <span class=mipe>'+fmt(T.ipe)+'</span> · <span class=mdotw>'+fmt(T.dotw)+'</span></td>'+(showDays?'<td class=dsep></td>'+days.map(()=>'<td></td>').join(''):'')+'</tr>';
+  h+='</table>';
+  const note='<div class=sub style=margin-top:8px>Each day cell shows <b>items</b> over <b>hours</b>. <b>Totes</b> = engraving jobs; <b>Items</b> = individual engravings. <b>Match</b> under 80% means some scans could not be tied to an order (usually a tote built before tote-tracking, or a mis-scan).</div>';
+  document.getElementById('engtable').innerHTML='<div class=tablewrap>'+h+'</div>'+note;}
+async function loadAnalytics(){const f=document.getElementById('from').value,t=document.getElementById('to').value,k=f+'|'+t;
+  if(!(FLOOR&&floorKey===k)){document.getElementById('analytics').innerHTML='<div class=sub>loading…</div>';
+    try{FLOOR=await getj('/floor?from='+f+'&to='+t);floorKey=k;}catch(e){document.getElementById('analytics').innerHTML='<div class=sub>could not load</div>';return;}}
+  renderAnalytics();}
+function renderAnalytics(){if(!FLOOR)return;
+  const ppl=FLOOR.people.filter(tfilter);
+  const el=document.getElementById('analytics'); if(!el)return;
+  if(!ppl.length){el.innerHTML='<div class=sub>No activity in this window.</div>';return;}
+  const sum=(g)=>ppl.reduce((a,p)=>a+g(p),0);
+  const H=sum(p=>p.hours), I=sum(p=>p.items), FUL=sum(p=>p.ful_items), REP=sum(p=>p.repl_items);
+  const uplh=H>0?Math.round(I/H):0;
+  const avgUtil=Math.round(ppl.reduce((a,p)=>a+p.util,0)/ppl.length);
+  const uphs=ppl.map(p=>p.items_per_hr).filter(x=>x>0).sort((a,b)=>a-b);
+  const med=uphs.length?uphs[Math.floor(uphs.length/2)]:0, top=uphs.length?uphs[uphs.length-1]:0, bot=uphs.length?uphs[0]:0;
+  let h='<div class=note style=margin-top:0>Team effectiveness for <b>'+FLOOR.range.from+' → '+FLOOR.range.to+'</b>. <b>UPLH</b> = items per active labour hour (the core warehouse productivity KPI). Active hours use the 45-min-break rule.</div>';
+  h+='<div class=cards>'+card('People','active','s-sel',ppl.length)+card('Active hours','all work','s-sel',Math.round(H))
+    +card('Items','pick+pack+engrave+restock','s-sel',I)+card('Team UPLH','items / active hr','s-sel',uplh)
+    +card('Avg utilization','active ÷ on-floor','s-repl',avgUtil+'%')+'</div>';
+  // per-person UPLH distribution + FT vs Intern
+  h+='<div class=cards style=margin-top:12px>'+card('Top UPLH','person best','s-sel',top)+card('Median UPLH','person','s-sel',med)+card('Bottom UPLH','person','s-sel',bot)
+    +card('Fulfillment items','pick+pack+engrave','s-sel',FUL)+card('Restocked','separate track','s-repl',REP)+'</div>';
+  const grp=(ty)=>{const g=ppl.filter(p=>p.type===ty);if(!g.length)return null;
+    const gh=g.reduce((a,p)=>a+p.hours,0),gi=g.reduce((a,p)=>a+p.items,0);
+    return {n:g.length,hours:Math.round(gh),items:gi,uplh:gh>0?Math.round(gi/gh):0,util:Math.round(g.reduce((a,p)=>a+p.util,0)/g.length)};};
+  const ft=grp('Full-timer'),it=grp('Intern');
+  if(ft||it){h+='<div class=card style="margin-top:14px;padding:14px 16px"><div style="font-weight:700;margin-bottom:6px">Full-timers vs Interns</div>'+
+    '<table><tr><th style=text-align:left>Group</th><th>People</th><th>Active hrs</th><th>Items</th><th>UPLH</th><th>Avg util</th></tr>'+
+    [['Full-timers',ft],['Interns',it]].filter(x=>x[1]).map(x=>'<tr><td class=name>'+x[0]+'</td><td>'+x[1].n+'</td><td>'+x[1].hours+'</td><td>'+fmt(x[1].items)+'</td><td><b>'+x[1].uplh+'</b></td><td>'+x[1].util+'%</td></tr>').join('')+
+    '</table></div>';}
+  el.innerHTML=h;}
 function copyChat(){const v=vis();const rows=DATA.people.filter(teamFilter).map(p=>p.person+': fulfillment '+fulItems(p,v)+' (picked '+p.items_picked_sh+', packed '+(p.items_packed_sh+p.items_packed_shop)+', engraved '+p.engraved_items+'), replenished '+p.replenished);
   navigator.clipboard.writeText('Warehouse '+DATA.range.from+'\n'+DATA.shipped.total+' orders shipped\n'+rows.join('\n'));document.getElementById('status').textContent='copied!';setTimeout(()=>document.getElementById('status').textContent='',1500);}
 function dl(kind){const ppl=DATA.people.filter(teamFilter);let blob,name;
@@ -680,13 +897,12 @@ function renderSpeed(){
   if(!SPEED)return;const cfg=SPEED.config,S=SPEED.stages,g=cfg.gate;
   // ---- methodology (all assumptions visible) ----
   let m='<div class=mbox><h3>How this is measured — read me</h3>';
-  m+='Speed = <b>units per ACTIVE hour</b>. The gap between your consecutive scans of a task is the time to do that unit of work. ';
-  m+='A gap longer than the task&rsquo;s <b>break threshold</b> means you stopped — lunch, switched task, or stepped away — and is removed, so time off never counts as slowness. But many small gaps (genuinely slow work) <b>do</b> count. Scans within <code>'+cfg.burst_s+'s</code> of each other are merged into one action.<br>';
-  m+='<b>Break thresholds (a gap bigger than this = not working):</b> '+SP_STAGES.map(s=>cap(s)+' <code>&gt;'+cfg.idle_min[s]+' min</code>').join(' &middot; ')+'. Set just above each task&rsquo;s normal per-item time, from its own data.<br>';
-  m+='<b>Replenishment</b> is ranked as <b>boxes moved per active hour</b> (each bin transfer = one box, any size) — not units/hr, which would just rank box size. The single-unit tote moves (98% of replenish scans) aren&rsquo;t replenishment and are excluded.<br>';
-  m+='<b>Sample size — ranked only if</b> a person has <code>&ge;'+g.min_intervals+' samples</code> across <code>&ge;'+g.min_days+' days</code> with <code>&ge;'+g.min_active_min+' active min</code>; otherwise shown as &ldquo;insufficient&rdquo; with the reason. A &ldquo;sample&rdquo; = one timed unit-of-work.<br>';
-  m+='<b>Window:</b> uses the date range above (<b>'+SPEED.range.from+' → '+SPEED.range.to+'</b>). Early-July data is less reliable — prefer a recent window and enough days.<br>';
-  m+='<b>Scans only:</b> pick/pack/replenish from ShipHero, engraving from the logger. Shopify hand-fulfillment timing isn&rsquo;t granular enough for pace, and off-scanner work isn&rsquo;t captured.';
+  m+='Speed = <b>units per ACTIVE hour</b> &mdash; the industry &ldquo;units per labor hour&rdquo; (UPLH), but on the labor actually spent on that task.<br>';
+  m+='<b>Active hours</b> = from a person&rsquo;s <b>first scan of a task to their last</b>, with any gap of <code>&ge;'+cfg.break_min+' min</code> removed as a break (lunch, task switch, stepped away). Gaps under '+cfg.break_min+' min DO count &mdash; so genuinely slow stretches count against the rate, but time away never does. Scans within <code>'+cfg.burst_s+'s</code> merge into one action.<br>';
+  m+='<b>Replenishment</b> is ranked as <b>boxes moved per active hour</b> (each bin transfer = one box, any size) &mdash; not units/hr, which would just rank box size. The single-unit tote moves (98% of replenish scans) aren&rsquo;t replenishment and are excluded.<br>';
+  m+='<b>Sample size — ranked only if</b> a person has <code>&ge;'+g.min_intervals+' timed units</code> across <code>&ge;'+g.min_days+' days</code> with <code>&ge;'+g.min_active_min+' active min</code>; otherwise shown as &ldquo;insufficient&rdquo; with the reason.<br>';
+  m+='<b>Window:</b> uses the date range above (<b>'+SPEED.range.from+' → '+SPEED.range.to+'</b>). Prefer a recent window with several days for a fair read.<br>';
+  m+='<b>Scans only:</b> pick/pack/replenish from ShipHero, engraving from the logger. Shopify hand-fulfillment timing isn&rsquo;t granular enough for pace, and off-scanner work isn&rsquo;t captured &mdash; so this is a <b>floor on speed, not a full timesheet</b>.';
   m+='</div>';
   document.getElementById('speed_method').innerHTML=m;
   // ---- percentiles per stage (among ranked) ----
@@ -698,7 +914,7 @@ function renderSpeed(){
   let b='';
   SP_STAGES.forEach(s=>{
     const rows=S[s]||[],rk=rows.filter(r=>r.ranked).sort((a,b)=>b.uph-a.uph),un=rows.filter(r=>!r.ranked);
-    b+='<div class=card style="padding:14px 16px"><div style="font-weight:700">'+cap(s)+' <span class=sub style="font-weight:400">('+cfg.unit[s]+'/active-hr · break &gt;'+cfg.idle_min[s]+'m)</span></div>';
+    b+='<div class=card style="padding:14px 16px"><div style="font-weight:700">'+cap(s)+' <span class=sub style="font-weight:400">('+cfg.unit[s]+'/active-hr · break &ge;'+cfg.break_min+'m)</span></div>';
     if(!rk.length)b+='<div class=sub style=margin-top:6px>No one has enough data yet in this window.</div>';
     else{b+='<table style=margin-top:6px><tr><th>#</th><th style=text-align:left>Person</th><th>'+cfg.unit[s]+'/hr</th><th>med s/ea</th><th>samples</th><th>days</th></tr>';
       rk.forEach((r,i)=>{b+='<tr><td>'+(i+1)+'</td><td class=name style=text-align:left>'+r.person+'</td><td><b style="color:'+pctColor(pct[r.person][s].p)+'">'+fmt(r.uph)+'</b></td><td>'+(r.med_spi==null?'—':r.med_spi)+'</td><td>'+r.n+'</td><td>'+r.days+'</td></tr>';});
