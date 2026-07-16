@@ -664,6 +664,22 @@ td.sub2{color:var(--muted)}
 .covmeta{width:150px;text-align:right;font-size:11px;color:var(--muted)}
 .covmeta b{color:var(--ink-2)}
 .covlog{color:#4f46e5;cursor:pointer;font-weight:600}.covlog:hover{text-decoration:underline}
+/* Staffing planner */
+.planbar{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;margin:14px 0}
+.planhero{display:flex;gap:30px;align-items:baseline;background:linear-gradient(180deg,#f2f6ff,#fff);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:12px;padding:16px 20px;margin:6px 0 4px;flex-wrap:wrap}
+.phn{font-size:36px;font-weight:800;color:var(--accent);line-height:1;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.phl{font-size:12px;color:var(--muted);margin-top:3px}
+.phd{font-size:15px;color:var(--ink-2);font-weight:600}
+.plancmp{font-size:13px;border-radius:9px;padding:9px 13px;margin:10px 0}
+.plancmp.ok{background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46}
+.plancmp.short{background:#fff7ed;border:1px solid #fdba74;color:#9a3412}
+.plantbl{margin-top:4px}
+.plan-rate{width:66px;text-align:center;padding:5px 6px}
+.lineup{display:flex;gap:14px;flex-wrap:wrap}
+.lncol{flex:1;min-width:150px;border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:#fbfcfe}
+.lnh{font-weight:700;font-size:12.5px;margin-bottom:6px;color:var(--ink-2)}
+.lnrow{display:flex;justify-content:space-between;font-size:12px;padding:2px 0}
+.lnrow b{font-variant-numeric:tabular-nums}
 /* Log off-scanner time card */
 .logcard{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:#fbfcfe;margin-top:16px}
 .logtitle{font-size:13px;font-weight:700;color:var(--ink-2);margin-bottom:10px}
@@ -715,6 +731,7 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 <div class=tabs>
   <div class="tab on" data-tab=dash onclick="tab('dash')">Dashboard</div>
   <div class=tab data-tab=floor onclick="tab('floor')">Floor Time</div>
+  <div class=tab data-tab=plan onclick="tab('plan')">Planner</div>
   <div class=tab data-tab=speed onclick="tab('speed')">Speed &amp; Rankings</div>
   <div class=tab data-tab=engt onclick="tab('engt')">Engraving</div>
   <div class=tab data-tab=watch onclick="tab('watch')">Watch List</div>
@@ -821,6 +838,20 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 
 <div id=watch class=hide><div id=watch_body></div></div>
 
+<div id=plan class=hide>
+  <div class=card>
+    <h2>Staffing planner <span style="color:#9ca3af;font-weight:400">&mdash; turn an order forecast into hours &amp; people</span></h2>
+    <div class=sub style=margin:0>Enter the orders you plan to ship. The planner converts that into items per activity, then into labor <b>hours</b> and <b>people</b>, using pace learned from your recent data. Rates default from the date range above and are editable &mdash; you own the assumption. Pick + pack are needed on essentially every order; engraving only on the share that historically gets engraved.</div>
+    <div class=planbar>
+      <div class=lf><label>Orders to ship</label><input id=pl_orders type=number min=0 step=10 oninput=planCompute()></div>
+      <div class=lf><label>Hours / person</label><input id=pl_shift type=number min=1 max=14 step=0.5 value=8 oninput=planCompute()></div>
+      <div class=lf><label>People available <span class=s>(optional)</span></label><input id=pl_people type=number min=0 step=1 placeholder="—" oninput=planCompute()></div>
+      <div class=lf><label>&nbsp;</label><button class=pill onclick="planReset()">Reset rates to data</button></div>
+    </div>
+    <div id=plan_out></div>
+  </div>
+</div>
+
 <div class=foot>
   <b>Chart colours:</b> <span class=s-sh>Picked&middot;ShipHero</span>, <span style=color:#16a34a>Packed&middot;ShipHero</span>, <span class=s-shop>Packed&middot;Shopify</span>, <span class=s-eng>Engraved</span> &mdash; these four stack into the <b>Fulfillment</b> bar. <span class=s-repl>Replenished</span> is drawn as its own separate bar (a parallel track, never added into the fulfillment/items total).
 </div>
@@ -834,9 +865,9 @@ function etAgo(n){return new Date(Date.now()-4*3600*1000-n*86400000).toISOString
 function segval(id){return document.querySelector('#'+id+' button.on').dataset.v;}
 function seg(id,v){document.querySelectorAll('#'+id+' button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));render();}
 document.querySelectorAll('.seg').forEach(s=>s.addEventListener('click',e=>{if(e.target.dataset.v){seg(s.id,e.target.dataset.v);}}));
-function tab(t){['dash','floor','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
+function tab(t){['dash','floor','plan','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
   document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('on',el.dataset.tab===t));
-  if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();}
+  if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();if(t==='plan')loadPlanner();}
 function preset(p){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.toggle('on',b.dataset.preset===p));
   let f=etToday(),t=etToday();
   if(p==='yest'){f=t=etAgo(1);}else if(p==='7'){f=etAgo(6);}else if(p==='30'){f=etAgo(29);}
@@ -1140,6 +1171,78 @@ async function addNote(){
     else{st.textContent=j.error||'error';st.className='nstat err';}
   }catch(e){st.textContent='could not save';st.className='nstat err';}}
 async function delNote(id){try{await fetch('/note/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});FLOOR=null;floorKey=null;loadFloor();}catch(e){}}
+
+// ===== Staffing planner: order forecast -> items -> hours -> people, with a suggested lineup =====
+let PLAN=null;
+function planStages(){return [['pick','Pick'],['pack','Pack'],['engrave','Engrave']];}
+function planDaysInRange(){if(!DATA||!DATA.range)return 1;var a=new Date(DATA.range.from+'T00:00'),b=new Date(DATA.range.to+'T00:00');return Math.max(1,Math.round((b-a)/86400000)+1);}
+function planItemsOrders(){var o={pick:{i:0,o:0},pack:{i:0,o:0},engrave:{i:0,o:0}};
+  (DATA.people||[]).forEach(function(p){
+    o.pick.i+=p.items_picked_sh||0; o.pick.o+=p.orders_picked_sh||0;
+    o.pack.i+=(p.items_packed_sh||0)+(p.items_packed_shop||0); o.pack.o+=(p.orders_packed_sh||0)+(p.orders_packed_shop||0);
+    o.engrave.i+=p.engraved_items||0; o.engrave.o+=p.engraved_orders||0;});
+  return o;}
+function planRateFromSpeed(stage){if(!SPEED||!SPEED.stages||!SPEED.stages[stage])return 0;
+  var u=0,mins=0; SPEED.stages[stage].forEach(function(r){u+=r.units||0;mins+=r.active_min||0;});
+  return mins>0?Math.round(u/(mins/60)):0;}
+async function loadPlanner(){var out=document.getElementById('plan_out');
+  if(!DATA){out.innerHTML='<div class=sub>loading…</div>';return;}
+  var f=document.getElementById('from').value,t=document.getElementById('to').value,k=f+'|'+t;
+  if(!(SPEED&&speedKey===k)){out.innerHTML='<div class=sub>learning your recent pace…</div>';
+    try{SPEED=await getj('/speed?from='+f+'&to='+t);speedKey=k;}catch(e){}}
+  planDefaults();planRender();}
+function planDefaults(){var io=planItemsOrders();var shipped=(DATA.shipped&&DATA.shipped.total)||0;var days=planDaysInRange();
+  var fallback={pick:110,pack:120,engrave:45};
+  PLAN={shipped:shipped, days:days, avgDaily:Math.round(shipped/days),
+    act:planStages().map(function(s){var key=s[0];
+      return {key:key,label:s[1],items_total:io[key].i,orders_total:io[key].o,
+        ipo:(shipped>0?io[key].i/shipped:0), rate:(planRateFromSpeed(key)||fallback[key])};})};}
+function num(id,d){var v=parseFloat((document.getElementById(id)||{}).value);return isFinite(v)?v:(d||0);}
+// Build the skeleton ONCE (rate inputs must persist so typing doesn't lose focus); planCompute only writes numbers.
+function planRender(){var oi=document.getElementById('pl_orders'); if(oi&&!oi.value)oi.value=PLAN.avgDaily||'';
+  var rows=PLAN.act.map(function(a){return '<tr><td class=name style=text-align:left>'+a.label+'</td>'+
+    '<td id=pli_'+a.key+'></td>'+
+    '<td><input class="nin plan-rate" id=pl_rate_'+a.key+' type=number min=1 step=5 value='+Math.round(a.rate)+' oninput=planCompute()></td>'+
+    '<td id=plh_'+a.key+'></td><td id=plp_'+a.key+'></td></tr>';}).join('');
+  document.getElementById('plan_out').innerHTML=
+    '<div id=pl_hero></div><div id=pl_cmp></div>'+
+    '<div class=sub style="margin:14px 0 6px">The funnel &mdash; orders &rarr; items &rarr; hours &rarr; people. Edit any rate and it flows through instantly; the activity with the most hours is your bottleneck.</div>'+
+    '<table class=plantbl><tr><th style=text-align:left>Activity</th><th>Items</th><th>Rate <span class=s>items/hr</span></th><th>Hours</th><th>People</th></tr>'+
+    rows+'<tr class=tot><td style=text-align:left>Total</td><td id=pl_titems></td><td></td><td id=pl_thrs></td><td id=pl_tppl></td></tr></table>'+
+    '<div id=pl_lineup></div>';
+  document.getElementById('pl_lineup').innerHTML=planLineup();
+  planCompute();}
+function set(id,html){var el=document.getElementById(id);if(el)el.innerHTML=html;}
+function planCompute(){if(!PLAN)return;
+  var N=num('pl_orders',0), shift=num('pl_shift',8)||8, pv=document.getElementById('pl_people').value;
+  var people=(pv===''||pv==null)?null:parseFloat(pv);
+  var totH=0, totItems=0, maxH=0;
+  PLAN.act.forEach(function(a){var rate=num('pl_rate_'+a.key,a.rate)||a.rate;
+    var items=Math.round(N*a.ipo), hrs=rate>0?items/rate:0; totH+=hrs; totItems+=items; if(hrs>maxH)maxH=hrs;});
+  PLAN.act.forEach(function(a){var rate=num('pl_rate_'+a.key,a.rate)||a.rate;
+    var items=Math.round(N*a.ipo), hrs=rate>0?items/rate:0;
+    set('pli_'+a.key,fmt(items)); set('plh_'+a.key,'<b>'+hrs.toFixed(1)+'</b>'+(hrs>=maxH&&maxH>0?' <span class=s style=color:#b45309>bottleneck</span>':'')); set('plp_'+a.key,(hrs/shift).toFixed(1));});
+  var ppl=totH/shift;
+  set('pl_titems',fmt(totItems)); set('pl_thrs','<b>'+totH.toFixed(1)+'</b>'); set('pl_tppl','<b>'+ppl.toFixed(1)+'</b>');
+  set('pl_hero','<div class=planhero><div><div class=phn>'+totH.toFixed(0)+'</div><div class=phl>labor hours</div></div>'+
+    '<div><div class=phn>'+ppl.toFixed(1)+'</div><div class=phl>people @ '+shift+'h</div></div>'+
+    '<div class=phd>to ship <b>'+fmt(N)+'</b> orders&ensp;<span class=sub style=font-weight:400>(&asymp;'+fmt(totItems)+' items handled)</span></div></div>');
+  var cmp='';
+  if(people!=null&&people>0){var avail=people*shift, gap=totH-avail;
+    cmp='<div class="plancmp '+(gap>0.5?'short':'ok')+'">With <b>'+people+'</b> people at '+shift+'h you have <b>'+avail.toFixed(0)+'h</b>. '+
+      (gap>0.5?('The plan needs <b>'+gap.toFixed(1)+'h</b> more &mdash; about '+(gap/shift).toFixed(1)+' more person'+((gap/shift)>=1.5?'s':'')+', or move the deadline / trim scope.'):
+       (Math.abs(gap)<=0.5?'That lines up almost exactly.':('You have <b>'+(-gap).toFixed(1)+'h</b> of slack &mdash; about '+((-gap)/shift).toFixed(1)+' person to spare or redeploy.')))+'</div>';}
+  set('pl_cmp',cmp);}
+function planLineup(){if(!SPEED||!SPEED.stages)return '';
+  var h='<div class=sub style="margin:18px 0 8px"><b>Suggested lineup</b> &mdash; your fastest hands per activity (typical pace, from Speed &amp; Rankings). Assign top-down to cover the people above.</div><div class=lineup>';
+  planStages().forEach(function(s){var key=s[0];
+    var rk=(SPEED.stages[key]||[]).filter(function(r){return r.ranked;}).sort(function(a,b){return b.pace-a.pace;}).slice(0,5);
+    h+='<div class=lncol><div class=lnh>'+s[1]+'</div>';
+    if(!rk.length)h+='<div class=sub style=font-size:11px>not enough ranked data yet</div>';
+    rk.forEach(function(r,i){h+='<div class=lnrow><span>'+(i+1)+'. '+r.person+'</span><b>'+fmt(r.pace)+'<span class=s>/hr</span></b></div>';});
+    h+='</div>';});
+  return h+'</div>';}
+function planReset(){if(!PLAN)return;PLAN.act.forEach(function(a){var el=document.getElementById('pl_rate_'+a.key);if(el)el.value=Math.round(a.rate);});planCompute();}
 async function loadEngraving(){const f=document.getElementById('from').value,t=document.getElementById('to').value,k=f+'|'+t;
   if(ENGR&&engKey===k){renderEngraving();return;}
   document.getElementById('engtable').innerHTML='<div class=sub>loading…</div>';
