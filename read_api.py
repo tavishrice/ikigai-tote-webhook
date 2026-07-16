@@ -646,6 +646,24 @@ td.mix{white-space:nowrap;font-size:12px}
 .notechip b{color:#1e1b4b}.notechip .x{cursor:pointer;color:#818cf8;font-weight:700;margin-left:2px}
 .projh{color:#4338ca;font-weight:700}
 td.sub2{color:var(--muted)}
+/* Trust & coverage layer */
+.covwrap{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:#fbfcfe;margin:14px 0}
+.covhead{font-size:13px;font-weight:700;color:var(--ink-2);margin-bottom:2px}
+.covsum{font-size:12px;color:var(--muted);margin-bottom:10px}
+.covsum b{color:var(--ink-2)}
+.covlegend{font-size:11px;color:var(--muted);margin:2px 0 12px}
+.covkey{display:inline-flex;align-items:center;gap:5px;margin-right:14px}
+.covkey i{width:11px;height:11px;border-radius:3px;display:inline-block}
+.covrow{display:flex;align-items:center;gap:10px;padding:4px 0}
+.covname{width:150px;font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.covpct{width:42px;text-align:right;font-weight:700;font-size:12.5px}
+.covpct.g{color:#15803d}.covpct.a{color:#b45309}.covpct.r{color:#b91c1c}
+.covbar{flex:1;height:17px;border-radius:5px;overflow:hidden;display:flex;background:#eef2f7;min-width:120px}
+.covbar i{display:block;height:100%}
+.cov-sc{background:#34d399}.cov-lg{background:#6366f1}.cov-un{background:#f87171}
+.covmeta{width:150px;text-align:right;font-size:11px;color:var(--muted)}
+.covmeta b{color:var(--ink-2)}
+.covlog{color:#4f46e5;cursor:pointer;font-weight:600}.covlog:hover{text-decoration:underline}
 /* Log off-scanner time card */
 .logcard{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:#fbfcfe;margin-top:16px}
 .logtitle{font-size:13px;font-weight:700;color:var(--ink-2);margin-bottom:10px}
@@ -747,6 +765,7 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
   <div class=card>
     <h2>Floor Time <span style="color:#9ca3af;font-weight:400">&mdash; the effectiveness auditor: hours &amp; output, by day</span></h2>
     <div class=sub style=margin:0>The headline <b>Hours</b> is the raw window from a person&rsquo;s <b>first scan to their last</b> (First in &rarr; Last out) &mdash; the default measure of time on the floor, and the one we trust most today. <b>Active</b> strips 45-min+ breaks out of that window; it&rsquo;s a stricter, still-maturing calculation, so it sits beside Hours rather than replacing it. The gap between them is break / off-scanner time &mdash; log the real off-scanner work under <b>Proj h</b> to keep it honest. <b>Util</b> = active &divide; span; <b>Items/hr</b> = units per floor-hour. All floor work (pick + pack + engrave + restock), Eastern time.</div>
+    <div id=floorcover></div>
     <div id=floortable></div>
     <div class=logcard>
       <div class=logtitle>Log off-scanner time <span class=s>&mdash; returns, cleanup, meetings, training: real work that doesn&rsquo;t hit a scanner</span></div>
@@ -1019,10 +1038,32 @@ async function loadFloor(){const f=document.getElementById('from').value,t=docum
   try{FLOOR=await getj('/floor?from='+f+'&to='+t);floorKey=k;renderFloor();}
   catch(e){document.getElementById('floortable').innerHTML='<div class=sub>could not load floor data</div>';}}
 function floorSortBy(k){if(floorSort===k)floorDir*=-1;else{floorSort=k;floorDir=-1;}renderFloor();}
+// Trust & coverage: split each person's on-floor span into scanned work / logged off-scanner / unexplained gap.
+function renderCoverage(ppl){var cw=document.getElementById('floorcover');if(!cw)return;
+  var rows=ppl.filter(function(p){return (p.span_h||0)>0;}).map(function(p){
+    var sp=p.span_h||0, sc=p.hours||0, lg=p.proj_hours||0;
+    var unex=Math.max(0, sp-sc-lg), base=Math.max(sp, sc+lg)||1;
+    return {person:p.person, sp:sp, sc:sc, lg:lg, unex:unex, base:base, cov:(sp>0?Math.round(100*(sp-unex)/sp):100)};});
+  if(!rows.length){cw.innerHTML='';return;}
+  rows.sort(function(a,b){return b.unex-a.unex;});   // biggest unexplained gap first — who needs logging
+  var tSp=rows.reduce(function(a,r){return a+r.sp;},0), tUn=rows.reduce(function(a,r){return a+r.unex;},0), tLg=rows.reduce(function(a,r){return a+r.lg;},0);
+  var tCov=tSp>0?Math.round(100*(tSp-tUn)/tSp):100, col=function(c){return c>=85?'g':(c>=65?'a':'r');};
+  var h='<div class=covwrap><div class=covhead>Time accounted for</div>'+
+    '<div class=covsum><b>'+tCov+'%</b> of on-floor time is accounted for — scanned work or logged off-scanner. <b>'+tUn.toFixed(1)+'h</b> still unexplained'+(tLg>0?', <b>'+tLg.toFixed(1)+'h</b> logged so far':'')+'. The more red a bar shows, the more of that person&rsquo;s day the data can&rsquo;t see &mdash; log it below to close the gap.</div>'+
+    '<div class=covlegend><span class=covkey><i class=cov-sc></i>Scanned work</span><span class=covkey><i class=cov-lg></i>Logged off-scanner</span><span class=covkey><i class=cov-un></i>Unexplained gap</span></div>';
+  rows.forEach(function(r){var w=function(x){return (100*x/r.base).toFixed(1);};
+    h+='<div class=covrow><div class=covname>'+r.person+'</div>'+
+      '<div class="covpct '+col(r.cov)+'">'+r.cov+'%</div>'+
+      '<div class=covbar><i class=cov-sc style="width:'+w(r.sc)+'%"></i><i class=cov-lg style="width:'+w(r.lg)+'%"></i><i class=cov-un style="width:'+w(r.unex)+'%"></i></div>'+
+      '<div class=covmeta><b>'+r.sp.toFixed(1)+'h</b> on floor'+(r.unex>0.05?' &middot; '+r.unex.toFixed(1)+'h gap <span class=covlog onclick="covLogFor(\''+r.person.replace(/'/g,"\\'")+'\')">&#43; log</span>':' &middot; <span style="color:#15803d">clear</span>')+'</div></div>';});
+  h+='</div>';cw.innerHTML=h;}
+function covLogFor(person){var sel=document.getElementById('n_person');if(sel){sel.value=person;onPersonPick();}
+  var el=document.querySelector('.logcard');if(el)el.scrollIntoView({behavior:'smooth',block:'center'});}
 function renderFloor(){if(!FLOOR)return;
   const days=FLOOR.days,showDays=DET()&&days.length<=16;
   const ppl=FLOOR.people.filter(tfilter);
   ppl.forEach(p=>{p.iphr_floor=((p.span_h||0)>0?Math.round(p.items/p.span_h):0);});   // items per FLOOR hour (span-based)
+  renderCoverage(ppl);
   const arr=[...ppl].sort((a,b)=>{const x=a[floorSort],y=b[floorSort];return (x>y?1:(x<y?-1:0))*floorDir;});
   const arw=k=>floorSort===k?'<span class=arw>'+(floorDir<0?'▼':'▲')+'</span>':'';
   const th=(k,l,s)=>'<th class="srt'+(floorSort===k?' act':'')+'" onclick="floorSortBy(\''+k+'\')">'+l+(s?' <span class=s>'+s+'</span>':'')+arw(k)+'</th>';
