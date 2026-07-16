@@ -100,10 +100,11 @@ def warehouse():
         cur.execute("""
         WITH o AS (SELECT order_number, bool_or(source='shiphero') sh, bool_or(source='shopify') shop
                    FROM event WHERE stage='pack' AND order_number IS NOT NULL
+                     AND person <> ALL(%s)              -- fired/departed packers don't count an order as shipped
                      AND et_day(ts) BETWEEN %s AND %s GROUP BY order_number)
         SELECT count(*) total, count(*) FILTER (WHERE sh) shiphero,
                count(*) FILTER (WHERE NOT sh AND shop) shopify_only,
-               count(*) FILTER (WHERE sh AND shop) both FROM o""", [frm, to])
+               count(*) FILTER (WHERE sh AND shop) both FROM o""", [list(EXCLUDED), frm, to])
         shipped = cur.fetchone()
 
     people = []
@@ -227,7 +228,7 @@ def floor_stats():
         out.append(p)
     seen={p["person"] for p in out}   # people with ONLY logged project time (no scans) still show up
     for person,nl in notes.items():
-        if person in seen: continue
+        if person in seen or person in EXCLUDED: continue
         out.append(dict(person=person, type=PERSON_TYPE.get(person,""), active_days=0,
             first_in="", last_out="", hours=0, hours_per_day=0, items=0, ful_items=0, repl_items=0,
             items_per_day=0, items_per_hr=0, util=0, avg_span=0, span_h=0, days=[],
@@ -320,7 +321,7 @@ def person_day():
     day=(request.args.get("d") or "").strip()[:10]
     try: dt.date.fromisoformat(day)
     except Exception: return jsonify(ok=False, error="bad date"), 400
-    if not person: return jsonify(ok=False, error="need a person"), 400
+    if not person or person in EXCLUDED: return jsonify(ok=False, error="unknown person"), 400
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
         cur.execute("""SELECT ts FROM event
                        WHERE person=%s AND is_floor_labor(stage,subtype) AND et_day(ts)=%s
@@ -456,7 +457,7 @@ def trend():
     pace = items/hr from the median gap between consecutive same-activity chunks; units = throughput volume.
     Weeks with too few timed items show volume only (pace null)."""
     person=(request.args.get("person") or "").strip()
-    if not person: return jsonify(ok=False, error="need a person"), 400
+    if not person or person in EXCLUDED: return jsonify(ok=False, error="unknown person"), 400
     try: wks=max(2, min(26, int(request.args.get("weeks") or 8)))
     except Exception: wks=8
     to = request.args.get("to") or (dt.datetime.now(_ET).date()).isoformat()
@@ -933,7 +934,7 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
     <div class=sub style=margin:0>Set who&rsquo;s on the floor and their hours (10 = a full day), and a realistic <b>Utilization %</b> (nobody runs at peak pace for 10 hours straight). <b>Auto-assign</b> pours every person-hour into whatever station is the current bottleneck, using each person&rsquo;s own all-time pace &mdash; so engraving only draws the few hours its demand needs and every spare hour (over-capacity pickers, extra engravers) cascades to the bottleneck. It will <b>split</b> a person&rsquo;s day when that&rsquo;s optimal (e.g. 2h engrave + 8h pack, shown next to their output). Override any <b>station</b>, flip <b>in/out</b>, or change <b>hours</b> and it recomputes live. Restock / receiving / returns &rarr; <b>Other</b>.</div>
     <div class=planbar>
       <div class=lf><label>Order target</label><input id=pl_orders type=number min=0 step=10 oninput=planCompute()></div>
-      <div class=lf><label>Default hours</label><input id=pl_defhrs type=number min=1 max=14 step=0.5 value=10 oninput=planCompute()></div>
+      <div class=lf><label>Default hours</label><input id=pl_defhrs type=number min=1 max=14 step=0.5 value=10></div>
       <div class=lf><label>Utilization %</label><input id=pl_util type=number min=10 max=100 step=5 value=80 oninput=planCompute() title="Nobody works at peak pace for 10 hours straight — this discounts every rate to a realistic sustained level."></div>
       <div class=lf><label>&nbsp;</label><button class=pill onclick="planAllHours()">Set all to default</button></div>
       <div class=lf><label>&nbsp;</label><button class="pill add" onclick="planRecommend()">Auto-assign</button></div>
@@ -1022,7 +1023,7 @@ function toggleAuto(){
   else{relWake();var el=document.getElementById('refstamp');if(el)el.textContent='';}
 }
 function initAuto(){try{var v=parseInt(localStorage.getItem('wh_auto')||'0',10);
-  if(v>0){document.getElementById('autoref').checked=true;var s=document.getElementById('autoint');if(s&&[2,5,15].indexOf(v)>=0)s.value=v;toggleAuto();}}catch(e){}}
+  if(v>0){document.getElementById('autoref').checked=true;var s=document.getElementById('autoint');if(s&&[2,5,15].indexOf(v)>=0)s.value=v;toggleAuto();return true;}}catch(e){}return false;}
 function fmt(n){return (n||0).toLocaleString();}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function ampm(iso){if(!iso)return '';return new Date(iso).toLocaleTimeString([], {hour:'numeric',minute:'2-digit',timeZone:'America/New_York'})+' ET';}
@@ -1056,13 +1057,13 @@ function render(){if(!DATA)return;
     card('Items packed','ShipHero','s-pksh',v.packsh?T.packsh_i:0),
     card('Items packed','Shopify','s-shop',v.packshop?T.packshop_i:0),
     card('Items engraved','logger','s-eng',v.eng?T.eng_i:0),
-    card('Items — total','fulfillment','s-sel',itemsSel)].join('');
+    card('Items — total','fulfillment','s-sel',itemsSel),
+    card('Restocked','units · incl. tote moves','s-repl',v.repl?T.repl:0)].join('');
   so.innerHTML=!showOrders?'':[
     card('Orders picked','ShipHero','s-sh',v.pick?T.pk_o:0),
     card('Orders packed','ShipHero','s-pksh',v.packsh?T.packsh_o:0),
     card('Orders packed','Shopify','s-shop',v.packshop?T.packshop_o:0),
-    card('Restocked','units · incl. tote moves','s-repl',v.repl?T.repl:0),
-    card('Orders — total','fulfillment','s-sel',ordersSel)].join('');
+    card('Order-lines','pick+pack+engrave, not distinct','s-sel',ordersSel)].join('');
   si.classList.toggle('hide',!showItems);so.classList.toggle('hide',!showOrders);
   drawChart(ppl,v);
   drawDetail(ppl,unit,v);
@@ -1411,7 +1412,9 @@ function planCompute(){if(!PLAN)return;
   function rt(p,st){return st==='Pick'?p.pick:st==='Pack'?p.pack:st==='Engrave'?p.eng:0;}
   PLAN.people.forEach(function(p,i){var out=0,label='';
     if(p.inn){
-      if(p.alloc){var segs=[];['Pick','Pack','Engrave'].forEach(function(st){var h=p.alloc[st]||0;if(h>0.05){var it=Math.round(rt(p,st)*h*util);out+=it;cap[st]+=it;hrs[st]+=h;nA[st]++;segs.push(st.slice(0,2)+' '+h.toFixed(1)+'h');}});label=segs.join(' · ');}
+      if(p.alloc){var segs=[],dom='Pick',dm=-1;['Pick','Pack','Engrave'].forEach(function(st){var h=p.alloc[st]||0;if(h>dm){dm=h;dom=st;}});
+        ['Pick','Pack','Engrave'].forEach(function(st){var h=p.alloc[st]||0;if(h>0.05){var it=Math.round(rt(p,st)*h*util);out+=it;cap[st]+=it;hrs[st]+=h;segs.push(st.slice(0,2)+' '+h.toFixed(1)+'h');}});
+        nA[dom]++;label=segs.join(' · ');}   // count a split person once, under their main station, so People = headcount
       else{var a=p.assign,it=Math.round(rt(p,a)*p.hours*util);out=it;if(cap[a]!=null)cap[a]+=it;if(hrs[a]!=null)hrs[a]+=p.hours;nA[a]=(nA[a]||0)+1;}}
     set('plout_'+i, p.inn?((out?'<b>'+fmt(out)+'</b> items':'<span class=dmt>—</span>')+(label?' <span class=s>'+label+'</span>':'')):'<span class=dmt>out</span>');});
   var ipoP=PLAN.ipo.pick>0.2?PLAN.ipo.pick:3.5, ipoK=PLAN.ipo.pack>0.2?PLAN.ipo.pack:3.5, ipoE=PLAN.ipo.engrave||0;
@@ -1632,7 +1635,6 @@ async function loadWatch(){
   catch(e){document.getElementById('watch_body').innerHTML='<div class=sub>could not load watch data</div>';}
 }
 function utilCls(u){return u<50?'ured':(u<65?'uamb':'ugrn');}
-function esc(s){return (''+s).replace(/"/g,'&quot;');}
 function renderWatch(){
   if(!WATCH)return;const c=WATCH.config,P=WATCH.people;
   const eng=P.filter(p=>p.engraver), main=P.filter(p=>!p.engraver&&(p.cohort||p.flags.length)), insuff=P.filter(p=>!p.engraver&&!p.cohort&&!p.flags.length);
@@ -1642,7 +1644,7 @@ function renderWatch(){
   h+='<b>Flags:</b> Bursty/idle (util &lt;'+c.util_low+'%) · Under hours (&lt;70% of target) · Short shifts (avg &lt;'+c.short_day_hr+'h/day) · Missed days (check the <b>PTO app</b>) · Low output (bottom '+c.out_bottom_pct+'%) · Fast-but-low-total · Inconsistent.<br>';
   h+='<b>Presence</b> comes from scan timestamps (a lower bound on real clock time) and does not yet cross-check the PTO app or scheduled shifts — so verify hours/attendance flags there. <b>Engravers ('+c.engravers.join(', ')+')</b> are shown separately and un-flagged for now, since engraving time isn&rsquo;t cleanly tracked.</div>';
   h+='<div class=card><h2>Flags &amp; profiles</h2><div class=sub style=margin:0>Most-flagged first. Hover a chip for the evidence. Util is coloured (red &lt;50%, amber 50–65%, green &gt;65%).</div>';
-  h+='<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th>Type</th><th>Output</th><th>Output/hr<span class=s> all tasks</span></th><th>Active h</th><th>Floor h</th><th>Util</th><th>Days</th><th>Avg/day</th><th style=text-align:left>Flags</th></tr>';
+  h+='<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th>Type</th><th>Output</th><th>Output/hr<span class=s> pick+pack+engrave</span></th><th>Active h</th><th>Floor h</th><th>Util</th><th>Days</th><th>Avg/day</th><th style=text-align:left>Flags</th></tr>';
   main.forEach(p=>{
     h+='<tr><td class=name>'+esc(p.person)+'</td><td><span class="badge '+(p.type==='Intern'?'in':'ft')+'">'+(p.type==='Intern'?'Intern':(p.type?'FT':'—'))+'</span></td>';
     h+='<td>'+fmt(p.output)+'</td><td>'+fmt(p.pace)+'</td><td>'+p.active_hr+'</td><td>'+p.floor_hr+'</td><td class='+utilCls(p.util)+'>'+p.util+'%</td><td>'+p.days+'</td><td>'+p.avg_span+'h</td>';
