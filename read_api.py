@@ -1049,12 +1049,12 @@ function renderOutstanding(){var o=OUT;
   // aging table
   var maxc=Math.max.apply(null,o.aging.map(function(a){return a.count;}).concat([1]));
   var ag='<div class=sub style="margin:16px 0 6px"><b>Aging</b> &mdash; how long orders have been waiting.</div>'+
-    '<table class=plantbl><tr><th style=text-align:left>Age</th><th>Orders</th><th></th><th>Value</th><th>Items</th></tr>';
+    '<table class=plantbl><tr><th style=text-align:left>Age</th><th>Orders</th><th></th><th>Value</th></tr>';
   o.aging.forEach(function(a){var w=Math.round(100*a.count/maxc);var col=a.aged?(a.label.indexOf("7")===0?'#dc2626':'#d97706'):'#16a34a';
     ag+='<tr'+(a.aged?' class=plbn':'')+'><td style=text-align:left>'+a.label+(a.aged?' <span class=s style=color:#b45309>aged</span>':'')+'</td>'+
       '<td><b>'+fmt(a.count)+'</b></td>'+
       '<td style="width:180px"><div style="background:#eef2f7;border-radius:5px;height:14px;overflow:hidden"><div style="height:100%;width:'+w+'%;background:'+col+'"></div></div></td>'+
-      '<td>'+money(a.value)+'</td><td>'+(a.items?fmt(a.items):'&middot;')+'</td></tr>';});
+      '<td>'+money(a.value)+'</td></tr>';});
   ag+='</table>';
   // status breakdown
   var st='';
@@ -1062,11 +1062,11 @@ function renderOutstanding(){var o=OUT;
     o.status.map(function(s){return '<div class=lncol><div class=lnh>'+esc(s.status)+'</div><div class=lnrow><span>'+fmt(s.count)+' orders</span><b>'+money(s.value)+'</b></div></div>';}).join('')+'</div>';}
   // oldest orders
   var ol='<div class=sub style="margin:18px 0 6px"><b>Oldest open orders</b> &mdash; work these down first.</div>'+
-    '<div class=tablewrap><table><tr><th style=text-align:left>Order</th><th>Age</th><th>Items</th><th>Value</th><th style=text-align:left>Status</th></tr>'+
+    '<div class=tablewrap><table><tr><th style=text-align:left>Order</th><th>Age</th><th>Value</th><th style=text-align:left>Status</th></tr>'+
     o.oldest.map(function(r){var ac=r.age_days>=7?'ured':(r.age_days>=3?'uamb':'ugrn');
       return '<tr><td class=name style=text-align:left>'+esc(r.order)+'</td>'+
         '<td><span class='+ac+'>'+r.age_days.toFixed(1)+'d</span></td>'+
-        '<td>'+(r.items?fmt(r.items):'&middot;')+'</td><td>'+money(r.value)+'</td>'+
+        '<td>'+money(r.value)+'</td>'+
         '<td style=text-align:left>'+esc(r.status||'')+(r.on_hold?' <span class=s style=color:#dc2626>on hold'+(r.hold?' ('+esc(r.hold)+')':'')+'</span>':'')+'</td></tr>';}).join('')+
     '</table></div>';
   var stamp=o.snapshot_at?('<div class=sub style="margin-top:12px">Snapshot from '+new Date(o.snapshot_at).toLocaleString()+'.</div>'):'';
