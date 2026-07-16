@@ -12,6 +12,8 @@ Auth + GraphQL client mirror shiphero_ingest.py (refresh_token -> access_token, 
 import os, json, time, urllib.request, urllib.error
 from db import connect
 
+# rev: credit-safe query (no line_items, first:50) — 2026-07-16
+
 AUTH = "https://public-api.shiphero.com/auth/refresh"
 GQL  = "https://public-api.shiphero.com/graphql"
 REFRESH = os.environ.get("SHIPHERO_REFRESH_TOKEN", "")
