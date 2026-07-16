@@ -23,9 +23,12 @@ PERSON_TYPE = {
     "Nic Cox":"FT","Halil Gurler":"FT","Kadil Ladson":"FT","Manu Bekele":"FT",
     "Maurice Williams":"FT","Jeffrey Kwan":"FT","Shambria Green":"FT","Breton Rice":"FT",
     "Esra Altug":"Intern","Simay Guner":"Intern","Cindy Lin":"Intern",
-    "Brennen Myrick":"Intern","Lara Nielsen":"Intern","Patrick Robin":"Intern",
-    "Broghan Rice":"","Daniella Gross":"","Roland Tilk":"",
+    "Lara Nielsen":"Intern","Patrick Robin":"Intern",
+    "Broghan Rice":"","Daniella Gross":"",
 }
+# People no longer on the team — hidden from every view (Roland Tilk: terminated for fraudulent
+# submissions; Brennen Myrick: departed). Their historical rows stay in the DB but never surface.
+EXCLUDED = {"Roland Tilk", "Brennen Myrick"}
 
 @app.after_request
 def cors(resp):
@@ -106,6 +109,7 @@ def warehouse():
     people = []
     tot = dict(pk_i=0,packsh_i=0,packshop_i=0,eng_i=0,pk_o=0,packsh_o=0,packshop_o=0,eng_o=0,repl=0)
     for r in rows:
+        if r[0] in EXCLUDED: continue
         (person,pk_i,pk_o,psh_i,psh_o,psp_i,psp_o,repl,eng_i,eng_o,pick_c,pack_c,ful_c,mov_c,cnt_c,eng_c,adays,first,last)=r
         people.append(dict(person=person, type=PERSON_TYPE.get(person,""), active_days=int(adays or 0),
             items_picked_sh=pk_i, items_packed_sh=psh_i, items_packed_shop=psp_i,
@@ -188,6 +192,7 @@ def floor_stats():
         notes.setdefault(person, []).append(dict(id=nid, d=str(nd), hours=float(nh or 0), note=note, author=author or ""))
     ppl = {}
     for (person,d,dow,active_s,ful,repl,first,last,span_s) in rows:
+        if person in EXCLUDED: continue
         p = ppl.setdefault(person, dict(person=person, type=PERSON_TYPE.get(person,""),
             active_days=0, active_s=0.0, span_s=0.0, ful=0, repl=0, days=[], _fi=(None,""), _lo=(None,"")))
         active_s=float(active_s or 0); span_s=float(span_s or 0)
@@ -243,6 +248,7 @@ def engraving():
         rows = cur.fetchall()
     ppl={}
     for (person,d,scans,totes,matched,dotw,lid,ipe,units,orders,hours) in rows:
+        if person in EXCLUDED: continue
         if not scans: continue
         p=ppl.setdefault(person, dict(person=person, type=PERSON_TYPE.get(person,""),
             active_days=0, scans=0, totes=0, matched=0, dotw=0, lid=0, ipe=0, items=0, orders=0, hours=0.0, days=[]))
@@ -413,7 +419,7 @@ def speed():
         rows = cur.fetchall()
     rows_by_stage = {s: [] for s in SPEED_STAGES}
     for (person, stage, n, days, amin, units, med_spi, med_move) in rows:
-        if not n: continue
+        if not n or person in EXCLUDED: continue
         n=int(n); days=int(days or 0); amin=float(amin or 0); units=int(units or 0)
         med_spi=float(med_spi) if med_spi is not None else None
         med_move=float(med_move) if med_move is not None else None
@@ -534,6 +540,7 @@ def watch():
         rows = cur.fetchall()
     ppl = []
     for (person,days,span,active,output,med,best) in rows:
+        if person in EXCLUDED: continue
         span=float(span or 0); active=float(active or 0); output=int(output or 0); days=int(days)
         ppl.append(dict(person=person, type=PERSON_TYPE.get(person,""), days=days,
             floor_hr=round(span/3600,1), active_hr=round(active/3600,1),
@@ -1337,8 +1344,11 @@ async function loadPlanner(){var host=document.getElementById('plan_roster');if(
   planRenderRoster();planCompute();}
 function planInit(k){var io=planItemsOrders(),shipped=(DATA.shipped&&DATA.shipped.total)||1,days=planDaysInRange();
   var def=num('pl_defhrs',10)||10;
+  var tmap={};['pick','pack','engrave'].forEach(function(s){((PSPEED&&PSPEED.stages&&PSPEED.stages[s])||[]).forEach(function(r){if(r.type)tmap[r.person]=r.type;});});
+  var roster=planRosterPeople();
+  roster.sort(function(a,b){var ai=(tmap[a]==='Intern')?1:0,bi=(tmap[b]==='Intern')?1:0;return ai!==bi?ai-bi:a.localeCompare(b);});  // full-timers first, interns last
   PLAN={key:k, ipo:{pick:io.pick.i/shipped, pack:io.pack.i/shipped, engrave:io.engrave.i/shipped}, avgDaily:Math.round(shipped/days),
-    people:planRosterPeople().map(function(p){return {person:p, pick:planRate(p,'pick'), pack:planRate(p,'pack'), eng:planRate(p,'engrave'), hours:def, inn:true, assign:'Other'};})};
+    people:roster.map(function(p){var t=tmap[p]||'';return {person:p, type:t, pick:planRate(p,'pick'), pack:planRate(p,'pack'), eng:planRate(p,'engrave'), hours:def, inn:(t!=='Intern'), assign:'Other'};})};
   var oi=document.getElementById('pl_orders'); if(oi&&!oi.value)oi.value=PLAN.avgDaily||'';
   planRecommend(true);}
 function planStationOpts(p,sel){var opts=[['Pick',p.pick],['Pack',p.pack]]; if(p.eng>0)opts.push(['Engrave',p.eng]); opts.push(['Other',0]);
@@ -1348,7 +1358,7 @@ function planRenderRoster(){var host=document.getElementById('plan_roster');if(!
   var h='<table class=plantbl id=plros><tr><th>In</th><th style=text-align:left>Person</th><th>Hours</th><th>Pick/hr</th><th>Pack/hr</th><th>Eng/hr</th><th style=text-align:left>Station</th><th>Their output</th></tr>';
   PLAN.people.forEach(function(p,i){h+='<tr class="'+(p.inn?'':'plout')+'">'+
     '<td><input type=checkbox class=plin id=plin_'+i+' '+(p.inn?'checked':'')+' onchange="planToggleIn('+i+')"></td>'+
-    '<td class=name style=text-align:left>'+esc(p.person)+'</td>'+
+    '<td class=name style=text-align:left>'+esc(p.person)+' '+badge(p.type)+'</td>'+
     '<td><input class="nin plhrs" id=plhrs_'+i+' type=number min=0 max=14 step=0.5 value='+p.hours+' oninput="planEdit()"></td>'+
     '<td>'+(p.pick||'<span class=dmt>·</span>')+'</td><td>'+(p.pack||'<span class=dmt>·</span>')+'</td><td>'+(p.eng||'<span class=dmt>·</span>')+'</td>'+
     '<td style=text-align:left><select class=plsel id=plsel_'+i+' onchange="planEdit()">'+planStationOpts(p,p.assign)+'</select></td>'+
