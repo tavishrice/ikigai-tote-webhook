@@ -39,6 +39,14 @@ _ET = dt.timezone(dt.timedelta(hours=-4))   # ET (EDT) for the summer window
 def _ampm(ts):
     if not ts: return ""
     return ts.astimezone(_ET).strftime("%-I:%M %p")
+def _hm(ts):   # 24h HH:MM in ET, for prefilling <input type=time>
+    if not ts: return ""
+    return ts.astimezone(_ET).strftime("%H:%M")
+def _hm_ampm(s):   # "13:30" -> "1:30p"
+    try:
+        hh,mm=map(int,s.split(":")); ap="a" if hh<12 else "p"; h12=hh%12 or 12
+        return f"{h12}:{mm:02d}{ap}"
+    except Exception: return s
 
 def _daylist(frm, to):
     out=[]; d=dt.date.fromisoformat(frm); end=dt.date.fromisoformat(to)
@@ -193,6 +201,7 @@ def floor_stats():
         p["items_per_hr"]=round(items/hrs) if hrs>0 else 0
         p["util"]=round(100*p["active_s"]/p["span_s"]) if p["span_s"]>0 else 0
         p["avg_span"]=round(p["span_s"]/p["active_days"]/3600.0,1) if p["active_days"] else 0   # typical first->last window/day
+        p["span_h"]=round(p["span_s"]/3600.0,1)   # total on-floor (first->last) across days
         nl=notes.get(p["person"],[]); p["notes"]=nl; p["proj_hours"]=round(sum(x["hours"] for x in nl),1)
         del p["active_s"]; del p["span_s"]; del p["ful"]; del p["repl"]
         out.append(p)
@@ -204,7 +213,8 @@ def floor_stats():
             items_per_day=0, items_per_hr=0, util=0, avg_span=0, days=[],
             notes=nl, proj_hours=round(sum(x["hours"] for x in nl),1)))
     out.sort(key=lambda x:-(x["hours"]+x.get("proj_hours",0)))
-    return jsonify(range={"from":frm,"to":to}, days=_daylist(frm,to), people=out)
+    dl=_daylist(frm,to); work_days=sum(1 for x in dl if x["dow"]<=5)   # weekdays (Mon-Fri) in the window
+    return jsonify(range={"from":frm,"to":to}, days=dl, work_days=work_days, people=out)
 
 @app.route("/engraving")
 def engraving():
@@ -250,6 +260,17 @@ def add_note():
     author=(d.get("author") or "").strip()[:80]
     try: hours=float(d.get("hours") or 0)
     except Exception: hours=0.0
+    # If a start+end time-of-day was picked, derive hours from it and stamp the window onto the note.
+    start=(d.get("start") or "").strip(); end=(d.get("end") or "").strip()
+    if start and end:
+        try:
+            sh,sm=map(int,start.split(":")); eh,em=map(int,end.split(":"))
+            mins=(eh*60+em)-(sh*60+sm)
+            if mins>0:
+                hours=round(mins/60.0,2)
+                rng=_hm_ampm(start)+"–"+_hm_ampm(end)
+                note=(rng+("  "+note if note else "")).strip()[:500]
+        except Exception: pass
     hours=max(0.0, min(24.0, hours))
     try: dt.date.fromisoformat(day)
     except Exception: return jsonify(ok=False, error="bad date"), 400
@@ -267,6 +288,50 @@ def del_note():
     with connect() as c, c.cursor() as cur:
         cur.execute("DELETE FROM floor_note WHERE id=%s", (int(nid),)); c.commit()
     return jsonify(ok=True)
+
+GAP_SHOW = 1800   # seconds = 30 min: gaps this long or longer are surfaced as fillable windows
+@app.route("/person_day")
+def person_day():
+    """One person, one ET day: their scan schedule broken into work blocks and the gaps between
+    them, so a leader can SEE the empty windows and log off-scanner time straight into a gap.
+    Active hours use the same 45-min-break rule as everywhere else; span = first->last scan."""
+    person=(request.args.get("person") or "").strip()
+    day=(request.args.get("d") or "").strip()[:10]
+    try: dt.date.fromisoformat(day)
+    except Exception: return jsonify(ok=False, error="bad date"), 400
+    if not person: return jsonify(ok=False, error="need a person"), 400
+    with connect() as c, c.cursor(row_factory=tuple_row) as cur:
+        cur.execute("""SELECT ts FROM event
+                       WHERE person=%s AND is_floor_labor(stage,subtype) AND et_day(ts)=%s
+                       ORDER BY ts""", [person, day])
+        ts=[r[0] for r in cur.fetchall()]
+        cur.execute("SELECT id,hours,note,author FROM floor_note WHERE person=%s AND d=%s ORDER BY id",[person,day])
+        notes=[dict(id=r[0],hours=float(r[1] or 0),note=r[2] or "",author=r[3] or "") for r in cur.fetchall()]
+    if not ts:
+        return jsonify(ok=True, person=person, d=day, scans=0, first="", last="",
+                       active_h=0, span_h=0, timeline=[], notes=notes)
+    first,last=ts[0],ts[-1]
+    blocks=[]; gaps=[]; s_start=ts[0]; prev=ts[0]
+    for cur_ts in ts[1:]:
+        g=(cur_ts-prev).total_seconds()
+        if g>=GAP_SHOW:
+            blocks.append((s_start,prev)); gaps.append((prev,cur_ts,g,g>=ACTIVE_BREAK)); s_start=cur_ts
+        prev=cur_ts
+    blocks.append((s_start,prev))
+    span_s=(last-first).total_seconds()
+    active_s=span_s-sum(g for (_,_,g,brk) in gaps if brk)   # remove only 45-min+ breaks (matches /floor)
+    tl=[]
+    for i,(s,e) in enumerate(blocks):
+        tl.append(dict(kind="work", start=_hm(s), end=_hm(e), start_l=_ampm(s), end_l=_ampm(e),
+                       mins=round((e-s).total_seconds()/60)))
+        if i < len(gaps):
+            gs,ge,g,brk=gaps[i]
+            tl.append(dict(kind="gap", start=_hm(gs), end=_hm(ge), start_l=_ampm(gs), end_l=_ampm(ge),
+                           mins=round(g/60), brk=brk))
+    return jsonify(ok=True, person=person, d=day, scans=len(ts),
+                   first=_ampm(first), last=_ampm(last),
+                   active_h=round(active_s/3600,2), span_h=round(span_s/3600,2),
+                   timeline=tl, notes=notes)
 
 # ---------------- Speed & Rankings ----------------
 # How fast each person works at each activity, so the right people get assigned to the right task.
@@ -579,6 +644,39 @@ td.mix{white-space:nowrap;font-size:12px}
 .notechip{display:inline-flex;align-items:center;gap:6px;background:#eef2ff;color:#3730a3;border-radius:8px;padding:3px 9px;font-size:11.5px;margin:8px 6px 0 0}
 .notechip b{color:#1e1b4b}.notechip .x{cursor:pointer;color:#818cf8;font-weight:700;margin-left:2px}
 .projh{color:#4338ca;font-weight:700}
+td.sub2{color:var(--muted)}
+/* Log off-scanner time card */
+.logcard{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:#fbfcfe;margin-top:16px}
+.logtitle{font-size:13px;font-weight:700;color:var(--ink-2);margin-bottom:10px}
+.logtitle .s{color:var(--muted);font-weight:400}
+.logrow{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+.lf{display:flex;flex-direction:column;gap:4px}
+.lf label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+.lf select,.lf input{padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;font-family:inherit;background:#fff}
+.lf select:focus,.lf input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak)}
+.lf select{min-width:150px}
+.lfh input{width:78px}
+.lgrow{flex:1;min-width:200px}.lgrow input{width:100%;box-sizing:border-box}
+.pill.add{padding:8px 18px;font-weight:700}
+.nstat{font-size:12px;color:var(--muted);min-height:0;margin-top:2px}
+.nstat.ok{color:#16a34a}.nstat.err{color:#dc2626}
+.sched{margin-top:4px}
+.schead{font-size:12px;color:var(--ink-2);margin:8px 0 6px}.schead b{color:var(--ink)}
+.tline{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.twork{display:inline-flex;flex-direction:column;background:#ecfdf5;border:1px solid #a7f3d0;color:#065f46;border-radius:8px;padding:4px 10px;font-size:11.5px;line-height:1.3}
+.twork b{font-weight:700}.twork .m{color:#059669;font-size:10px}
+.tgap{display:inline-flex;flex-direction:column;cursor:pointer;background:#fff7ed;border:1px dashed #fdba74;color:#9a3412;border-radius:8px;padding:4px 10px;font-size:11.5px;line-height:1.3;transition:all .12s}
+.tgap:hover{background:#ffedd5;border-color:#fb923c}
+.tgap.brk{background:#fef2f2;border-color:#fecaca;color:#991b1b}.tgap.brk:hover{background:#fee2e2}
+.tgap b{font-weight:700}.tgap .m{font-size:10px;opacity:.85}.tgap .fill{font-size:9.5px;text-transform:uppercase;letter-spacing:.03em;font-weight:700;opacity:.7}
+.tarrow{color:var(--muted);font-size:11px}
+.grp th{border-bottom:none;padding:0 8px 3px}
+.gh{text-align:center;font-size:10px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;padding:4px 6px;border-radius:6px}
+.gt{color:#334155;background:#eef2f7}
+.gf{color:#1e40af;background:#eaf1ff}
+.gr{color:#6d28d9;background:#f3eeff}
+th.gsep,td.gsep{width:16px;min-width:16px;max-width:16px;padding:0;border-bottom:none;background:transparent}
+tr:hover td.gsep{background:transparent}
 .wchip{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10.5px;font-weight:600;margin:2px 4px 2px 0;white-space:nowrap;cursor:default}
 .wchip.r{background:#fef2f2;color:#b91c1c}
 .wchip.a{background:#fffbeb;color:#b45309}
@@ -633,7 +731,7 @@ td.mix{white-space:nowrap;font-size:12px}
   </div>
   <div class=card style=margin-top:16px>
     <h2>Per-person detail</h2>
-    <div class=sub style=margin:0>Pick, pack &amp; engrave are combined into one <b>Fulfillment</b> figure (breakdown shown beneath each number). <b>Restocked</b> is separate. Click any column header to sort.</div>
+    <div class=sub style=margin:0>Three groups, left to right: <b>On the clock</b> (days &amp; hours worked, so you can see whether someone's ahead just because they put in more time), <b>Fulfillment</b> (pick + pack + engrave, one figure), and <b>Restocking</b> (separate). Click any column header to sort. <b>Worked</b> = active hours (breaks removed); <b>Since 1st</b> = clock time from first to last scan.</div>
     <div id=detail></div>
   </div>
 </div>
@@ -641,22 +739,28 @@ td.mix{white-space:nowrap;font-size:12px}
 <div id=floor class=hide>
   <div class=card>
     <h2>Floor Time <span style="color:#9ca3af;font-weight:400">&mdash; the effectiveness auditor: hours &amp; output, by day</span></h2>
-    <div class=sub style=margin:0><b>Active hours</b> = from a person&rsquo;s first scan of the day to their last, minus any gap of 45+ minutes (a break). <b>Utilization</b> = active ÷ time-on-floor. <b>Items/hr</b> is the units-per-labor-hour (UPLH) benchmark. All floor work (pick + pack + engrave + restock), Eastern time.</div>
+    <div class=sub style=margin:0>Two different clocks, side by side. <b>First in &rarr; Last out</b> and <b>Span/day</b> = the raw window between their earliest and latest scan &mdash; a rough &ldquo;when were they on the floor.&rdquo; <b>Hours</b> = <b>active</b> hours inside that window, i.e. span with every 45-min+ break removed &mdash; the effort that actually happened. Gap between the two = breaks / off-scanner time. <b>Util</b> = active &divide; span; <b>Items/hr</b> = units per active hour (UPLH). All floor work (pick + pack + engrave + restock), Eastern time.</div>
     <div id=floortable></div>
-    <details class=nbox style=margin-top:14px>
-      <summary>&#43; Log special-project / off-scanner time <span class=s>(returns, entryway cleanup, meetings &mdash; work that doesn&rsquo;t scan)</span></summary>
-      <div class=nrow>
-        <input id=n_person list=roster placeholder="Person" class=nin autocomplete=off>
-        <input id=n_date type=date class=nin>
-        <input id=n_hours type=number step=0.5 min=0 max=24 placeholder="Hours" class="nin nhrs">
-        <input id=n_note placeholder="What were they doing?" class="nin nnote">
-        <button class=pill onclick="addNote()">Add</button><span id=n_status class=sub></span>
+    <div class=logcard>
+      <div class=logtitle>Log off-scanner time <span class=s>&mdash; returns, cleanup, meetings, training: real work that doesn&rsquo;t hit a scanner</span></div>
+      <div class=logrow>
+        <div class=lf><label>Person</label>
+          <select id=n_person onchange="onPersonPick()"><option value="">Select&hellip;</option></select>
+          <input id=n_person_custom class=nin placeholder="New name&hellip;" style="display:none" oninput="loadPersonDay()">
+        </div>
+        <div class=lf><label>Date</label><input id=n_date type=date class=nin onchange="onPersonPick()"></div>
+        <div class=lf><label>From</label><input id=n_start type=time class=nin onchange="calcHrs()"></div>
+        <div class=lf><label>To</label><input id=n_end type=time class=nin onchange="calcHrs()"></div>
+        <div class="lf lfh"><label>Hours</label><input id=n_hours type=number step=0.25 min=0 max=24 class="nin nhrs" placeholder="auto"></div>
+        <div class="lf lgrow"><label>What were they doing?</label><input id=n_note class=nin placeholder="e.g. processed returns, floor reset"></div>
+        <button class="pill add" onclick="addNote()">Add</button>
       </div>
+      <div id=n_status class=nstat></div>
+      <div id=n_sched class=sched></div>
       <div id=n_list></div>
-    </details>
+    </div>
   </div>
 </div>
-<datalist id=roster></datalist>
 
 <div id=engt class=hide>
   <div class=card>
@@ -715,7 +819,9 @@ function preset(p){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.
 async function getj(u){for(let i=0;i<8;i++){try{const r=await fetch(u);if(r.ok)return await r.json();}catch(e){}
   document.getElementById('status').textContent='waking server ('+(i+1)+')…';await new Promise(s=>setTimeout(s,4000));}throw 0;}
 async function load(){document.getElementById('status').textContent='loading…';
-  try{DATA=await getj('/warehouse?from='+document.getElementById('from').value+'&to='+document.getElementById('to').value);
+  const f=document.getElementById('from').value,t=document.getElementById('to').value;
+  try{DATA=await getj('/warehouse?from='+f+'&to='+t);
+  try{FLOOR=await getj('/floor?from='+f+'&to='+t);floorKey=f+'|'+t;}catch(e){FLOOR=null;}  // hours/days for the detail table
   document.getElementById('status').textContent='';render();
   if(!document.getElementById('speed').classList.contains('hide')){speedKey=null;loadSpeed();}
   if(!document.getElementById('watch').classList.contains('hide')){watchKey=null;loadWatch();}
@@ -815,44 +921,75 @@ function drawChart(ppl,v){
     plugins:[stackTotals]});
 }
 function drawDetail(ppl,unit,v){
-  // Simplified layout: pick + pack + engrave collapse into ONE Fulfillment figure (items AND orders),
-  // shown right next to the name; restocking is its own separate column. Every header is click-to-sort.
+  // Three visually separated groups: ON THE CLOCK (days + hours, merged from /floor so you can tell
+  // whether someone leads because they worked more time), FULFILLMENT (pick+pack+engrave, items+orders),
+  // and RESTOCKING (separate). Every header is click-to-sort.
+  const det=DET();
   const teamItems=ppl.reduce((a,p)=>a+fulItems(p,v),0)||1;
   const teamRestock=ppl.reduce((a,p)=>a+(v.repl?p.replenished:0),0)||1;
-  const arr=ppl.map(p=>({person:p.person, type:p.type,
+  const fmap={}; if(FLOOR&&FLOOR.people)FLOOR.people.forEach(p=>fmap[p.person]=p);
+  const wd=(FLOOR&&FLOOR.work_days)||0;
+  const arr=ppl.map(p=>{const fl=fmap[p.person]||{};return {person:p.person, type:p.type,
     items:fulItems(p,v), orders:fulOrders(p,v), restock:(v.repl?p.replenished:0),
     _pick:(v.pick?p.items_picked_sh:0),
     _pack:(v.packsh?p.items_packed_sh:0)+(v.packshop?p.items_packed_shop:0),
-    _eng:(v.eng?p.engraved_items:0)}));
+    _eng:(v.eng?p.engraved_items:0),
+    worked_h:(fl.hours||0), span_h:(fl.span_h||0),
+    active_days:(fl.active_days!=null?fl.active_days:(p.active_days||0))};});
   arr.forEach(p=>{p.share=Math.round(p.items/teamItems*100); p.rshare=Math.round(p.restock/teamRestock*100);});
-  const det=DET();
   const K={items_total:'items',orders_total:'orders',replenished:'restock',share:'share',rshare:'rshare'}[sortKey]||sortKey;
   arr.sort((a,b)=>{const x=a[K],y=b[K];return (x>y?1:(x<y?-1:0))*sortDir;});
   const arw=k=>sortKey===k?'<span class=arw>'+(sortDir<0?'▼':'▲')+'</span>':'';
   const th=(k,lab,sub)=>'<th class="srt'+(sortKey===k?' act':'')+'" onclick="sortBy(\''+k+'\')">'+lab+(sub?' <span class=s>'+sub+'</span>':'')+arw(k)+'</th>';
-  let h='<table><tr>'+
-    th('person','Person','')+
+  const nful=det?6:3;   // items,[pick,pack,eng],share,orders
+  // group-title header row
+  let h='<table><tr class=grp>'+
+    '<th></th><th></th>'+
+    '<th colspan=3 class="gh gt">On the clock</th>'+
+    '<th class=gsep></th>'+
+    '<th colspan='+nful+' class="gh gf">Fulfillment</th>'+
+    '<th class=gsep></th>'+
+    '<th colspan=2 class="gh gr">Restocking</th>'+
+    '</tr>';
+  // column header row
+  h+='<tr>'+th('person','Person','')+
     '<th class=srt onclick="sortBy(\'type\')">Type'+arw('type')+'</th>'+
-    th('items_total','Fulfillment items','pick + pack + engrave')+
+    th('active_days','Days',(wd?'of '+wd:'active'))+
+    th('worked_h','Worked','h active')+
+    th('span_h','Since 1st','h span')+
+    '<th class=gsep></th>'+
+    th('items_total','Items','pick+pack+engrave')+
     (det? th('_pick','Picked','ShipHero')+th('_pack','Packed','SH + Shopify')+th('_eng','Engraved','logger') : '')+
     th('share','Share','of team')+
-    th('orders_total','Fulfillment orders','')+
-    th('replenished','Restocked','separate')+
+    th('orders_total','Orders','fulfillment')+
+    '<th class=gsep></th>'+
+    th('replenished','Units','')+
     th('rshare','Share','of team')+
     '</tr>';
-  const T={items:0,orders:0,restock:0,_pick:0,_pack:0,_eng:0};
+  const T={items:0,orders:0,restock:0,_pick:0,_pack:0,_eng:0,worked:0,span:0};
   arr.forEach(p=>{
+    const dstr=p.active_days?(p.active_days+(wd?' / '+wd:'')):'&mdash;';
     h+='<tr><td class=name>'+p.person+'</td><td>'+badge(p.type)+'</td>'+
+      '<td>'+dstr+'</td>'+
+      '<td><b>'+(p.worked_h?p.worked_h.toFixed(1):'&mdash;')+'</b></td>'+
+      '<td class=sub2>'+(p.span_h?p.span_h.toFixed(1):'&mdash;')+'</td>'+
+      '<td class=gsep></td>'+
       '<td class=fi><b>'+fmt(p.items)+'</b></td>'+
       (det? '<td>'+fmt(p._pick)+'</td><td>'+fmt(p._pack)+'</td><td class=eng>'+fmt(p._eng)+'</td>' : '')+
       '<td class=shr>'+p.share+'%</td>'+
       '<td>'+fmt(p.orders)+'</td>'+
+      '<td class=gsep></td>'+
       '<td class=p><b>'+fmt(p.restock)+'</b></td>'+
       '<td class=shr>'+(p.restock?p.rshare+'%':'&mdash;')+'</td></tr>';
-    T.items+=p.items;T.orders+=p.orders;T.restock+=p.restock;T._pick+=p._pick;T._pack+=p._pack;T._eng+=p._eng;});
-  h+='<tr class=tot><td>Total</td><td></td><td><b>'+fmt(T.items)+'</b></td>'+
+    T.items+=p.items;T.orders+=p.orders;T.restock+=p.restock;T._pick+=p._pick;T._pack+=p._pack;T._eng+=p._eng;T.worked+=p.worked_h;T.span+=p.span_h;});
+  h+='<tr class=tot><td>Total</td><td></td>'+
+    '<td></td><td><b>'+(T.worked?T.worked.toFixed(0):'')+'</b></td><td class=sub2>'+(T.span?T.span.toFixed(0):'')+'</td>'+
+    '<td class=gsep></td>'+
+    '<td><b>'+fmt(T.items)+'</b></td>'+
     (det? '<td>'+fmt(T._pick)+'</td><td>'+fmt(T._pack)+'</td><td>'+fmt(T._eng)+'</td>' : '')+
-    '<td>100%</td><td>'+fmt(T.orders)+'</td><td class=p><b>'+fmt(T.restock)+'</b></td><td>100%</td></tr>';
+    '<td>100%</td><td>'+fmt(T.orders)+'</td>'+
+    '<td class=gsep></td>'+
+    '<td class=p><b>'+fmt(T.restock)+'</b></td><td>100%</td></tr>';
   h+='</table>';
   document.getElementById('detail').innerHTML='<div class=tablewrap>'+h+'</div>';
 }
@@ -900,25 +1037,57 @@ function renderFloor(){if(!FLOOR)return;
   h+='</table>';
   const note='<div class=sub style=margin-top:8px>Sorted by '+floorSort.replace(/_/g,' ')+'. <b>First in / Last out</b> = earliest &amp; latest scan; <b>Span/day</b> = typical first→last window (Hours removes 45-min+ breaks from it). <b>Proj h</b> = off-scanner project time you&rsquo;ve logged below (hover for detail). '+(showDays?'Day cell = <b>hours</b> over <b>items</b>.':'Switch <b>Detail → Detailed</b> for the day-by-day grid.')+'</div>';
   document.getElementById('floortable').innerHTML='<div class=tablewrap>'+h+'</div>'+note;
-  // roster + existing-notes list for the annotation panel
-  if(DATA){const dl=document.getElementById('roster');if(dl)dl.innerHTML=DATA.people.map(p=>'<option value="'+p.person+'">').join('');}
+  // roster dropdown + existing-notes list for the annotation panel
+  fillRoster();
   const allNotes=[];FLOOR.people.forEach(p=>(p.notes||[]).forEach(n=>allNotes.push(Object.assign({person:p.person},n))));
   allNotes.sort((a,b)=>a.d<b.d?1:-1);
   const nl=document.getElementById('n_list');
-  if(nl)nl.innerHTML=allNotes.length?('<div style=margin-top:6px>'+allNotes.map(n=>'<span class=notechip><b>'+n.person+'</b> '+n.d+(n.hours?' · '+n.hours+'h':'')+(n.note?' · '+n.note:'')+' <span class=x title="delete" onclick="delNote('+n.id+')">✕</span></span>').join('')+'</div>'):'';}
+  if(nl)nl.innerHTML=allNotes.length?('<div class=schead style=margin-top:12px><b>Logged off-scanner time</b> in this range</div><div>'+allNotes.map(n=>'<span class=notechip><b>'+n.person+'</b> '+n.d+(n.hours?' · '+n.hours+'h':'')+(n.note?' · '+n.note:'')+' <span class=x title="delete" onclick="delNote('+n.id+')">✕</span></span>').join('')+'</div>'):'';}
+
+function nRoster(){const s=new Set();if(DATA&&DATA.people)DATA.people.forEach(p=>s.add(p.person));if(FLOOR&&FLOOR.people)FLOOR.people.forEach(p=>s.add(p.person));return [...s].sort((a,b)=>a.localeCompare(b));}
+function fillRoster(){const sel=document.getElementById('n_person');if(!sel)return;const cur=sel.value;
+  const opts=nRoster().map(n=>'<option value="'+n.replace(/"/g,'&quot;')+'">'+n+'</option>').join('');
+  sel.innerHTML='<option value="">Select&hellip;</option>'+opts+'<option value="__new__">&#43; New person&hellip;</option>';
+  if(cur)sel.value=cur;
+  const d=document.getElementById('n_date');if(d&&!d.value)d.value=document.getElementById('to').value||etToday();}
+function curPerson(){const sel=document.getElementById('n_person');if(sel&&sel.value==='__new__')return document.getElementById('n_person_custom').value.trim();return sel?sel.value:'';}
+function onPersonPick(){const sel=document.getElementById('n_person'),cust=document.getElementById('n_person_custom');
+  if(sel&&sel.value==='__new__'){cust.style.display='';cust.focus();}else if(cust){cust.style.display='none';}
+  loadPersonDay();}
+function calcHrs(){const s=document.getElementById('n_start').value,e=document.getElementById('n_end').value,h=document.getElementById('n_hours');
+  if(s&&e){const a=s.split(':').map(Number),b=e.split(':').map(Number),m=(b[0]*60+b[1])-(a[0]*60+a[1]);h.value=m>0?(m/60).toFixed(2):'';}}
+function fmtDur(m){if(m>=60){const h=Math.floor(m/60),r=m%60;return h+'h'+(r?' '+r+'m':'');}return m+'m';}
+function gapFill(s,e){document.getElementById('n_start').value=s;document.getElementById('n_end').value=e;calcHrs();document.getElementById('n_note').focus();}
+async function loadPersonDay(){const person=curPerson(),date=document.getElementById('n_date').value,box=document.getElementById('n_sched');
+  if(!box)return;
+  if(!person||person==='__new__'||!date){box.innerHTML='';return;}
+  box.innerHTML='<div class=schead>loading schedule&hellip;</div>';
+  try{const j=await getj('/person_day?person='+encodeURIComponent(person)+'&d='+date);
+    if(!j.ok||!j.scans){box.innerHTML='<div class=schead>No scans for <b>'+person+'</b> on '+date+' &mdash; log the full off-scanner block below.</div>';return;}
+    let h='<div class=schead><b>'+person+'</b> &middot; '+date+' &mdash; on floor <b>'+j.first+' &ndash; '+j.last+'</b>, active <b>'+j.active_h.toFixed(1)+'h</b> of a <b>'+j.span_h.toFixed(1)+'h</b> span. Tap a gap to fill it in.</div><div class=tline>';
+    j.timeline.forEach((t,i)=>{
+      if(i)h+='<span class=tarrow>&rsaquo;</span>';
+      if(t.kind==='work')h+='<span class=twork><b>'+t.start_l+'&ndash;'+t.end_l+'</b><span class=m>worked '+fmtDur(t.mins)+'</span></span>';
+      else h+='<span class="tgap'+(t.brk?' brk':'')+'" onclick="gapFill(\''+t.start+'\',\''+t.end+'\')"><b>'+t.start_l+'&ndash;'+t.end_l+'</b><span class=m>'+(t.brk?'break':'gap')+' '+fmtDur(t.mins)+'</span><span class=fill>&#43; log</span></span>';});
+    h+='</div>';box.innerHTML=h;
+  }catch(e){box.innerHTML='<div class=schead>could not load schedule</div>';}}
 
 async function addNote(){
-  const person=document.getElementById('n_person').value.trim();
+  const person=curPerson();
   const date=document.getElementById('n_date').value||document.getElementById('to').value;
+  const start=document.getElementById('n_start').value,end=document.getElementById('n_end').value;
   const hours=document.getElementById('n_hours').value, note=document.getElementById('n_note').value.trim();
-  const st=document.getElementById('n_status');
-  if(!person||(!hours&&!note)){st.textContent=' need a person + hours or a note';return;}
-  st.textContent=' saving…';
-  try{const r=await fetch('/note',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({person,date,hours,note})});
+  const st=document.getElementById('n_status');st.className='nstat';
+  if(!person){st.textContent='Pick a person first.';st.className='nstat err';return;}
+  if(!hours&&!(start&&end)&&!note){st.textContent='Add a time window, hours, or a note.';st.className='nstat err';return;}
+  st.textContent='saving…';
+  try{const r=await fetch('/note',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({person,date,start,end,hours,note})});
     const j=await r.json();
-    if(j.ok){st.textContent=' added ✓';document.getElementById('n_hours').value='';document.getElementById('n_note').value='';FLOOR=null;floorKey=null;loadFloor();}
-    else st.textContent=' '+(j.error||'error');
-  }catch(e){st.textContent=' could not save';}}
+    if(j.ok){st.textContent='Added ✓';st.className='nstat ok';
+      ['n_hours','n_note','n_start','n_end'].forEach(id=>document.getElementById(id).value='');
+      FLOOR=null;floorKey=null;loadFloor();}
+    else{st.textContent=j.error||'error';st.className='nstat err';}
+  }catch(e){st.textContent='could not save';st.className='nstat err';}}
 async function delNote(id){try{await fetch('/note/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});FLOOR=null;floorKey=null;loadFloor();}catch(e){}}
 async function loadEngraving(){const f=document.getElementById('from').value,t=document.getElementById('to').value,k=f+'|'+t;
   if(ENGR&&engKey===k){renderEngraving();return;}
