@@ -650,7 +650,7 @@ input[type=date]:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 
 .stat .k{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
 .stat .k .s{font-weight:600;font-size:10.5px;margin-left:5px;text-transform:none;letter-spacing:0}
 .stat .v{font-size:27px;font-weight:700;margin-top:7px;letter-spacing:-.02em}
-.s-sh{color:var(--accent)}.s-shop{color:var(--amber)}.s-repl{color:var(--violet)}.s-sel{color:var(--ink)}.s-eng{color:var(--teal)}
+.s-sh{color:var(--accent)}.s-pksh{color:#16a34a}.s-shop{color:var(--amber)}.s-repl{color:var(--violet)}.s-sel{color:var(--ink)}.s-eng{color:var(--teal)}
 .note{color:var(--ink-2);font-size:12.5px;margin:14px 0;line-height:1.55}
 h2{font-size:15px;font-weight:700;margin:0 0 4px;letter-spacing:-.01em}
 .chartwrap{height:360px;margin-top:12px}
@@ -834,7 +834,7 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
   <input type=date id=from> <span style=color:#9ca3af>to</span> <input type=date id=to>
   <button class=pill onclick="load()">Apply</button><span id=status></span>
 </div>
-<div class=ctl>
+<div class=ctl id=ctl1>
   <span class=lbl>Unit</span><span class=seg id=unit><button class=on data-v=both>Both</button><button data-v=items>Items</button><button data-v=orders>Orders</button></span>
   <span class=lbl style=margin-left:14px>Stage</span><span class=seg id=stage><button class=on data-v=all>All</button><button data-v=pick>Picked</button><button data-v=pack>Packed</button><button data-v=engrave>Engraved</button><button data-v=repl>Replenished</button></span>
   <span class=lbl style=margin-left:14px>Source</span><span class=seg id=source><button class=on data-v=both>Both</button><button data-v=shiphero>ShipHero</button><button data-v=shopify>Shopify</button></span>
@@ -843,8 +843,8 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
   <button class=pill onclick="dl('csv')">CSV</button>
   <button class=pill onclick="dl('json')">JSON</button>
 </div>
-<div class=ctl>
-  <span class=seg id=team class="seg gray"><button class=on data-v=all>Everyone</button><button data-v=FT>Full-timers</button><button data-v=Intern>Interns</button></span>
+<div class=ctl id=ctl2>
+  <span class="seg gray" id=team><button class=on data-v=all>Everyone</button><button data-v=FT>Full-timers</button><button data-v=Intern>Interns</button></span>
   <span class=lbl style=margin-left:14px>Detail</span><span class=seg id=view><button class=on data-v=simple>Simple</button><button data-v=detailed>Detailed</button></span>
 </div>
 <div class=note id=summary></div>
@@ -980,6 +980,12 @@ function seg(id,v){document.querySelectorAll('#'+id+' button').forEach(b=>b.clas
 document.querySelectorAll('.seg').forEach(s=>s.addEventListener('click',e=>{if(e.target.dataset.v){seg(s.id,e.target.dataset.v);}}));
 function tab(t){['dash','floor','log','plan','trend','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
   document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('on',el.dataset.tab===t));
+  // Only show the controls a tab actually uses (Unit/Stage/Source + exports = Dashboard only;
+  // Team/Detail = Dashboard/Floor/Engraving/Analytics), so no toggle is ever an inert no-op.
+  var showU=(t==='dash'), showTV=(['dash','floor','engt','an'].indexOf(t)>=0);
+  var c1=document.getElementById('ctl1');if(c1)c1.style.display=showU?'':'none';
+  var c2=document.getElementById('ctl2');if(c2)c2.style.display=showTV?'':'none';
+  var sm=document.getElementById('summary');if(sm)sm.style.display=showU?'':'none';
   if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();if(t==='plan')loadPlanner();if(t==='log')loadLog();if(t==='trend')loadTrend();}
 function preset(p){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.toggle('on',b.dataset.preset===p));
   let f=etToday(),t=etToday();
@@ -1026,13 +1032,13 @@ function render(){if(!DATA)return;
   const si=document.getElementById('statsItems'), so=document.getElementById('statsOrders');
   si.innerHTML=!showItems?'':[
     card('Items picked','ShipHero','s-sh',v.pick?T.pk_i:0),
-    card('Items packed','ShipHero','s-sh',v.packsh?T.packsh_i:0),
+    card('Items packed','ShipHero','s-pksh',v.packsh?T.packsh_i:0),
     card('Items packed','Shopify','s-shop',v.packshop?T.packshop_i:0),
     card('Items engraved','logger','s-eng',v.eng?T.eng_i:0),
     card('Items — total','fulfillment','s-sel',itemsSel)].join('');
   so.innerHTML=!showOrders?'':[
     card('Orders picked','ShipHero','s-sh',v.pick?T.pk_o:0),
-    card('Orders packed','ShipHero','s-sh',v.packsh?T.packsh_o:0),
+    card('Orders packed','ShipHero','s-pksh',v.packsh?T.packsh_o:0),
     card('Orders packed','Shopify','s-shop',v.packshop?T.packshop_o:0),
     card('Replenished','units·separate','s-repl',v.repl?T.repl:0),
     card('Orders — total','fulfillment','s-sel',ordersSel)].join('');
@@ -1342,7 +1348,7 @@ function planAllHours(){var def=num('pl_defhrs',10)||10;PLAN.people.forEach(func
 // Auto-assign finds the pick/pack split that maximizes orders (min of the two stage capacities) — the true
 // optimum by comparative advantage, not an average. Exact search when the crew is small; greedy if huge.
 function planRecommend(silent){if(!PLAN)return;
-  var ipoP=PLAN.ipo.pick||0.001, ipoK=PLAN.ipo.pack||0.001;
+  var ipoP=PLAN.ipo.pick>0.2?PLAN.ipo.pick:3.5, ipoK=PLAN.ipo.pack>0.2?PLAN.ipo.pack:3.5;
   var R=[];PLAN.people.forEach(function(p,i){if(p.inn){p.assign='Other';R.push(i);}});
   if(R.length){
     if(R.length<=18){var nC=1<<R.length, best=null;
@@ -1362,7 +1368,7 @@ function planCompute(){if(!PLAN)return;
     if(p.inn){var a=p.assign, rate=(a==='Pick'?p.pick:a==='Pack'?p.pack:a==='Engrave'?p.eng:0);
       out=Math.round(rate*p.hours); if(cap[a]!=null)cap[a]+=out; if(hrs[a]!=null)hrs[a]+=p.hours; nA[a]=(nA[a]||0)+1;}
     set('plout_'+i, p.inn?(out?fmt(out)+' items':'<span class=dmt>—</span>'):'<span class=dmt>out</span>');});
-  var ipoP=PLAN.ipo.pick||0.001, ipoK=PLAN.ipo.pack||0.001, ipoE=PLAN.ipo.engrave||0;
+  var ipoP=PLAN.ipo.pick>0.2?PLAN.ipo.pick:3.5, ipoK=PLAN.ipo.pack>0.2?PLAN.ipo.pack:3.5, ipoE=PLAN.ipo.engrave||0;
   var oPick=cap.Pick/ipoP, oPack=cap.Pack/ipoK, orders=Math.floor(Math.min(oPick,oPack));
   var bneck=oPick<=oPack?'Pick':'Pack';
   var engNeed=Math.round(orders*ipoE), engHave=Math.round(cap.Engrave), engOK=(engHave>=engNeed)||engNeed===0;
