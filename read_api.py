@@ -388,7 +388,8 @@ th.act{color:var(--ink)}
 td.fi{line-height:1.25}
 td.fi>b{font-size:14px}
 td.fi .brk{font-size:10px;color:var(--muted);font-weight:400;margin-top:3px;letter-spacing:.2px}
-td.shr{color:var(--ink-2);font-weight:600}
+td.fi .brk .shr{color:var(--ink-2);font-weight:700}
+td.p.fi>b{color:var(--violet)}
 .wchip{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10.5px;font-weight:600;margin:2px 4px 2px 0;white-space:nowrap;cursor:default}
 .wchip.r{background:#fef2f2;color:#b91c1c}
 .wchip.a{background:#fffbeb;color:#b45309}
@@ -601,37 +602,40 @@ function drawDetail(ppl,unit,v){
   // Simplified layout: pick + pack + engrave collapse into ONE Fulfillment figure (items AND orders),
   // shown right next to the name; restocking is its own separate column. Every header is click-to-sort.
   const teamItems=ppl.reduce((a,p)=>a+fulItems(p,v),0)||1;
+  const teamRestock=ppl.reduce((a,p)=>a+(v.repl?p.replenished:0),0)||1;
   const arr=ppl.map(p=>({person:p.person, type:p.type,
     items:fulItems(p,v), orders:fulOrders(p,v), restock:(v.repl?p.replenished:0),
     _pick:(v.pick?p.items_picked_sh:0),
     _pack:(v.packsh?p.items_packed_sh:0)+(v.packshop?p.items_packed_shop:0),
     _eng:(v.eng?p.engraved_items:0)}));
-  arr.forEach(p=>p.share=Math.round(p.items/teamItems*100));
+  arr.forEach(p=>{p.share=Math.round(p.items/teamItems*100); p.rshare=Math.round(p.restock/teamRestock*100);});
   // map legacy sort keys onto the collapsed columns
-  const K={items_total:'items',orders_total:'orders',replenished:'restock'}[sortKey]||sortKey;
+  const K={items_total:'items',orders_total:'orders',replenished:'restock',share:'share'}[sortKey]||sortKey;
   arr.sort((a,b)=>{const x=a[K],y=b[K];return (x>y?1:(x<y?-1:0))*sortDir;});
   const arw=k=>sortKey===k?'<span class=arw>'+(sortDir<0?'▼':'▲')+'</span>':'';
   const th=(k,lab,sub)=>'<th class="srt'+(sortKey===k?' act':'')+'" onclick="sortBy(\''+k+'\')">'+lab+(sub?' <span class=s>'+sub+'</span>':'')+arw(k)+'</th>';
   let h='<table><tr>'+
     th('person','Person','')+
     '<th class=srt onclick="sortBy(\'type\')">Type'+arw('type')+'</th>'+
-    th('items_total','Fulfillment items','pick + pack + engrave')+
+    th('items_total','Fulfillment items','pick + pack + engrave · % of team')+
     th('orders_total','Fulfillment orders','')+
-    th('replenished','Restocked','separate track')+
-    th('share','Share','of team')+
+    th('replenished','Restocked','separate track · % of team')+
     '</tr>';
   const T={items:0,orders:0,restock:0};
   arr.forEach(p=>{
     const parts=[]; if(p._pick)parts.push('Pick '+fmt(p._pick)); if(p._pack)parts.push('Pack '+fmt(p._pack)); if(p._eng)parts.push('Engrave '+fmt(p._eng));
-    const brk=parts.length?'<div class=brk>'+parts.join(' &middot; ')+'</div>':'';
+    const fbrk='<div class=brk><b class=shr>'+p.share+'%</b> of team'+(parts.length?' &middot; '+parts.join(' &middot; '):'')+'</div>';
+    const rbrk='<div class=brk>'+(p.restock?'<b class=shr>'+p.rshare+'%</b> of team':'&mdash;')+'</div>';
     h+='<tr><td class=name>'+p.person+'</td>'+
       '<td><span class="badge '+(p.type==='Intern'?'in':'ft')+'">'+(p.type==='Intern'?'Intern':(p.type?'Full-timer':'—'))+'</span></td>'+
-      '<td class=fi><b>'+fmt(p.items)+'</b>'+brk+'</td>'+
+      '<td class=fi><b>'+fmt(p.items)+'</b>'+fbrk+'</td>'+
       '<td>'+fmt(p.orders)+'</td>'+
-      '<td class=p>'+fmt(p.restock)+'</td>'+
-      '<td class=shr>'+p.share+'%</td></tr>';
+      '<td class="p fi"><b>'+fmt(p.restock)+'</b>'+rbrk+'</td></tr>';
     T.items+=p.items;T.orders+=p.orders;T.restock+=p.restock;});
-  h+='<tr class=tot><td>Total</td><td></td><td><b>'+fmt(T.items)+'</b></td><td>'+fmt(T.orders)+'</td><td class=p>'+fmt(T.restock)+'</td><td>100%</td></tr>';
+  h+='<tr class=tot><td>Total</td><td></td>'+
+    '<td class=fi><b>'+fmt(T.items)+'</b><div class=brk>100% of team</div></td>'+
+    '<td>'+fmt(T.orders)+'</td>'+
+    '<td class="p fi"><b>'+fmt(T.restock)+'</b><div class=brk>100% of team</div></td></tr>';
   h+='</table>';
   document.getElementById('detail').innerHTML='<div class=tablewrap>'+h+'</div>';
 }
