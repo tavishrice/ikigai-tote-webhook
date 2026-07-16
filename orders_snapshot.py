@@ -63,22 +63,23 @@ DDL = """CREATE TABLE IF NOT EXISTS open_order(
   snapshot_at        timestamptz DEFAULT now())"""
 
 # ShipHero `orders` connection, cursor-paginated. fulfillment_status='pending' = the
-# open backlog (not fulfilled, not canceled). Order-level fields only + a lightweight
-# line-item roll-up for "items still to pick"; holds tell us what can't ship yet.
+# open backlog (not fulfilled, not canceled). ShipHero charges query "credits" by
+# complexity and caps each operation at ~4004 credits; a nested line_items connection
+# blows past that (needs 10101), so we deliberately DON'T pull line items and keep the
+# page at 50. Order-level fields + holds (a cheap flat object) stay well under budget.
 Q = """query($fs:String,$after:String){
   orders(fulfillment_status:$fs){
-    data(first:100, after:$after){
+    data(first:50, after:$after){
       edges{ node{
         order_number order_date fulfillment_status total_price shop_name required_ship_date
         holds{ address_hold operator_hold fraud_hold payment_hold client_hold }
-        line_items(first:100){ edges{ node{ quantity quantity_pending_fulfillment } } }
       } }
       pageInfo{ hasNextPage endCursor } } } }"""
 
-# Fallback query if `holds`/`line_items` sub-selections aren't valid on this account.
+# Fallback query if `holds` sub-selection isn't valid on this account (order-level only).
 Q_MIN = """query($fs:String,$after:String){
   orders(fulfillment_status:$fs){
-    data(first:100, after:$after){
+    data(first:50, after:$after){
       edges{ node{ order_number order_date fulfillment_status total_price shop_name required_ship_date } }
       pageInfo{ hasNextPage endCursor } } } }"""
 
@@ -93,15 +94,25 @@ def _pages(token, fs, query):
         else:
             break
 
+def _probe_ok(token, query):
+    """A query is usable only if ShipHero returns a non-null `orders` (it returns
+    data={orders:null} alongside an errors[] for bad sub-fields or credit overruns)."""
+    try:
+        r = gql(query, token, {"fs": "pending", "after": None})
+        return (r.get("data") or {}).get("orders") is not None
+    except RuntimeError as e:
+        print("[orders_snapshot] probe error:", str(e)[:160], flush=True)
+        return False
+
 def _rows(token):
     """Try the rich query; fall back to the minimal one if the schema rejects sub-fields."""
-    try:
+    if _probe_ok(token, Q):
         query = Q
-        # probe one page to validate the rich schema before committing to it
-        gql(Q, token, {"fs": "pending", "after": None})
-    except RuntimeError as e:
-        print("[orders_snapshot] rich query rejected, using minimal:", str(e)[:160], flush=True)
+    elif _probe_ok(token, Q_MIN):
+        print("[orders_snapshot] rich query rejected, using minimal", flush=True)
         query = Q_MIN
+    else:
+        raise RuntimeError("ShipHero orders query returned null for both Q and Q_MIN")
     out = []
     for n in _pages(token, "pending", query):
         h = n.get("holds") or {}
