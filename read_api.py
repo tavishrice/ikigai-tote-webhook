@@ -58,6 +58,7 @@ def warehouse():
           count(DISTINCT order_number) FILTER (WHERE stage='pack' AND source='shopify')           packshop_orders,
           COALESCE(sum(quantity) FILTER (WHERE stage='replenish'),0)                              repl_units,
           COALESCE(sum(quantity) FILTER (WHERE stage='engrave'),0)                                 eng_items,
+          count(DISTINCT order_number) FILTER (WHERE stage='engrave')                             eng_orders,
           count(*) FILTER (WHERE stage='pick')                                pick_cnt,
           count(*) FILTER (WHERE stage='pack' AND source='shiphero')          pack_cnt,
           count(*) FILTER (WHERE stage='pack' AND source='shopify')           fulfill_cnt,
@@ -88,15 +89,15 @@ def warehouse():
         gaps = {r[0]: r for r in cur.fetchall()}
 
     people, floor = [], []
-    tot = dict(pk_i=0,packsh_i=0,packshop_i=0,eng_i=0,pk_o=0,packsh_o=0,packshop_o=0,repl=0)
+    tot = dict(pk_i=0,packsh_i=0,packshop_i=0,eng_i=0,pk_o=0,packsh_o=0,packshop_o=0,eng_o=0,repl=0)
     for r in rows:
-        (person,pk_i,pk_o,psh_i,psh_o,psp_i,psp_o,repl,eng_i,pick_c,pack_c,ful_c,mov_c,cnt_c,eng_c,first,last)=r
+        (person,pk_i,pk_o,psh_i,psh_o,psp_i,psp_o,repl,eng_i,eng_o,pick_c,pack_c,ful_c,mov_c,cnt_c,eng_c,first,last)=r
         people.append(dict(person=person, type=PERSON_TYPE.get(person,""),
             items_picked_sh=pk_i, items_packed_sh=psh_i, items_packed_shop=psp_i,
-            engraved_items=eng_i, engraved_totes=eng_c, replenished=repl,
+            engraved_items=eng_i, engraved_totes=eng_c, engraved_orders=eng_o, replenished=repl,
             orders_picked_sh=pk_o, orders_packed_sh=psh_o, orders_packed_shop=psp_o))
         tot["pk_i"]+=pk_i; tot["packsh_i"]+=psh_i; tot["packshop_i"]+=psp_i; tot["eng_i"]+=eng_i
-        tot["pk_o"]+=pk_o; tot["packsh_o"]+=psh_o; tot["packshop_o"]+=psp_o; tot["repl"]+=repl
+        tot["pk_o"]+=pk_o; tot["packsh_o"]+=psh_o; tot["packshop_o"]+=psp_o; tot["eng_o"]+=eng_o; tot["repl"]+=repl
         g = gaps.get(person)
         floor.append(dict(person=person, first_ts=first.isoformat() if first else None,
             last_ts=last.isoformat() if last else None,
@@ -382,6 +383,12 @@ tr.tot td{font-weight:700;color:var(--ink);border-top:1.5px solid var(--line);ba
 .spbar>i{display:block;height:5px;border-radius:4px}
 .best{background:#f0fdf4;outline:1.5px solid #86efac;border-radius:8px}
 .ins{color:var(--muted)}
+th.act{color:var(--ink)}
+.arw{font-size:9px;margin-left:4px;color:var(--accent)}
+td.fi{line-height:1.25}
+td.fi>b{font-size:14px}
+td.fi .brk{font-size:10px;color:var(--muted);font-weight:400;margin-top:3px;letter-spacing:.2px}
+td.shr{color:var(--ink-2);font-weight:600}
 .wchip{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10.5px;font-weight:600;margin:2px 4px 2px 0;white-space:nowrap;cursor:default}
 .wchip.r{background:#fef2f2;color:#b91c1c}
 .wchip.a{background:#fffbeb;color:#b45309}
@@ -426,15 +433,15 @@ tr.tot td{font-weight:700;color:var(--ink);border-top:1.5px solid var(--line);ba
   <div class="card shipped" id=shipped></div>
   <div class=cards id=statsItems></div>
   <div class=cards id=statsOrders style=margin-top:14px></div>
-  <div class=note>Cards + chart + table all follow the Unit / Stage / Source toggles. <b>Fulfillment items total = Picked + Packed + Engraved</b> for the selected filters. Replenishment is a separate track and is never added into that total.</div>
+  <div class=note>Cards and chart follow the Unit / Stage / Source toggles; the table always shows both items and orders. <b>Fulfillment = Picked + Packed + Engraved</b> for the selected filters. Restocking is a separate track, never added into that total.</div>
   <div class=card style=margin-top:8px>
     <h2>Contribution by person</h2>
-    <div class=sub style=margin:0>Left bar = <b>Fulfillment</b> (Picked + Packed + Engraved) &mdash; its height is the total for the selected <b>Unit</b>, sorted most&rarr;least. Right bar = <b>Replenished</b> (separate track, Items view only; Orders has no engraving/replenishment). Click a bar for that person.</div>
+    <div class=sub style=margin:0>Each bar is one person&rsquo;s <b>Fulfillment</b> total (Picked + Packed + Engraved) for the selected <b>Unit</b>, tallest first &mdash; the number above each bar is that total. <b>Restocked</b> is a separate track, drawn as its own bar. Click a bar to focus that person.</div>
     <div class=chartwrap><canvas id=chart></canvas></div>
   </div>
   <div class=card style=margin-top:16px>
     <h2>Per-person detail</h2>
-    <div class=sub style=margin:0>Columns follow the Unit / Stage / Source toggles above. Click a header to sort.</div>
+    <div class=sub style=margin:0>Pick, pack &amp; engrave are combined into one <b>Fulfillment</b> figure (breakdown shown beneath each number). <b>Restocked</b> is separate. Click any column header to sort.</div>
     <div id=detail></div>
   </div>
 </div>
@@ -509,7 +516,7 @@ function vis(){const stage=segval('stage'),src=segval('source');return{
   repl:  (stage==='all'||stage==='repl')    && src!=='shopify'};}
 // visible fulfillment ITEMS total for a person (pick+pack+engrave) — this is the fulfillment bar height
 function fulItems(p,v){return (v.pick?p.items_picked_sh:0)+(v.packsh?p.items_packed_sh:0)+(v.packshop?p.items_packed_shop:0)+(v.eng?p.engraved_items:0);}
-function fulOrders(p,v){return (v.pick?p.orders_picked_sh:0)+(v.packsh?p.orders_packed_sh:0)+(v.packshop?p.orders_packed_shop:0);}
+function fulOrders(p,v){return (v.pick?p.orders_picked_sh:0)+(v.packsh?p.orders_packed_sh:0)+(v.packshop?p.orders_packed_shop:0)+(v.eng?(p.engraved_orders||0):0);}
 function render(){if(!DATA)return;
   const unit=segval('unit'),v=vis();
   const ppl=DATA.people.filter(teamFilter);
@@ -522,7 +529,7 @@ function render(){if(!DATA)return;
   // ---- stat cards (honor toggles) ----
   const showItems=unit!=='orders', showOrders=unit!=='items';
   const itemsSel=(v.pick?T.pk_i:0)+(v.packsh?T.packsh_i:0)+(v.packshop?T.packshop_i:0)+(v.eng?T.eng_i:0);
-  const ordersSel=(v.pick?T.pk_o:0)+(v.packsh?T.packsh_o:0)+(v.packshop?T.packshop_o:0);
+  const ordersSel=(v.pick?T.pk_o:0)+(v.packsh?T.packsh_o:0)+(v.packshop?T.packshop_o:0)+(v.eng?(T.eng_o||0):0);
   const si=document.getElementById('statsItems'), so=document.getElementById('statsOrders');
   si.innerHTML=!showItems?'':[
     card('Items picked','ShipHero','s-sh',v.pick?T.pk_i:0),
@@ -545,75 +552,87 @@ function render(){if(!DATA)return;
 function card(k,s,cls,val){return '<div class="card stat"><div class=k>'+k+' <span class="s '+cls+'">'+s+'</span></div><div class=v>'+fmt(val)+'</div></div>';}
 function drawChart(ppl,v){
   const ord=segval('unit')==='orders';            // chart follows the Items/Orders toggle
-  // per-component value, honoring Stage/Source toggles AND the Items/Orders unit.
-  // Orders has no notion of engraving or replenishment, so those drop out in orders mode.
   const val=(p,c)=>{
     if(ord){ if(c==='pick')return v.pick?p.orders_picked_sh:0;
              if(c==='packsh')return v.packsh?p.orders_packed_sh:0;
-             if(c==='packshop')return v.packshop?p.orders_packed_shop:0; return 0; }
+             if(c==='packshop')return v.packshop?p.orders_packed_shop:0;
+             if(c==='eng')return v.eng?(p.engraved_orders||0):0; return 0; }
     if(c==='pick')return v.pick?p.items_picked_sh:0;
     if(c==='packsh')return v.packsh?p.items_packed_sh:0;
     if(c==='packshop')return v.packshop?p.items_packed_shop:0;
     if(c==='eng')return v.eng?p.engraved_items:0;
     if(c==='repl')return v.repl?p.replenished:0; return 0; };
-  const ftot=p=>val(p,'pick')+val(p,'packsh')+val(p,'packshop')+(ord?0:val(p,'eng'));
+  const ftot=p=>val(p,'pick')+val(p,'packsh')+val(p,'packshop')+val(p,'eng');
   const arr=[...ppl].sort((a,b)=>ftot(b)-ftot(a));  // most -> least, left -> right
   const labels=arr.map(p=>p.person);
+  const ulbl=ord?'orders':'items';
   const ds=[
     {label:'Picked · ShipHero',stack:'ful',backgroundColor:C.pick,data:arr.map(p=>val(p,'pick'))},
     {label:'Packed · ShipHero',stack:'ful',backgroundColor:C.pack,data:arr.map(p=>val(p,'packsh'))},
-    {label:'Packed · Shopify',stack:'ful',backgroundColor:C.fulfill,data:arr.map(p=>val(p,'packshop'))}];
-  if(!ord){
-    ds.push({label:'Engraved',stack:'ful',backgroundColor:C.engrave,data:arr.map(p=>val(p,'eng'))});
-    ds.push({label:'Replenished (separate track)',stack:'repl',backgroundColor:C.repl,data:arr.map(p=>val(p,'repl'))});
-  }
-  const ulbl=ord?'orders':'items';
+    {label:'Packed · Shopify',stack:'ful',backgroundColor:C.fulfill,data:arr.map(p=>val(p,'packshop'))},
+    {label:'Engraved',stack:'ful',backgroundColor:C.engrave,data:arr.map(p=>val(p,'eng'))}];
+  if(!ord) ds.push({label:'Restocked (separate track)',stack:'repl',backgroundColor:C.repl,data:arr.map(p=>val(p,'repl'))});
+  // plugin: print each bar's stack total just above it, so the numbers are readable at a glance
+  const stackTotals={id:'stackTotals',afterDatasetsDraw(ch){
+    const ctx=ch.ctx, groups={};
+    ch.data.datasets.forEach((d,di)=>{(groups[d.stack]=groups[d.stack]||[]).push(di);});
+    ctx.save();ctx.font='700 11px Inter';ctx.textAlign='center';ctx.textBaseline='bottom';
+    ch.data.labels.forEach((_,i)=>{Object.values(groups).forEach(dis=>{
+      let sum=0,topY=1e9,x=null;
+      dis.forEach(di=>{const vv=ch.data.datasets[di].data[i]||0,bar=ch.getDatasetMeta(di).data[i];
+        if(vv>0&&bar){sum+=vv;if(bar.y<topY)topY=bar.y;x=bar.x;}});
+      if(sum>0&&x!=null){ctx.fillStyle='#334155';ctx.fillText(sum.toLocaleString(),x,topY-3);}});});
+    ctx.restore();}};
   if(chart)chart.destroy();
   chart=new Chart(document.getElementById('chart'),{type:'bar',data:{labels,datasets:ds},
-    options:{responsive:true,maintainAspectRatio:false,
-      scales:{x:{stacked:true,grid:{display:false}},y:{stacked:true,beginAtZero:true}},
-      plugins:{legend:{position:'bottom'},tooltip:{callbacks:{footer:(items)=>{
-        let f=0;items.forEach(i=>{if(i.dataset.stack==='ful')f+=i.parsed.y;});return f?'Fulfillment '+ulbl+': '+f:'';}}}}}});
+    options:{responsive:true,maintainAspectRatio:false,layout:{padding:{top:24}},
+      scales:{x:{stacked:true,grid:{display:false},ticks:{autoSkip:false,maxRotation:40,font:{size:11}}},
+              y:{stacked:true,beginAtZero:true,grid:{color:'#eef1f5'},
+                 title:{display:true,text:(ord?'Orders':'Items')+' fulfilled',color:'#64748b',font:{size:11,weight:'600'}}}},
+      plugins:{
+        title:{display:true,text:'Fulfillment '+ulbl+' per person — tallest first'+((v.repl&&!ord)?'  (Restocked shown as a separate bar)':''),
+               color:'#0f172a',font:{size:13,weight:'600'},padding:{bottom:12}},
+        legend:{position:'bottom'},
+        tooltip:{callbacks:{footer:(items)=>{let f=0;items.forEach(i=>{if(i.dataset.stack==='ful')f+=i.parsed.y;});
+          return f?'Fulfillment '+ulbl+': '+f.toLocaleString():'';}}}}},
+    plugins:[stackTotals]});
 }
 function drawDetail(ppl,unit,v){
-  const showI=unit!=='orders',showO=unit!=='items';
-  // build columns dynamically so the toggles actually filter the table
-  const icols=[];
-  if(showI){
-    if(v.pick)   icols.push(['items_picked_sh','Items picked','<span class=s>ShipHero</span>','']);
-    if(v.packsh) icols.push(['items_packed_sh','Items packed','<span class=s>ShipHero</span>','']);
-    if(v.packshop)icols.push(['items_packed_shop','Items packed','<span class="s o">Shopify</span>','o']);
-    if(v.eng)    icols.push(['engraved_items','Items engraved','<span class="s eng">logger</span>','eng']);
-  }
-  const ocols=[];
-  if(showO){
-    if(v.pick)   ocols.push(['orders_picked_sh','Orders picked','<span class=s>ShipHero</span>','']);
-    if(v.packsh) ocols.push(['orders_packed_sh','Orders packed','<span class=s>ShipHero</span>','']);
-    if(v.packshop)ocols.push(['orders_packed_shop','Orders packed','<span class="s o">Shopify</span>','o']);
-  }
-  const arr=ppl.map(p=>({...p,
-    items_total:fulItems(p,v), orders_total:fulOrders(p,v)}));
-  arr.sort((a,b)=>((a[sortKey]>b[sortKey]?1:-1)*sortDir));
-  let h='<table><tr><th onclick="sortBy(\'person\')">Person</th><th>Type</th>';
-  icols.forEach(c=>h+='<th onclick="sortBy(\''+c[0]+'\')">'+c[1]+' '+c[2]+'</th>');
-  if(showI)h+='<th onclick="sortBy(\'items_total\')">Items total</th>';
-  if(v.repl)h+='<th onclick="sortBy(\'replenished\')">Replenished <span class="s p">units·sep.</span></th>';
-  ocols.forEach(c=>h+='<th onclick="sortBy(\''+c[0]+'\')">'+c[1]+' '+c[2]+'</th>');
-  h+='</tr>';
-  const Tt={};
+  // Simplified layout: pick + pack + engrave collapse into ONE Fulfillment figure (items AND orders),
+  // shown right next to the name; restocking is its own separate column. Every header is click-to-sort.
+  const teamItems=ppl.reduce((a,p)=>a+fulItems(p,v),0)||1;
+  const arr=ppl.map(p=>({person:p.person, type:p.type,
+    items:fulItems(p,v), orders:fulOrders(p,v), restock:(v.repl?p.replenished:0),
+    _pick:(v.pick?p.items_picked_sh:0),
+    _pack:(v.packsh?p.items_packed_sh:0)+(v.packshop?p.items_packed_shop:0),
+    _eng:(v.eng?p.engraved_items:0)}));
+  arr.forEach(p=>p.share=Math.round(p.items/teamItems*100));
+  // map legacy sort keys onto the collapsed columns
+  const K={items_total:'items',orders_total:'orders',replenished:'restock'}[sortKey]||sortKey;
+  arr.sort((a,b)=>{const x=a[K],y=b[K];return (x>y?1:(x<y?-1:0))*sortDir;});
+  const arw=k=>sortKey===k?'<span class=arw>'+(sortDir<0?'▼':'▲')+'</span>':'';
+  const th=(k,lab,sub)=>'<th class="srt'+(sortKey===k?' act':'')+'" onclick="sortBy(\''+k+'\')">'+lab+(sub?' <span class=s>'+sub+'</span>':'')+arw(k)+'</th>';
+  let h='<table><tr>'+
+    th('person','Person','')+
+    '<th class=srt onclick="sortBy(\'type\')">Type'+arw('type')+'</th>'+
+    th('items_total','Fulfillment items','pick + pack + engrave')+
+    th('orders_total','Fulfillment orders','')+
+    th('replenished','Restocked','separate track')+
+    th('share','Share','of team')+
+    '</tr>';
+  const T={items:0,orders:0,restock:0};
   arr.forEach(p=>{
-    h+='<tr><td class=name>'+p.person+'</td><td><span class="badge '+(p.type==='Intern'?'in':'ft')+'">'+(p.type==='Intern'?'Intern':(p.type?'Full-timer':'—'))+'</span></td>';
-    icols.forEach(c=>{h+='<td class="'+c[3]+'">'+fmt(p[c[0]])+'</td>';Tt[c[0]]=(Tt[c[0]]||0)+p[c[0]];});
-    if(showI){h+='<td><b>'+fmt(p.items_total)+'</b></td>';Tt.items_total=(Tt.items_total||0)+p.items_total;}
-    if(v.repl){h+='<td class=p>'+fmt(p.replenished)+'</td>';Tt.replenished=(Tt.replenished||0)+p.replenished;}
-    ocols.forEach(c=>{h+='<td class="'+c[3]+'">'+fmt(p[c[0]])+'</td>';Tt[c[0]]=(Tt[c[0]]||0)+p[c[0]];});
-    h+='</tr>';});
-  h+='<tr class=tot><td>Total</td><td></td>';
-  icols.forEach(c=>h+='<td>'+fmt(Tt[c[0]]||0)+'</td>');
-  if(showI)h+='<td>'+fmt(Tt.items_total||0)+'</td>';
-  if(v.repl)h+='<td class=p>'+fmt(Tt.replenished||0)+'</td>';
-  ocols.forEach(c=>h+='<td>'+fmt(Tt[c[0]]||0)+'</td>');
-  h+='</tr></table>';
+    const parts=[]; if(p._pick)parts.push('Pick '+fmt(p._pick)); if(p._pack)parts.push('Pack '+fmt(p._pack)); if(p._eng)parts.push('Engrave '+fmt(p._eng));
+    const brk=parts.length?'<div class=brk>'+parts.join(' &middot; ')+'</div>':'';
+    h+='<tr><td class=name>'+p.person+'</td>'+
+      '<td><span class="badge '+(p.type==='Intern'?'in':'ft')+'">'+(p.type==='Intern'?'Intern':(p.type?'Full-timer':'—'))+'</span></td>'+
+      '<td class=fi><b>'+fmt(p.items)+'</b>'+brk+'</td>'+
+      '<td>'+fmt(p.orders)+'</td>'+
+      '<td class=p>'+fmt(p.restock)+'</td>'+
+      '<td class=shr>'+p.share+'%</td></tr>';
+    T.items+=p.items;T.orders+=p.orders;T.restock+=p.restock;});
+  h+='<tr class=tot><td>Total</td><td></td><td><b>'+fmt(T.items)+'</b></td><td>'+fmt(T.orders)+'</td><td class=p>'+fmt(T.restock)+'</td><td>100%</td></tr>';
+  h+='</table>';
   document.getElementById('detail').innerHTML='<div class=tablewrap>'+h+'</div>';
 }
 function sortBy(k){if(sortKey===k)sortDir*=-1;else{sortKey=k;sortDir=-1;}render();}
