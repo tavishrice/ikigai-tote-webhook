@@ -132,6 +132,14 @@ def warehouse():
 ACTIVE_BREAK = 2700  # seconds = 45 min. ONE definition of "active time" app-wide: from a person's first
                      # scan to their last, with any gap >= 45 min removed as a break (Floor Time, Speed,
                      # engraving hours all use it).
+# Replenishment is logged differently: a picker/replenisher does the physical work FIRST (find boxes, cut
+# them open, place inventory on the shelf) and then, in a short burst, scans the empty boxes at their
+# locations. So the GAP BEFORE a replenish scan is real work, not a break — but it must be capped so that a
+# 2.5h gap before a single box isn't credited as 2.5h of replenishing. We credit min(gap, cap) where the cap
+# scales with the box size (units placed): a full 40-unit box ~= 14 min, a 1-unit tote move ~= 2 min.
+REPL_BASE = 120      # sec: fixed handling per replenish action (walk to it, open the box, log it)
+REPL_PER_UNIT = 18   # sec per unit placed on the shelf (40-unit box => 120 + 720 = 840s = 14 min)
+REPL_MAX = 1800      # sec: absolute ceiling of credited work before any one replenish scan (30 min)
 
 @app.route("/floor")
 def floor_stats():
@@ -143,17 +151,21 @@ def floor_stats():
           SELECT person, ts, (ts AT TIME ZONE 'America/New_York')::date d, stage, quantity
           FROM event WHERE is_floor_labor(stage,subtype) AND et_day(ts) BETWEEN %s AND %s),
         seq AS (
-          SELECT person, d, ts,
+          SELECT person, d, ts, stage, quantity,
             EXTRACT(epoch FROM (ts - lag(ts) OVER (PARTITION BY person,d ORDER BY ts))) gap
           FROM ev),
-        sess AS (
-          SELECT person, d, ts,
-            sum(CASE WHEN gap IS NULL OR gap >= %s THEN 1 ELSE 0 END)
-                OVER (PARTITION BY person,d ORDER BY ts) sid FROM seq),
-        span AS (   -- active seconds = sum of session spans (breaks removed)
-          SELECT person, d, sum(sp) active_s FROM (
-            SELECT person, d, sid, EXTRACT(epoch FROM (max(ts)-min(ts))) sp
-            FROM sess GROUP BY person,d,sid) x GROUP BY person,d),
+        cred AS (   -- active seconds = sum of credited gaps between consecutive scans.
+                    -- Any sub-break gap counts fully (identical to the old session-span model for everyone).
+                    -- The ONLY change: a >= 45-min gap that lands right BEFORE a replenish scan is the
+                    -- physical box work (find/cut/place, logged after), so instead of discarding it as a
+                    -- break we credit it up to a per-box cap that scales with units placed. Big-gap-before-
+                    -- one-box can never be credited as hours; a break before pick/pack is still a break.
+          SELECT person, d, sum(CASE
+              WHEN gap IS NULL THEN 0
+              WHEN gap < %s THEN gap
+              WHEN stage='replenish' THEN LEAST(gap, LEAST(%s, %s + %s*COALESCE(quantity,0)))
+              ELSE 0 END) active_s
+          FROM seq GROUP BY person,d),
         it AS (
           SELECT person, d,
             COALESCE(sum(quantity) FILTER (WHERE stage IN ('pick','pack','engrave')),0) ful,
@@ -163,8 +175,8 @@ def floor_stats():
         SELECT it.person, it.d, EXTRACT(isodow FROM it.d)::int dow,
                COALESCE(sp.active_s,0), it.ful, it.repl, it.first_ts, it.last_ts,
                EXTRACT(epoch FROM (it.last_ts-it.first_ts)) span_s
-        FROM it LEFT JOIN span sp USING (person,d) ORDER BY it.person, it.d""",
-        [frm, to, ACTIVE_BREAK])
+        FROM it LEFT JOIN cred sp USING (person,d) ORDER BY it.person, it.d""",
+        [frm, to, ACTIVE_BREAK, REPL_MAX, REPL_BASE, REPL_PER_UNIT])
         rows = cur.fetchall()
         cur.execute("SELECT id,person,d,hours,note,author FROM floor_note WHERE d BETWEEN %s AND %s "
                     "ORDER BY d, id", [frm, to])
@@ -843,7 +855,7 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 <div id=floor class=hide>
   <div class=card>
     <h2>Floor Time <span style="color:#9ca3af;font-weight:400">&mdash; the effectiveness auditor: hours &amp; output, by day</span></h2>
-    <div class=sub style=margin:0>The headline <b>Hours</b> is the raw window from a person&rsquo;s <b>first scan to their last</b> (First in &rarr; Last out) &mdash; the default measure of time on the floor, and the one we trust most today. <b>Active</b> strips 45-min+ breaks out of that window; it&rsquo;s a stricter, still-maturing calculation, so it sits beside Hours rather than replacing it. The gap between them is break / off-scanner time &mdash; log the real off-scanner work under <b>Proj h</b> to keep it honest. <b>Util</b> = active &divide; span; <b>Items/hr</b> = units per floor-hour. All floor work (pick + pack + engrave + restock), Eastern time.</div>
+    <div class=sub style=margin:0>The headline <b>Hours</b> is the raw window from a person&rsquo;s <b>first scan to their last</b> (First in &rarr; Last out) &mdash; the default measure of time on the floor, and the one we trust most today. <b>Active</b> strips 45-min+ breaks out of that window; it&rsquo;s a stricter, still-maturing calculation, so it sits beside Hours rather than replacing it. The gap between them is break / off-scanner time &mdash; log the real off-scanner work under <b>Proj h</b> to keep it honest. <b>Util</b> = active &divide; span; <b>Items/hr</b> = units per floor-hour. All floor work (pick + pack + engrave + restock), Eastern time. <b>Replenishment is credited fairly:</b> because boxes are worked first and scanned in a burst afterward, a long gap right before a replenish scan counts as box work (not a break) &mdash; capped at a reasonable per-box amount, so a 2-hour gap before one box can never read as 2 hours of replenishing.</div>
     <div id=floorcover></div>
     <div id=floortable></div>
     <div class=logptr>Off-scanner work (returns, cleanup, meetings, training) is logged in the <b><span class=tablink onclick="tab('log')">Log time</span></b> tab &mdash; it feeds the <b>Proj h</b> column and the coverage bars above.</div>
