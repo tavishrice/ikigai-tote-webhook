@@ -187,6 +187,7 @@ def floor_stats():
             lt=last.astimezone(_ET).time()
             if p["_lo"][0] is None or lt > p["_lo"][0]: p["_lo"]=(lt,_ampm(last))
         p["days"].append(dict(d=str(d), dow=dow, hours=round(active_s/3600.0,2),
+            span=round(span_s/3600.0,2),
             ful=int(ful or 0), repl=int(repl or 0),
             first=_ampm(first), last=_ampm(last),
             util=(round(100*active_s/span_s) if span_s>0 else 0)))
@@ -210,7 +211,7 @@ def floor_stats():
         if person in seen: continue
         out.append(dict(person=person, type=PERSON_TYPE.get(person,""), active_days=0,
             first_in="", last_out="", hours=0, hours_per_day=0, items=0, ful_items=0, repl_items=0,
-            items_per_day=0, items_per_hr=0, util=0, avg_span=0, days=[],
+            items_per_day=0, items_per_hr=0, util=0, avg_span=0, span_h=0, days=[],
             notes=nl, proj_hours=round(sum(x["hours"] for x in nl),1)))
     out.sort(key=lambda x:-(x["hours"]+x.get("proj_hours",0)))
     dl=_daylist(frm,to); work_days=sum(1 for x in dl if x["dow"]<=5)   # weekdays (Mon-Fri) in the window
@@ -745,7 +746,7 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 <div id=floor class=hide>
   <div class=card>
     <h2>Floor Time <span style="color:#9ca3af;font-weight:400">&mdash; the effectiveness auditor: hours &amp; output, by day</span></h2>
-    <div class=sub style=margin:0>Two different clocks, side by side. <b>First in &rarr; Last out</b> and <b>Span/day</b> = the raw window between their earliest and latest scan &mdash; a rough &ldquo;when were they on the floor.&rdquo; <b>Hours</b> = <b>active</b> hours inside that window, i.e. span with every 45-min+ break removed &mdash; the effort that actually happened. Gap between the two = breaks / off-scanner time. <b>Util</b> = active &divide; span; <b>Items/hr</b> = units per active hour (UPLH). All floor work (pick + pack + engrave + restock), Eastern time.</div>
+    <div class=sub style=margin:0>The headline <b>Hours</b> is the raw window from a person&rsquo;s <b>first scan to their last</b> (First in &rarr; Last out) &mdash; the default measure of time on the floor, and the one we trust most today. <b>Active</b> strips 45-min+ breaks out of that window; it&rsquo;s a stricter, still-maturing calculation, so it sits beside Hours rather than replacing it. The gap between them is break / off-scanner time &mdash; log the real off-scanner work under <b>Proj h</b> to keep it honest. <b>Util</b> = active &divide; span; <b>Items/hr</b> = units per floor-hour. All floor work (pick + pack + engrave + restock), Eastern time.</div>
     <div id=floortable></div>
     <div class=logcard>
       <div class=logtitle>Log off-scanner time <span class=s>&mdash; returns, cleanup, meetings, training: real work that doesn&rsquo;t hit a scanner</span></div>
@@ -1021,29 +1022,30 @@ function floorSortBy(k){if(floorSort===k)floorDir*=-1;else{floorSort=k;floorDir=
 function renderFloor(){if(!FLOOR)return;
   const days=FLOOR.days,showDays=DET()&&days.length<=16;
   const ppl=FLOOR.people.filter(tfilter);
+  ppl.forEach(p=>{p.iphr_floor=((p.span_h||0)>0?Math.round(p.items/p.span_h):0);});   // items per FLOOR hour (span-based)
   const arr=[...ppl].sort((a,b)=>{const x=a[floorSort],y=b[floorSort];return (x>y?1:(x<y?-1:0))*floorDir;});
   const arw=k=>floorSort===k?'<span class=arw>'+(floorDir<0?'▼':'▲')+'</span>':'';
   const th=(k,l,s)=>'<th class="srt'+(floorSort===k?' act':'')+'" onclick="floorSortBy(\''+k+'\')">'+l+(s?' <span class=s>'+s+'</span>':'')+arw(k)+'</th>';
   let h='<table><tr>'+th('person','Person','')+'<th>Type</th>'+
     '<th>First in</th><th>Last out</th>'+th('active_days','Days','active')+
-    th('hours','Hours','active')+th('hours_per_day','Hrs/day','avg')+th('avg_span','Span/day','first→last')+th('util','Util','active÷span')+
-    th('items','Items','all work')+th('items_per_day','Items/day','')+th('items_per_hr','Items/hr','UPLH')+th('proj_hours','Proj h','off-scanner');
+    th('span_h','Hours','1st&rarr;last')+th('hours','Active','breaks out')+th('avg_span','Hrs/day','1st&rarr;last')+th('util','Util','active÷span')+
+    th('items','Items','all work')+th('items_per_day','Items/day','')+th('iphr_floor','Items/hr','per floor-hr')+th('proj_hours','Proj h','off-scanner');
   if(showDays)h+='<th class=dsep></th>'+days.map(dhead).join('');
-  h+='</tr>';const T={hours:0,items:0};const pad='<td></td><td></td>';
-  arr.forEach(p=>{const m={};p.days.forEach(x=>m[x.d]=x);
+  h+='</tr>';const T={span:0,hours:0,items:0};const pad='<td></td><td></td>';
+  arr.forEach(p=>{const m={};p.days.forEach(x=>m[x.d]=x);const sph=p.span_h||0;
     const projT=(p.notes||[]).map(n=>n.d+' · '+n.hours+'h · '+(n.note||'')).join(' | ').replace(/"/g,'&quot;');
     h+='<tr><td class=name>'+p.person+'</td><td>'+badge(p.type)+'</td>'+
       '<td>'+(p.first_in||'—')+'</td><td>'+(p.last_out||'—')+'</td>'+
-      '<td>'+p.active_days+'</td><td><b>'+p.hours.toFixed(1)+'</b></td><td>'+p.hours_per_day.toFixed(1)+'</td><td>'+p.avg_span.toFixed(1)+'</td>'+
-      '<td>'+chip(p.util)+'</td><td><b>'+fmt(p.items)+'</b></td><td>'+fmt(p.items_per_day)+'</td><td><b>'+fmt(p.items_per_hr)+'</b></td>'+
+      '<td>'+p.active_days+'</td><td><b>'+sph.toFixed(1)+'</b></td><td class=sub2>'+p.hours.toFixed(1)+'</td><td>'+p.avg_span.toFixed(1)+'</td>'+
+      '<td>'+chip(p.util)+'</td><td><b>'+fmt(p.items)+'</b></td><td>'+fmt(p.items_per_day)+'</td><td><b>'+fmt(p.iphr_floor)+'</b></td>'+
       '<td>'+(p.proj_hours?'<span class=projh title="'+projT+'">'+p.proj_hours.toFixed(1)+'</span>':'<span class=dmt>·</span>')+'</td>';
     if(showDays)h+='<td class=dsep></td>'+days.map(d=>{const x=m[d.d];
-      if(!x||(!x.hours&&!x.ful&&!x.repl))return '<td class="dcell'+(d.dow>=6?' wknd':'')+'"><span class=dmt>·</span></td>';
-      return '<td class="dcell'+(d.dow>=6?' wknd':'')+'" title="'+(x.first||'')+'–'+(x.last||'')+' · '+x.util+'% util"><b>'+x.hours.toFixed(1)+'h</b><div class=dsub>'+fmt(x.ful+x.repl)+'</div></td>';}).join('');
-    h+='</tr>';T.hours+=p.hours;T.items+=p.items;});
-  h+='<tr class=tot><td>Team</td><td></td>'+pad+'<td></td><td><b>'+T.hours.toFixed(1)+'</b></td><td></td><td></td><td></td><td><b>'+fmt(T.items)+'</b></td><td></td><td><b>'+fmt(T.hours>0?Math.round(T.items/T.hours):0)+'</b></td><td></td>'+(showDays?'<td class=dsep></td>'+days.map(()=>'<td></td>').join(''):'')+'</tr>';
+      if(!x||(!x.span&&!x.ful&&!x.repl))return '<td class="dcell'+(d.dow>=6?' wknd':'')+'"><span class=dmt>·</span></td>';
+      return '<td class="dcell'+(d.dow>=6?' wknd':'')+'" title="'+(x.first||'')+'–'+(x.last||'')+' · active '+x.hours.toFixed(1)+'h · '+x.util+'% util"><b>'+x.span.toFixed(1)+'h</b><div class=dsub>'+fmt(x.ful+x.repl)+'</div></td>';}).join('');
+    h+='</tr>';T.span+=sph;T.hours+=p.hours;T.items+=p.items;});
+  h+='<tr class=tot><td>Team</td><td></td>'+pad+'<td></td><td><b>'+T.span.toFixed(1)+'</b></td><td class=sub2>'+T.hours.toFixed(1)+'</td><td></td><td></td><td><b>'+fmt(T.items)+'</b></td><td></td><td><b>'+fmt(T.span>0?Math.round(T.items/T.span):0)+'</b></td><td></td>'+(showDays?'<td class=dsep></td>'+days.map(()=>'<td></td>').join(''):'')+'</tr>';
   h+='</table>';
-  const note='<div class=sub style=margin-top:8px>Sorted by '+floorSort.replace(/_/g,' ')+'. <b>First in / Last out</b> = earliest &amp; latest scan; <b>Span/day</b> = typical first→last window (Hours removes 45-min+ breaks from it). <b>Proj h</b> = off-scanner project time you&rsquo;ve logged below (hover for detail). '+(showDays?'Day cell = <b>hours</b> over <b>items</b>.':'Switch <b>Detail → Detailed</b> for the day-by-day grid.')+'</div>';
+  const note='<div class=sub style=margin-top:8px>Sorted by '+floorSort.replace(/_/g,' ')+'. <b>Hours (1st&rarr;last)</b> is the default measure of time on the floor — earliest to latest scan. <b>Active</b> strips 45-min+ breaks out of that window (a stricter, still-maturing calculation, so we lead with the fuller number). The gap between them is what <b>Proj h</b> is for — log real off-scanner work (returns, cleanup, meetings) below and it becomes accounted-for time instead of a mystery gap. '+(showDays?'Day cell = <b>span h</b> over <b>items</b> (hover for active + util).':'Switch <b>Detail → Detailed</b> for the day-by-day grid.')+'</div>';
   document.getElementById('floortable').innerHTML='<div class=tablewrap>'+h+'</div>'+note;
   // roster dropdown + existing-notes list for the annotation panel
   fillRoster();
