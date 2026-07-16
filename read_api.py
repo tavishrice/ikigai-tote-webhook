@@ -585,6 +585,42 @@ def watch():
         config=dict(idle_min=WATCH_IDLE//60, exp_days=exp_days, exp_hours=exp_hours,
                     engravers=sorted(WATCH_ENGRAVERS), **WATCH), people=ppl)
 
+@app.route("/outstanding")
+def outstanding():
+    """The demand side: the current outstanding (not-yet-shipped) order backlog from ShipHero,
+    aged and valued — what we owe. Reads the open_order snapshot (refreshed by orders_snapshot.py)."""
+    AGE_LABELS = ["under 1 day","1–2 days","2–3 days","3–5 days","5–7 days","7+ days"]
+    with connect() as c, c.cursor(row_factory=tuple_row) as cur:
+        cur.execute("SELECT to_regclass('public.open_order')")
+        if cur.fetchone()[0] is None:
+            return jsonify(ready=False, orders=0)
+        cur.execute("SELECT count(*), COALESCE(sum(total_price),0), COALESCE(sum(items_open),0), "
+                    "count(*) FILTER (WHERE on_hold), COALESCE(sum(total_price) FILTER (WHERE on_hold),0), "
+                    "max(snapshot_at) FROM open_order")
+        n, val, items, nhold, valhold, snap = cur.fetchone()
+        cur.execute("""
+          WITH a AS (SELECT total_price, items_open,
+              EXTRACT(epoch FROM (now()-order_date))/86400.0 age FROM open_order WHERE order_date IS NOT NULL)
+          SELECT CASE WHEN age<1 THEN 0 WHEN age<2 THEN 1 WHEN age<3 THEN 2 WHEN age<5 THEN 3 WHEN age<7 THEN 4 ELSE 5 END b,
+                 count(*), COALESCE(sum(total_price),0), COALESCE(sum(items_open),0)
+          FROM a GROUP BY b""")
+        bk = {int(b): (int(cnt), float(v or 0), int(it or 0)) for b, cnt, v, it in cur.fetchall()}
+        cur.execute("""SELECT order_number, order_date, total_price, fulfillment_status, on_hold, hold_reason,
+                          items_open, EXTRACT(epoch FROM (now()-order_date))/86400.0 age
+                       FROM open_order ORDER BY order_date ASC NULLS LAST LIMIT 40""")
+        oldest = [dict(order=r[0], value=float(r[2] or 0), status=r[3], on_hold=bool(r[4]),
+                       hold=r[5], items=int(r[6] or 0), age_days=round(float(r[7] or 0),1)) for r in cur.fetchall()]
+        cur.execute("SELECT COALESCE(fulfillment_status,'unknown'), count(*), COALESCE(sum(total_price),0) "
+                    "FROM open_order GROUP BY 1 ORDER BY 2 DESC")
+        status = [dict(status=r[0], count=int(r[1]), value=float(r[2] or 0)) for r in cur.fetchall()]
+    aging = [dict(label=AGE_LABELS[i], count=bk.get(i,(0,0,0))[0], value=bk.get(i,(0,0,0))[1],
+                  items=bk.get(i,(0,0,0))[2], aged=(i>=3)) for i in range(6)]
+    aged_n = sum(a["count"] for a in aging if a["aged"]); aged_v = sum(a["value"] for a in aging if a["aged"])
+    return jsonify(ready=True, orders=int(n or 0), value=float(val or 0), items=int(items or 0),
+                   on_hold=int(nhold or 0), on_hold_value=float(valhold or 0),
+                   aged=aged_n, aged_value=aged_v,
+                   snapshot_at=(snap.isoformat() if snap else None), aging=aging, oldest=oldest, status=status)
+
 @app.route("/")
 def dashboard():
     return Response(DASHBOARD_HTML, mimetype="text/html")
@@ -806,6 +842,7 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 <div class=sub>Live contribution from ShipHero <b>+ direct-in-Shopify fulfillments + engraving</b>. <b>Fulfillment</b> (pick + pack + engrave) and <b>Restock</b> are two separate tracks.</div>
 <div class=tabs>
   <div class="tab on" data-tab=dash onclick="tab('dash')">Dashboard</div>
+  <div class=tab data-tab=out onclick="tab('out')">Outstanding</div>
   <div class=tab data-tab=floor onclick="tab('floor')">Floor Time</div>
   <div class=tab data-tab=log onclick="tab('log')">Log time</div>
   <div class=tab data-tab=plan onclick="tab('plan')">Planner</div>
@@ -857,6 +894,14 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
     <h2>Per-person detail</h2>
     <div class=sub style=margin:0>Three groups, left to right: <b>On the clock</b> (days &amp; hours worked, so you can see whether someone's ahead just because they put in more time), <b>Fulfillment</b> (pick + pack + engrave, one figure), and <b>Restocking</b> (separate). Click any column header to sort. <b>Hours</b> = clock time from first to last scan &mdash; the default &ldquo;hours worked,&rdquo; since gaps may be special-project time rather than idle. <b>Active</b> = that same window minus 45-min+ breaks (the stricter, calculated number).</div>
     <div id=detail></div>
+  </div>
+</div>
+
+<div id=out class=hide>
+  <div class=card>
+    <h2>Outstanding orders <span style="color:#9ca3af;font-weight:400">&mdash; the backlog we owe: how much, how aged, what status</span></h2>
+    <div class=sub style=margin:0>Every order in ShipHero that hasn&rsquo;t shipped yet &mdash; the demand side, next to your output. <b>Aged</b> = open <b>3+ days</b> (past a normal 1&ndash;2 business-day ship window). <b>On hold</b> = flagged in ShipHero (address / payment / fraud / operator) and can&rsquo;t ship until cleared. Snapshot refreshes with the ShipHero ingest; this view ignores the date range above.</div>
+    <div id=out_body><div class=sub style=margin-top:12px>loading&hellip;</div></div>
   </div>
 </div>
 
@@ -975,7 +1020,7 @@ function segval(id){return document.querySelector('#'+id+' button.on').dataset.v
 function seg(id,v){document.querySelectorAll('#'+id+' button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));render();}
 document.querySelectorAll('.seg').forEach(s=>s.addEventListener('click',e=>{if(e.target.dataset.v){seg(s.id,e.target.dataset.v);}}));
 let curTab='dash';
-function tab(t){curTab=t;['dash','floor','log','plan','trend','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
+function tab(t){curTab=t;['dash','out','floor','log','plan','trend','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
   document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('on',el.dataset.tab===t));
   // Only show the controls a tab actually uses (Unit/Stage/Source + exports = Dashboard only;
   // Team/Detail = Dashboard/Floor/Engraving/Analytics), so no toggle is ever an inert no-op.
@@ -983,7 +1028,49 @@ function tab(t){curTab=t;['dash','floor','log','plan','trend','engt','an','speed
   var c1=document.getElementById('ctl1');if(c1)c1.style.display=showU?'':'none';
   var c2=document.getElementById('ctl2');if(c2)c2.style.display=showTV?'':'none';
   var sm=document.getElementById('summary');if(sm)sm.style.display=showU?'':'none';
-  if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();if(t==='plan')loadPlanner();if(t==='log')loadLog();if(t==='trend')loadTrend();}
+  if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();if(t==='plan')loadPlanner();if(t==='log')loadLog();if(t==='trend')loadTrend();if(t==='out')loadOutstanding();}
+// ===== Outstanding orders (the demand-side backlog from ShipHero) =====
+let OUT=null;
+function money(v){return '$'+Math.round(v||0).toLocaleString();}
+async function loadOutstanding(){var host=document.getElementById('out_body');
+  try{OUT=await getj('/outstanding');}catch(e){host.innerHTML='<div class=sub>could not load outstanding orders</div>';return;}
+  if(!OUT.ready){host.innerHTML='<div class=logptr style="margin-top:12px">The outstanding-orders snapshot hasn&rsquo;t run yet. Once the ShipHero orders snapshot populates, this fills in automatically.</div>';return;}
+  renderOutstanding();}
+function renderOutstanding(){var o=OUT;
+  var agedPct=o.orders?Math.round(100*o.aged/o.orders):0;
+  var hero='<div class=planhero style="border-left-color:#d97706;background:linear-gradient(180deg,#fffaf3,#fff)">'+
+    '<div><div class=phn style=color:#b45309>'+money(o.value)+'</div><div class=phl>owed &mdash; value of open orders</div></div>'+
+    '<div><div class=phn>'+fmt(o.orders)+'</div><div class=phl>orders outstanding'+(o.items?' &middot; '+fmt(o.items)+' items to pick':'')+'</div></div>'+
+    '<div class=phd>'+fmt(o.aged)+' <b>aged</b> (3+ days) &middot; '+money(o.aged_value)+'</div></div>';
+  var cmp='';
+  if(o.on_hold)cmp='<div class="plancmp short" style="margin-top:10px"><b>'+fmt(o.on_hold)+'</b> orders ('+money(o.on_hold_value)+') are <b>on hold</b> in ShipHero and can&rsquo;t ship until cleared &mdash; work these first.</div>';
+  else if(o.aged>0)cmp='<div class="plancmp short" style="margin-top:10px"><b>'+fmt(o.aged)+'</b> orders are aged 3+ days ('+agedPct+'% of the backlog) &mdash; prioritise the oldest below.</div>';
+  else cmp='<div class="plancmp ok" style="margin-top:10px">Nothing aged past 3 days &mdash; the backlog is current.</div>';
+  // aging table
+  var maxc=Math.max.apply(null,o.aging.map(function(a){return a.count;}).concat([1]));
+  var ag='<div class=sub style="margin:16px 0 6px"><b>Aging</b> &mdash; how long orders have been waiting.</div>'+
+    '<table class=plantbl><tr><th style=text-align:left>Age</th><th>Orders</th><th></th><th>Value</th><th>Items</th></tr>';
+  o.aging.forEach(function(a){var w=Math.round(100*a.count/maxc);var col=a.aged?(a.label.indexOf("7")===0?'#dc2626':'#d97706'):'#16a34a';
+    ag+='<tr'+(a.aged?' class=plbn':'')+'><td style=text-align:left>'+a.label+(a.aged?' <span class=s style=color:#b45309>aged</span>':'')+'</td>'+
+      '<td><b>'+fmt(a.count)+'</b></td>'+
+      '<td style="width:180px"><div style="background:#eef2f7;border-radius:5px;height:14px;overflow:hidden"><div style="height:100%;width:'+w+'%;background:'+col+'"></div></div></td>'+
+      '<td>'+money(a.value)+'</td><td>'+(a.items?fmt(a.items):'&middot;')+'</td></tr>';});
+  ag+='</table>';
+  // status breakdown
+  var st='';
+  if(o.status&&o.status.length>1){st='<div class=sub style="margin:16px 0 6px"><b>By status</b></div><div class=lineup>'+
+    o.status.map(function(s){return '<div class=lncol><div class=lnh>'+esc(s.status)+'</div><div class=lnrow><span>'+fmt(s.count)+' orders</span><b>'+money(s.value)+'</b></div></div>';}).join('')+'</div>';}
+  // oldest orders
+  var ol='<div class=sub style="margin:18px 0 6px"><b>Oldest open orders</b> &mdash; work these down first.</div>'+
+    '<div class=tablewrap><table><tr><th style=text-align:left>Order</th><th>Age</th><th>Items</th><th>Value</th><th style=text-align:left>Status</th></tr>'+
+    o.oldest.map(function(r){var ac=r.age_days>=7?'ured':(r.age_days>=3?'uamb':'ugrn');
+      return '<tr><td class=name style=text-align:left>'+esc(r.order)+'</td>'+
+        '<td><span class='+ac+'>'+r.age_days.toFixed(1)+'d</span></td>'+
+        '<td>'+(r.items?fmt(r.items):'&middot;')+'</td><td>'+money(r.value)+'</td>'+
+        '<td style=text-align:left>'+esc(r.status||'')+(r.on_hold?' <span class=s style=color:#dc2626>on hold'+(r.hold?' ('+esc(r.hold)+')':'')+'</span>':'')+'</td></tr>';}).join('')+
+    '</table></div>';
+  var stamp=o.snapshot_at?('<div class=sub style="margin-top:12px">Snapshot from '+new Date(o.snapshot_at).toLocaleString()+'.</div>'):'';
+  document.getElementById('out_body').innerHTML=hero+cmp+ag+st+ol+stamp;}
 function dateEdit(){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.remove('on'));load();}   // manual date change: drop preset highlight + reload
 function preset(p){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.toggle('on',b.dataset.preset===p));
   let f=etToday(),t=etToday();
@@ -1010,6 +1097,7 @@ async function refreshNow(){
   await load();
   if(curTab==='engt')loadEngraving(); else if(curTab==='an')loadAnalytics();
   else if(curTab==='plan')loadPlanner(); else if(curTab==='trend')loadTrendData(); else if(curTab==='log')loadLog();
+  else if(curTab==='out')loadOutstanding();
   stampRefresh();
 }
 async function reqWake(){try{if('wakeLock' in navigator)wakeLock=await navigator.wakeLock.request('screen');}catch(e){}}
