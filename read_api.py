@@ -35,7 +35,11 @@ def cors(resp):
 def _range():
     return request.args.get("from"), request.args.get("to")
 
-_ET = dt.timezone(dt.timedelta(hours=-4))   # ET (EDT) for the summer window
+try:                                         # real Eastern tz so EST/EDT (winter/summer) is always correct
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo("America/New_York")
+except Exception:
+    _ET = dt.timezone(dt.timedelta(hours=-4))
 def _ampm(ts):
     if not ts: return ""
     return ts.astimezone(_ET).strftime("%-I:%M %p")
@@ -99,16 +103,7 @@ def warehouse():
                count(*) FILTER (WHERE sh AND shop) both FROM o""", [frm, to])
         shipped = cur.fetchone()
 
-        cur.execute("""
-        WITH ev AS (SELECT person, ts,
-                      EXTRACT(epoch FROM (ts-lag(ts) OVER w))/60 gap, lag(ts) OVER w prev
-                    FROM event WHERE et_day(ts) BETWEEN %s AND %s AND is_floor_labor(stage,subtype)
-                    WINDOW w AS (PARTITION BY person ORDER BY ts)),
-        mx AS (SELECT person,gap,prev,ts,row_number() OVER (PARTITION BY person ORDER BY gap DESC NULLS LAST) rn FROM ev)
-        SELECT person, round(gap::numeric,0) gap_min, prev, ts FROM mx WHERE rn=1""", [frm, to])
-        gaps = {r[0]: r for r in cur.fetchall()}
-
-    people, floor = [], []
+    people = []
     tot = dict(pk_i=0,packsh_i=0,packshop_i=0,eng_i=0,pk_o=0,packsh_o=0,packshop_o=0,eng_o=0,repl=0)
     for r in rows:
         (person,pk_i,pk_o,psh_i,psh_o,psp_i,psp_o,repl,eng_i,eng_o,pick_c,pack_c,ful_c,mov_c,cnt_c,eng_c,adays,first,last)=r
@@ -118,16 +113,9 @@ def warehouse():
             orders_picked_sh=pk_o, orders_packed_sh=psh_o, orders_packed_shop=psp_o))
         tot["pk_i"]+=pk_i; tot["packsh_i"]+=psh_i; tot["packshop_i"]+=psp_i; tot["eng_i"]+=eng_i
         tot["pk_o"]+=pk_o; tot["packsh_o"]+=psh_o; tot["packshop_o"]+=psp_o; tot["eng_o"]+=eng_o; tot["repl"]+=repl
-        g = gaps.get(person)
-        floor.append(dict(person=person, first_ts=first.isoformat() if first else None,
-            last_ts=last.isoformat() if last else None,
-            gap_min=(int(g[1]) if g and g[1] is not None else 0),
-            gap_from=(g[2].isoformat() if g and g[2] else None),
-            gap_to=(g[3].isoformat() if g and g[3] else None),
-            mix=dict(pick=pick_c, pack=pack_c, fulfill=ful_c, move=mov_c, count=cnt_c, engrave=eng_c)))
     return jsonify(range={"from":frm,"to":to},
         shipped=dict(total=shipped[0], shiphero=shipped[1], shopify_only=shipped[2], both=shipped[3]),
-        totals=tot, people=people, floor=floor)
+        totals=tot, people=people)
 
 ACTIVE_BREAK = 2700  # seconds = 45 min. ONE definition of "active time" app-wide: from a person's first
                      # scan to their last, with any gap >= 45 min removed as a break (Floor Time, Speed,
@@ -378,10 +366,6 @@ SPEED_UNIT = {"pick":"items","pack":"items","engrave":"totes","replenish":"boxes
 # hour — replenish is ranked as BOXES/hr, because a 40-unit box isn't 40x the work of a 1-unit move, so
 # units/hr would just rank box size, not speed.
 SPEED_RATE = {"pick":"units","pack":"units","engrave":"units","replenish":"moves"}
-# Per-stage row filter (a raw SQL fragment built ONLY from these constants — never user input).
-# Replenish counts only real boxes moved in (bin transfers); the qty=1 tote moves (98% of replenish rows)
-# aren't replenishment and are excluded.
-SPEED_FILTER = {"replenish":"AND (raw->>'reason') NOT ILIKE '%%tote%%' AND quantity>1"}
 
 @app.route("/speed")
 def speed():
@@ -606,7 +590,7 @@ DASHBOARD_HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <style>
 :root{color-scheme:light;
   --bg:#f5f6f8;--surface:#fff;--line:#e6e8ec;--line-2:#eef0f3;
-  --ink:#0f172a;--ink-2:#475569;--muted:#94a3b8;
+  --ink:#0f172a;--ink-2:#475569;--muted:#64748b;
   --accent:#2563eb;--accent-weak:#eff4ff;
   --green:#16a34a;--amber:#d97706;--violet:#7c3aed;--teal:#0d9488;--red:#dc2626;
   --r:14px;--r-sm:9px;--r-xs:7px;
@@ -660,7 +644,7 @@ th:first-child,td:first-child{text-align:left;padding-left:4px}
 th:last-child,td:last-child{padding-right:4px}
 th{color:var(--muted);font-weight:600;font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;cursor:pointer;user-select:none}
 th:hover{color:var(--ink-2)}
-th .s{color:#b8c0cc;font-weight:500;text-transform:none;letter-spacing:0}
+th .s{color:#7c8698;font-weight:500;text-transform:none;letter-spacing:0}
 tr:hover td{background:#f8fafc}
 td.name{font-weight:600;color:var(--ink)}
 .tablewrap{overflow-x:auto;overflow-y:hidden}
@@ -676,7 +660,6 @@ td.name{font-weight:600;color:var(--ink)}
 .o{color:var(--amber)}.p{color:var(--violet);font-weight:600}.eng{color:var(--teal);font-weight:600}
 tr.tot td{font-weight:700;color:var(--ink);border-top:1.5px solid var(--line);background:#fcfcfd}
 .red{color:var(--red);font-weight:600}
-.lunch{background:#fef3c7;color:#92400e;border-radius:20px;padding:1px 8px;font-size:10.5px;font-weight:600;margin-left:6px}
 .foot{color:var(--muted);font-size:11.5px;margin-top:24px;line-height:1.7}
 .foot b{color:var(--ink-2)}
 #status{color:var(--ink-2);font-size:12.5px;margin-left:8px}
@@ -757,9 +740,6 @@ td.sub2{color:var(--muted)}
 .tablink{color:var(--accent);font-weight:700;cursor:pointer}.tablink:hover{text-decoration:underline}
 .trendkpis{display:flex;gap:14px;flex-wrap:wrap;margin:12px 0 6px}
 .trendkpi{font-size:13px;background:#fbfcfe;border:1px solid var(--line);border-radius:9px;padding:8px 12px}
-.rosck{cursor:pointer;width:15px;height:15px}
-.asgpick{background:#eaf1ff;color:#1e40af;border-radius:6px;padding:2px 9px;font-size:11px;font-weight:700}
-.asgpack{background:#eafaf0;color:#166534;border-radius:6px;padding:2px 9px;font-size:11px;font-weight:700}
 .plout{opacity:.42}
 .plbn td{background:#fff7ed}
 .plhrs{width:58px;text-align:center;padding:5px 6px}
@@ -813,7 +793,7 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 @media(max-width:900px){.spgrid{grid-template-columns:1fr}.wrap{padding:20px 16px 80px}}
 </style></head><body><div class=wrap>
 <div class=apphead><h1>Warehouse Picking &amp; Packing</h1><span class=dot></span><span class=live>Live</span></div>
-<div class=sub>Live contribution from ShipHero <b>+ direct-in-Shopify fulfillments + engraving</b>, PTO-aware. <b>Fulfillment</b> (pick + pack + engrave) and <b>Replenishment</b> are two separate tracks.</div>
+<div class=sub>Live contribution from ShipHero <b>+ direct-in-Shopify fulfillments + engraving</b>. <b>Fulfillment</b> (pick + pack + engrave) and <b>Restock</b> are two separate tracks.</div>
 <div class=tabs>
   <div class="tab on" data-tab=dash onclick="tab('dash')">Dashboard</div>
   <div class=tab data-tab=floor onclick="tab('floor')">Floor Time</div>
@@ -831,12 +811,12 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
   <button class=pill data-preset=week onclick="preset('week')">This week</button>
   <button class="pill on" data-preset=7 onclick="preset('7')">Last 7 days</button>
   <button class=pill data-preset=30 onclick="preset('30')">Last 30 days</button>
-  <input type=date id=from> <span style=color:#9ca3af>to</span> <input type=date id=to>
+  <input type=date id=from onchange="dateEdit()"> <span style=color:#9ca3af>to</span> <input type=date id=to onchange="dateEdit()">
   <button class=pill onclick="load()">Apply</button><span id=status></span>
 </div>
 <div class=ctl id=ctl1>
   <span class=lbl>Unit</span><span class=seg id=unit><button class=on data-v=both>Both</button><button data-v=items>Items</button><button data-v=orders>Orders</button></span>
-  <span class=lbl style=margin-left:14px>Stage</span><span class=seg id=stage><button class=on data-v=all>All</button><button data-v=pick>Picked</button><button data-v=pack>Packed</button><button data-v=engrave>Engraved</button><button data-v=repl>Replenished</button></span>
+  <span class=lbl style=margin-left:14px>Stage</span><span class=seg id=stage><button class=on data-v=all>All</button><button data-v=pick>Picked</button><button data-v=pack>Packed</button><button data-v=engrave>Engraved</button><button data-v=repl>Restocked</button></span>
   <span class=lbl style=margin-left:14px>Source</span><span class=seg id=source><button class=on data-v=both>Both</button><button data-v=shiphero>ShipHero</button><button data-v=shopify>Shopify</button></span>
   <div class=spacer></div>
   <button class=pill onclick="copyChat()">Copy for chat</button>
@@ -966,15 +946,16 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 </div>
 
 <div class=foot>
-  <b>Chart colours:</b> <span class=s-sh>Picked&middot;ShipHero</span>, <span style=color:#16a34a>Packed&middot;ShipHero</span>, <span class=s-shop>Packed&middot;Shopify</span>, <span class=s-eng>Engraved</span> &mdash; these four stack into the <b>Fulfillment</b> bar. <span class=s-repl>Replenished</span> is drawn as its own separate bar (a parallel track, never added into the fulfillment/items total).
+  <b>Chart colours:</b> <span class=s-sh>Picked&middot;ShipHero</span>, <span style=color:#16a34a>Packed&middot;ShipHero</span>, <span class=s-shop>Packed&middot;Shopify</span>, <span class=s-eng>Engraved</span> &mdash; these four stack into the <b>Fulfillment</b> bar. <span class=s-repl>Restocked</span> is drawn as its own separate bar (a parallel track, never added into the fulfillment/items total).
 </div>
 </div>
 <script>
 const C={pick:'#2563eb',pack:'#16a34a',fulfill:'#d97706',repl:'#7c3aed',engrave:'#0d9488'};
 if(window.Chart){Chart.defaults.font.family="'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif";Chart.defaults.font.size=12;Chart.defaults.color='#475569';Chart.defaults.plugins.legend.labels.usePointStyle=true;Chart.defaults.plugins.legend.labels.boxWidth=8;Chart.defaults.plugins.legend.labels.boxHeight=8;Chart.defaults.plugins.legend.labels.padding=16;}
 let DATA=null, sortKey='items_total', sortDir=-1, chart=null;
-function etToday(){return new Date(Date.now()-4*3600*1000).toISOString().slice(0,10);}
-function etAgo(n){return new Date(Date.now()-4*3600*1000-n*86400000).toISOString().slice(0,10);}
+function etDstr(d){return d.toLocaleDateString('en-CA',{timeZone:'America/New_York'});}   // YYYY-MM-DD in real ET
+function etToday(){return etDstr(new Date());}
+function etAgo(n){return etDstr(new Date(Date.now()-n*86400000));}
 function segval(id){return document.querySelector('#'+id+' button.on').dataset.v;}
 function seg(id,v){document.querySelectorAll('#'+id+' button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));render();}
 document.querySelectorAll('.seg').forEach(s=>s.addEventListener('click',e=>{if(e.target.dataset.v){seg(s.id,e.target.dataset.v);}}));
@@ -987,6 +968,7 @@ function tab(t){['dash','floor','log','plan','trend','engt','an','speed','watch'
   var c2=document.getElementById('ctl2');if(c2)c2.style.display=showTV?'':'none';
   var sm=document.getElementById('summary');if(sm)sm.style.display=showU?'':'none';
   if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();if(t==='plan')loadPlanner();if(t==='log')loadLog();if(t==='trend')loadTrend();}
+function dateEdit(){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.remove('on'));load();}   // manual date change: drop preset highlight + reload
 function preset(p){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.toggle('on',b.dataset.preset===p));
   let f=etToday(),t=etToday();
   if(p==='yest'){f=t=etAgo(1);}else if(p==='7'){f=etAgo(6);}else if(p==='30'){f=etAgo(29);}
@@ -1003,7 +985,7 @@ async function load(){document.getElementById('status').textContent='loading…'
   if(!document.getElementById('watch').classList.contains('hide')){watchKey=null;loadWatch();}
   }catch(e){document.getElementById('status').textContent='could not reach API';}}
 function fmt(n){return (n||0).toLocaleString();}
-function fmtmin(m){if(m==null)return '—';const h=Math.floor(m/60),x=Math.round(m%60);return h?h+'h '+x+'m':x+'m';}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function ampm(iso){if(!iso)return '';return new Date(iso).toLocaleTimeString([], {hour:'numeric',minute:'2-digit',timeZone:'America/New_York'})+' ET';}
 function teamFilter(p){const t=segval('team');return t==='all'||p.type===t;}
 // which fulfillment components are visible for the current Stage/Source toggles
@@ -1022,7 +1004,7 @@ function render(){if(!DATA)return;
   const sh=DATA.shipped, T=DATA.totals;
   const actItems=T.pk_i+T.packsh_i+T.packshop_i+T.eng_i;
   document.getElementById('summary').innerHTML=ppl.length+' people &middot; <b>'+fmt(sh.total)+'</b> orders shipped &middot; '+
-    fmt(actItems)+' fulfillment items ('+fmt(T.pk_i)+' picked + '+fmt(T.packsh_i)+' packed·SH + '+fmt(T.packshop_i)+' packed·Shopify + '+fmt(T.eng_i)+' engraved) &middot; '+fmt(T.repl)+' replenished &middot; '+DATA.range.from;
+    fmt(actItems)+' fulfillment items ('+fmt(T.pk_i)+' picked + '+fmt(T.packsh_i)+' packed·SH + '+fmt(T.packshop_i)+' packed·Shopify + '+fmt(T.eng_i)+' engraved) &middot; '+fmt(T.repl)+' restocked &middot; '+DATA.range.from;
   document.getElementById('shipped').innerHTML='<div class=big>'+fmt(sh.total)+'</div><div class=t>orders shipped out the door</div>'+
     '<div class=d><b>'+fmt(sh.shiphero)+'</b> ShipHero &middot; <span class=o>'+fmt(sh.shopify_only)+'</span> Shopify-only ('+fmt(sh.both)+' ShipHero orders were finished by hand in Shopify)</div>';
   // ---- stat cards (honor toggles) ----
@@ -1040,7 +1022,7 @@ function render(){if(!DATA)return;
     card('Orders picked','ShipHero','s-sh',v.pick?T.pk_o:0),
     card('Orders packed','ShipHero','s-pksh',v.packsh?T.packsh_o:0),
     card('Orders packed','Shopify','s-shop',v.packshop?T.packshop_o:0),
-    card('Replenished','units·separate','s-repl',v.repl?T.repl:0),
+    card('Restocked','units · incl. tote moves','s-repl',v.repl?T.repl:0),
     card('Orders — total','fulfillment','s-sel',ordersSel)].join('');
   si.classList.toggle('hide',!showItems);so.classList.toggle('hide',!showOrders);
   drawChart(ppl,v);
@@ -1147,7 +1129,7 @@ function drawDetail(ppl,unit,v){
   const T={items:0,orders:0,restock:0,_pick:0,_pack:0,_eng:0,worked:0,span:0};
   arr.forEach(p=>{
     const dstr=p.active_days?(p.active_days+(wd?' / '+wd:'')):'&mdash;';
-    h+='<tr><td class=name>'+p.person+'</td><td>'+badge(p.type)+'</td>'+
+    h+='<tr><td class=name>'+esc(p.person)+'</td><td>'+badge(p.type)+'</td>'+
       '<td class=gct>'+dstr+'</td>'+
       '<td class=gct><b>'+(p.span_h?p.span_h.toFixed(1):'&mdash;')+'</b></td>'+
       '<td class="gct sub2">'+(p.worked_h?p.worked_h.toFixed(1):'&mdash;')+'</td>'+
@@ -1202,12 +1184,12 @@ function renderCoverage(ppl){var cw=document.getElementById('floorcover');if(!cw
     '<div class=covsum><b>'+tCov+'%</b> of on-floor time is accounted for — scanned work or logged off-scanner. <b>'+tUn.toFixed(1)+'h</b> still unexplained'+(tLg>0?', <b>'+tLg.toFixed(1)+'h</b> logged so far':'')+'. The more red a bar shows, the more of that person&rsquo;s day the data can&rsquo;t see &mdash; log it below to close the gap.</div>'+
     '<div class=covlegend><span class=covkey><i class=cov-sc></i>Scanned work</span><span class=covkey><i class=cov-lg></i>Logged off-scanner</span><span class=covkey><i class=cov-un></i>Unexplained gap</span></div>';
   rows.forEach(function(r){var w=function(x){return (100*x/r.base).toFixed(1);};
-    h+='<div class=covrow><div class=covname>'+r.person+'</div>'+
+    h+='<div class=covrow><div class=covname>'+esc(r.person)+'</div>'+
       '<div class="covpct '+col(r.cov)+'">'+r.cov+'%</div>'+
       '<div class=covbar><i class=cov-sc style="width:'+w(r.sc)+'%"></i><i class=cov-lg style="width:'+w(r.lg)+'%"></i><i class=cov-un style="width:'+w(r.unex)+'%"></i></div>'+
-      '<div class=covmeta><b>'+r.sp.toFixed(1)+'h</b> on floor'+(r.unex>0.05?' &middot; '+r.unex.toFixed(1)+'h gap <span class=covlog onclick="covLogFor(\''+r.person.replace(/'/g,"\\'")+'\')">&#43; log</span>':' &middot; <span style="color:#15803d">clear</span>')+'</div></div>';});
+      '<div class=covmeta><b>'+r.sp.toFixed(1)+'h</b> on floor'+(r.unex>0.05?' &middot; '+r.unex.toFixed(1)+'h gap <span class=covlog onclick="covLogFor(\''+encodeURIComponent(r.person)+'\')">&#43; log</span>':' &middot; <span style="color:#15803d">clear</span>')+'</div></div>';});
   h+='</div>';cw.innerHTML=h;}
-function covLogFor(person){tab('log');var sel=document.getElementById('n_person');if(sel){sel.value=person;onPersonPick();}}
+function covLogFor(person){person=decodeURIComponent(person);tab('log');var sel=document.getElementById('n_person');if(sel){sel.value=person;onPersonPick();}}
 function renderFloor(){if(!FLOOR)return;
   const days=FLOOR.days,showDays=DET()&&days.length<=16;
   const ppl=FLOOR.people.filter(tfilter);
@@ -1224,7 +1206,7 @@ function renderFloor(){if(!FLOOR)return;
   h+='</tr>';const T={span:0,hours:0,items:0};const pad='<td></td><td></td>';
   arr.forEach(p=>{const m={};p.days.forEach(x=>m[x.d]=x);const sph=p.span_h||0;
     const projT=(p.notes||[]).map(n=>n.d+' · '+n.hours+'h · '+(n.note||'')).join(' | ').replace(/"/g,'&quot;');
-    h+='<tr><td class=name>'+p.person+'</td><td>'+badge(p.type)+'</td>'+
+    h+='<tr><td class=name>'+esc(p.person)+'</td><td>'+badge(p.type)+'</td>'+
       '<td>'+(p.first_in||'—')+'</td><td>'+(p.last_out||'—')+'</td>'+
       '<td>'+p.active_days+'</td><td><b>'+sph.toFixed(1)+'</b></td><td class=sub2>'+p.hours.toFixed(1)+'</td><td>'+p.avg_span.toFixed(1)+'</td>'+
       '<td>'+chip(p.util)+'</td><td><b>'+fmt(p.items)+'</b></td><td>'+fmt(p.items_per_day)+'</td><td><b>'+fmt(p.iphr_floor)+'</b></td>'+
@@ -1243,14 +1225,14 @@ function renderLogPanel(){fillRoster();if(!FLOOR)return;
   const allNotes=[];FLOOR.people.forEach(p=>(p.notes||[]).forEach(n=>allNotes.push(Object.assign({person:p.person},n))));
   allNotes.sort((a,b)=>a.d<b.d?1:-1);
   const nl=document.getElementById('n_list');
-  if(nl)nl.innerHTML=allNotes.length?('<div class=schead style="margin-top:10px"><b>Logged off-scanner time</b> in this range</div><div>'+allNotes.map(n=>'<span class=notechip><b>'+n.person+'</b> '+n.d+(n.hours?' · '+n.hours+'h':'')+(n.note?' · '+n.note:'')+' <span class=x title="delete" onclick="delNote('+n.id+')">✕</span></span>').join('')+'</div>'):'<div class=sub style="margin-top:8px">No off-scanner time logged in this range yet.</div>';}
+  if(nl)nl.innerHTML=allNotes.length?('<div class=schead style="margin-top:10px"><b>Logged off-scanner time</b> in this range</div><div>'+allNotes.map(n=>'<span class=notechip><b>'+esc(n.person)+'</b> '+n.d+(n.hours?' · '+n.hours+'h':'')+(n.note?' · '+esc(n.note):'')+' <span class=x title="delete" onclick="delNote('+n.id+')">✕</span></span>').join('')+'</div>'):'<div class=sub style="margin-top:8px">No off-scanner time logged in this range yet.</div>';}
 async function loadLog(){const f=document.getElementById('from').value,t=document.getElementById('to').value,k=f+'|'+t;
   if(!(FLOOR&&floorKey===k)){try{FLOOR=await getj('/floor?from='+f+'&to='+t);floorKey=k;}catch(e){}}
   renderLogPanel();var d=document.getElementById('n_date');if(d&&!d.value)d.value=t||etToday();}
 
 function nRoster(){const s=new Set();if(DATA&&DATA.people)DATA.people.forEach(p=>s.add(p.person));if(FLOOR&&FLOOR.people)FLOOR.people.forEach(p=>s.add(p.person));return [...s].sort((a,b)=>a.localeCompare(b));}
 function fillRoster(){const sel=document.getElementById('n_person');if(!sel)return;const cur=sel.value;
-  const opts=nRoster().map(n=>'<option value="'+n.replace(/"/g,'&quot;')+'">'+n+'</option>').join('');
+  const opts=nRoster().map(n=>'<option value="'+esc(n)+'">'+esc(n)+'</option>').join('');
   sel.innerHTML='<option value="">Select&hellip;</option>'+opts+'<option value="__new__">&#43; New person&hellip;</option>';
   if(cur)sel.value=cur;
   const d=document.getElementById('n_date');if(d&&!d.value)d.value=document.getElementById('to').value||etToday();}
@@ -1334,7 +1316,7 @@ function planRenderRoster(){var host=document.getElementById('plan_roster');if(!
   var h='<table class=plantbl id=plros><tr><th>In</th><th style=text-align:left>Person</th><th>Hours</th><th>Pick/hr</th><th>Pack/hr</th><th>Eng/hr</th><th style=text-align:left>Station</th><th>Their output</th></tr>';
   PLAN.people.forEach(function(p,i){h+='<tr class="'+(p.inn?'':'plout')+'">'+
     '<td><input type=checkbox class=plin id=plin_'+i+' '+(p.inn?'checked':'')+' onchange="planToggleIn('+i+')"></td>'+
-    '<td class=name style=text-align:left>'+p.person+'</td>'+
+    '<td class=name style=text-align:left>'+esc(p.person)+'</td>'+
     '<td><input class="nin plhrs" id=plhrs_'+i+' type=number min=0 max=14 step=0.5 value='+p.hours+' oninput="planEdit()"></td>'+
     '<td>'+(p.pick||'<span class=dmt>·</span>')+'</td><td>'+(p.pack||'<span class=dmt>·</span>')+'</td><td>'+(p.eng||'<span class=dmt>·</span>')+'</td>'+
     '<td style=text-align:left><select class=plsel id=plsel_'+i+' onchange="planEdit()">'+planStationOpts(p,p.assign)+'</select></td>'+
@@ -1394,7 +1376,7 @@ function planCompute(){if(!PLAN)return;
 // ===== Individual trends: one person's weekly pace per activity =====
 let TREND=null, trendChartObj=null;
 function loadTrend(){var sel=document.getElementById('tr_person');
-  if(sel&&sel.options.length===0){var r=nRoster();sel.innerHTML=r.map(function(n){return '<option>'+n+'</option>';}).join('');}
+  if(sel&&sel.options.length===0){var r=nRoster();sel.innerHTML=r.map(function(n){return '<option value="'+esc(n)+'">'+esc(n)+'</option>';}).join('');}
   if(sel&&!sel.value&&sel.options.length)sel.value=sel.options[0].value;
   loadTrendData();}
 async function loadTrendData(){var person=(document.getElementById('tr_person')||{}).value, weeks=(document.getElementById('tr_weeks')||{}).value||12;
@@ -1410,7 +1392,7 @@ function renderTrend(){if(!TREND)return;var acts=trendActs(),weeks=TREND.weeks;
     if(!pts.length)return;var first=pts[0],last=pts[pts.length-1],delta=last-first,pct=first?Math.round(100*delta/first):0;
     var dir=delta>0?'&#9650; improving':(delta<0?'&#9660; slower':'&ndash; flat'),col=delta>0?'#15803d':(delta<0?'#b91c1c':'#64748b');
     sHtml+='<span class=trendkpi><b style="color:'+a[2]+'">'+a[1]+'</b> '+first+' &rarr; <b>'+last+'</b> /hr <span style="color:'+col+'">'+(delta>=0?'+':'')+pct+'% '+dir+'</span></span>';});
-  document.getElementById('tr_summary').innerHTML='<div class=trendkpis>'+(sHtml||'<span class=sub>Not enough timed data yet for '+TREND.person+' &mdash; needs a few more days of scans.</span>')+'</div>';
+  document.getElementById('tr_summary').innerHTML='<div class=trendkpis>'+(sHtml||'<span class=sub>Not enough timed data yet for '+esc(TREND.person)+' &mdash; needs a few more days of scans.</span>')+'</div>';
   if(window.Chart){var ds=acts.map(function(a){return {label:a[1],data:weeks.map(function(w){var o=w[a[0]]||{};return o.uph==null?null:o.uph;}),
       borderColor:a[2],backgroundColor:a[2],tension:.3,spanGaps:true,pointRadius:4,borderWidth:2};});
     if(trendChartObj)trendChartObj.destroy();
@@ -1442,7 +1424,7 @@ function renderEngraving(){if(!ENGR)return;
   if(showDays)h+='<th class=dsep></th>'+days.map(dhead).join('');
   h+='</tr>';const T={totes:0,items:0,hours:0,lid:0,ipe:0,dotw:0};
   arr.forEach(p=>{const m={};p.days.forEach(x=>m[x.d]=x);
-    h+='<tr><td class=name>'+p.person+'</td><td>'+badge(p.type)+'</td><td>'+p.active_days+'</td>'+
+    h+='<tr><td class=name>'+esc(p.person)+'</td><td>'+badge(p.type)+'</td><td>'+p.active_days+'</td>'+
       '<td><b>'+fmt(p.totes)+'</b></td><td><b>'+fmt(p.items)+'</b></td><td>'+p.hours.toFixed(1)+'</td>'+
       '<td><b>'+fmt(p.items_per_hr)+'</b></td><td>'+p.totes_per_hr.toFixed(1)+'</td><td>'+fmt(p.items_per_day)+'</td>'+
       '<td>'+chip(p.match_rate)+'</td>'+
@@ -1468,7 +1450,7 @@ function renderAnalytics(){if(!FLOOR)return;
   const uplh=H>0?Math.round(I/H):0;
   const avgUtil=Math.round(ppl.reduce((a,p)=>a+p.util,0)/ppl.length);
   const uphs=ppl.map(p=>p.items_per_hr).filter(x=>x>0).sort((a,b)=>a-b);
-  const med=uphs.length?uphs[Math.floor(uphs.length/2)]:0, top=uphs.length?uphs[uphs.length-1]:0, bot=uphs.length?uphs[0]:0;
+  const _n=uphs.length, med=_n?(_n%2?uphs[(_n-1)/2]:Math.round((uphs[_n/2-1]+uphs[_n/2])/2)):0, top=_n?uphs[_n-1]:0, bot=_n?uphs[0]:0;
   let h='<div class=note style=margin-top:0>Team effectiveness for <b>'+FLOOR.range.from+' → '+FLOOR.range.to+'</b>. <b>UPLH</b> = items per active labour hour (the core warehouse productivity KPI). Active hours use the 45-min-break rule.</div>';
   h+='<div class=cards>'+card('People','active','s-sel',ppl.length)+card('Active hours','all work','s-sel',Math.round(H))
     +card('Items','pick+pack+engrave+restock','s-sel',I)+card('Team UPLH','items / active hr','s-sel',uplh)
@@ -1485,7 +1467,12 @@ function renderAnalytics(){if(!FLOOR)return;
     [['Full-timers',ft],['Interns',it]].filter(x=>x[1]).map(x=>'<tr><td class=name>'+x[0]+'</td><td>'+x[1].n+'</td><td>'+x[1].hours+'</td><td>'+fmt(x[1].items)+'</td><td><b>'+x[1].uplh+'</b></td><td>'+x[1].util+'%</td></tr>').join('')+
     '</table></div>';}
   el.innerHTML=h;}
-function copyChat(){const v=vis();const rows=DATA.people.filter(teamFilter).map(p=>p.person+': fulfillment '+fulItems(p,v)+' (picked '+p.items_picked_sh+', packed '+(p.items_packed_sh+p.items_packed_shop)+', engraved '+p.engraved_items+'), replenished '+p.replenished);
+function copyChat(){const v=vis();const rows=DATA.people.filter(teamFilter).map(p=>{
+    var parts=[];
+    if(v.pick)parts.push('picked '+p.items_picked_sh);
+    if(v.packsh||v.packshop)parts.push('packed '+((v.packsh?p.items_packed_sh:0)+(v.packshop?p.items_packed_shop:0)));
+    if(v.eng)parts.push('engraved '+p.engraved_items);
+    return p.person+': fulfillment '+fulItems(p,v)+(parts.length?' ('+parts.join(', ')+')':'')+(v.repl?', restocked '+p.replenished:'');});
   navigator.clipboard.writeText('Warehouse '+DATA.range.from+'\n'+DATA.shipped.total+' orders shipped\n'+rows.join('\n'));document.getElementById('status').textContent='copied!';setTimeout(()=>document.getElementById('status').textContent='',1500);}
 function dl(kind){const ppl=DATA.people.filter(teamFilter);let blob,name;
   if(kind==='json'){blob=new Blob([JSON.stringify(DATA,null,2)],{type:'application/json'});name='warehouse.json';}
@@ -1532,8 +1519,8 @@ function renderSpeed(){
     const rows=S[s]||[],rk=rows.filter(r=>r.ranked).sort((a,b)=>b.uph-a.uph),un=rows.filter(r=>!r.ranked);
     b+='<div class=card style="padding:14px 16px"><div style="font-weight:700">'+cap(s)+' <span class=sub style="font-weight:400">(pace = typical '+cfg.unit[s]+'/hr, fastest first)</span></div>';
     if(!rk.length)b+='<div class=sub style=margin-top:6px>No one has enough data yet in this window.</div>';
-    else{b+='<table style=margin-top:6px><tr><th>#</th><th style=text-align:left>Person</th><th>Pace</th><th>Thru</th><th>s/ea</th><th>n</th><th>days</th></tr>';
-      rk.forEach((r,i)=>{b+='<tr><td>'+(i+1)+'</td><td class=name style=text-align:left>'+r.person+'</td><td><b style="color:'+pctColor(pct[r.person][s].p)+'">'+fmt(r.pace)+'</b></td><td class=sub>'+fmt(r.throughput)+'</td><td>'+(r.med_spi==null?'—':r.med_spi+'s')+'</td><td>'+r.n+'</td><td>'+r.days+'</td></tr>';});
+    else{b+='<table style=margin-top:6px><tr><th>#</th><th style=text-align:left>Person</th><th title="typical items/hr when hands are on the task (ranking metric)">Pace</th><th title="throughput: items per active hour, pauses included">Thru</th><th title="median seconds per item">s/ea</th><th title="number of timed intervals behind the number">n</th><th>days</th></tr>';
+      rk.forEach((r,i)=>{b+='<tr><td>'+(i+1)+'</td><td class=name style=text-align:left>'+esc(r.person)+'</td><td><b style="color:'+pctColor(pct[r.person][s].p)+'">'+fmt(r.pace)+'</b></td><td class=sub>'+fmt(r.throughput)+'</td><td>'+(r.med_spi==null?'—':r.med_spi+'s')+'</td><td>'+r.n+'</td><td>'+r.days+'</td></tr>';});
       b+='</table>';}
     if(un.length)b+='<div class=sub style=margin-top:8px><b>Insufficient:</b> '+un.map(r=>r.person+' <span class=ins>('+r.reason+')</span>').join(', ')+'</div>';
     b+='</div>';
@@ -1548,7 +1535,7 @@ function renderSpeed(){
     .filter(r=>r.total>0 && (segval('team')==='all'||r.type===segval('team'))).sort((a,b)=>b.total-a.total);
   const hcell=v=>v>0?v.toFixed(1):'<span class=dmt>·</span>';
   let hh='<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th>Type</th><th>Pick h</th><th>Pack h</th><th>Engrave h</th><th>Restock h</th><th>Total h</th></tr>';
-  hrows.forEach(r=>{hh+='<tr><td class=name>'+r.person+'</td><td>'+badge(r.type)+'</td><td>'+hcell(r.pick)+'</td><td>'+hcell(r.pack)+'</td><td>'+hcell(r.engrave)+'</td><td>'+hcell(r.replenish)+'</td><td><b>'+r.total.toFixed(1)+'</b></td></tr>';});
+  hrows.forEach(r=>{hh+='<tr><td class=name>'+esc(r.person)+'</td><td>'+badge(r.type)+'</td><td>'+hcell(r.pick)+'</td><td>'+hcell(r.pack)+'</td><td>'+hcell(r.engrave)+'</td><td>'+hcell(r.replenish)+'</td><td><b>'+r.total.toFixed(1)+'</b></td></tr>';});
   hh+='</table></div>';
   document.getElementById('speed_hours').innerHTML=hrows.length?hh:'<div class=sub>No tracked activity in this window.</div>';
   // ---- assignment matrix ----
@@ -1591,16 +1578,16 @@ function renderWatch(){
   h+='<b>Flags:</b> Bursty/idle (util &lt;'+c.util_low+'%) · Under hours (&lt;70% of target) · Short shifts (avg &lt;'+c.short_day_hr+'h/day) · Missed days (check the <b>PTO app</b>) · Low output (bottom '+c.out_bottom_pct+'%) · Fast-but-low-total · Inconsistent.<br>';
   h+='<b>Presence</b> comes from scan timestamps (a lower bound on real clock time) and does not yet cross-check the PTO app or scheduled shifts — so verify hours/attendance flags there. <b>Engravers ('+c.engravers.join(', ')+')</b> are shown separately and un-flagged for now, since engraving time isn&rsquo;t cleanly tracked.</div>';
   h+='<div class=card><h2>Flags &amp; profiles</h2><div class=sub style=margin:0>Most-flagged first. Hover a chip for the evidence. Util is coloured (red &lt;50%, amber 50–65%, green &gt;65%).</div>';
-  h+='<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th>Type</th><th>Output</th><th>Pace<span class=s> /act-hr</span></th><th>Active h</th><th>Floor h</th><th>Util</th><th>Days</th><th>Avg/day</th><th style=text-align:left>Flags</th></tr>';
+  h+='<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th>Type</th><th>Output</th><th>Output/hr<span class=s> all tasks</span></th><th>Active h</th><th>Floor h</th><th>Util</th><th>Days</th><th>Avg/day</th><th style=text-align:left>Flags</th></tr>';
   main.forEach(p=>{
-    h+='<tr><td class=name>'+p.person+'</td><td><span class="badge '+(p.type==='Intern'?'in':'ft')+'">'+(p.type==='Intern'?'Intern':(p.type?'FT':'—'))+'</span></td>';
+    h+='<tr><td class=name>'+esc(p.person)+'</td><td><span class="badge '+(p.type==='Intern'?'in':'ft')+'">'+(p.type==='Intern'?'Intern':(p.type?'FT':'—'))+'</span></td>';
     h+='<td>'+fmt(p.output)+'</td><td>'+fmt(p.pace)+'</td><td>'+p.active_hr+'</td><td>'+p.floor_hr+'</td><td class='+utilCls(p.util)+'>'+p.util+'%</td><td>'+p.days+'</td><td>'+p.avg_span+'h</td>';
     h+='<td style=text-align:left>'+(p.flags.length?p.flags.map(x=>'<span class="wchip '+x.sev+'" title="'+esc(x.d)+'">'+x.t+'</span>').join(''):'<span class=wok>✓ clear</span>')+'</td></tr>';
   });
   h+='</table></div></div>';
   if(eng.length){h+='<div class=card style=margin-top:16px><h2>Engravers <span style="color:#94a3b8;font-weight:400">— separate; engraving time not fully tracked, not flagged yet</span></h2>';
     h+='<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th>Output</th><th>Pace</th><th>Active h</th><th>Floor h</th><th>Util</th><th>Days</th></tr>';
-    eng.forEach(p=>{h+='<tr><td class=name>'+p.person+'</td><td>'+fmt(p.output)+'</td><td>'+fmt(p.pace)+'</td><td>'+p.active_hr+'</td><td>'+p.floor_hr+'</td><td>'+p.util+'%</td><td>'+p.days+'</td></tr>';});
+    eng.forEach(p=>{h+='<tr><td class=name>'+esc(p.person)+'</td><td>'+fmt(p.output)+'</td><td>'+fmt(p.pace)+'</td><td>'+p.active_hr+'</td><td>'+p.floor_hr+'</td><td>'+p.util+'%</td><td>'+p.days+'</td></tr>';});
     h+='</table></div></div>';}
   if(insuff.length)h+='<div class=note style=margin-top:14px><b>Not enough data to assess:</b> '+insuff.map(p=>p.person+' <span class=ins>('+p.days+' day'+(p.days===1?'':'s')+')</span>').join(', ')+'</div>';
   document.getElementById('watch_body').innerHTML=h;
