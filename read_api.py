@@ -731,6 +731,9 @@ td.sub2{color:var(--muted)}
 .tablink{color:var(--accent);font-weight:700;cursor:pointer}.tablink:hover{text-decoration:underline}
 .trendkpis{display:flex;gap:14px;flex-wrap:wrap;margin:12px 0 6px}
 .trendkpi{font-size:13px;background:#fbfcfe;border:1px solid var(--line);border-radius:9px;padding:8px 12px}
+.rosck{cursor:pointer;width:15px;height:15px}
+.asgpick{background:#eaf1ff;color:#1e40af;border-radius:6px;padding:2px 9px;font-size:11px;font-weight:700}
+.asgpack{background:#eafaf0;color:#166534;border-radius:6px;padding:2px 9px;font-size:11px;font-weight:700}
 /* Log off-scanner time card */
 .logcard{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:#fbfcfe;margin-top:16px}
 .logtitle{font-size:13px;font-weight:700;color:var(--ink-2);margin-bottom:10px}
@@ -911,6 +914,12 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
     </div>
     <div id=plan_out></div>
   </div>
+  <div class=card style="margin-top:16px">
+    <h2>Who does what <span style="color:#9ca3af;font-weight:400">&mdash; best assignment for the people you have</span></h2>
+    <div class=sub style=margin:0>Tick who&rsquo;s on the floor. Because the same person is a different speed picking vs packing, the optimizer places each one where they balance the line and ship the most orders. Everyone is planned at the hours set above; engraving is a separate pool.</div>
+    <div id=plan_roster style="margin-top:12px"></div>
+    <div id=plan_opt></div>
+  </div>
 </div>
 
 <div id=trend class=hide>
@@ -940,7 +949,7 @@ function etAgo(n){return new Date(Date.now()-4*3600*1000-n*86400000).toISOString
 function segval(id){return document.querySelector('#'+id+' button.on').dataset.v;}
 function seg(id,v){document.querySelectorAll('#'+id+' button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));render();}
 document.querySelectorAll('.seg').forEach(s=>s.addEventListener('click',e=>{if(e.target.dataset.v){seg(s.id,e.target.dataset.v);}}));
-function tab(t){['dash','floor','log','plan','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
+function tab(t){['dash','floor','log','plan','trend','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
   document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('on',el.dataset.tab===t));
   if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();if(t==='plan')loadPlanner();if(t==='log')loadLog();if(t==='trend')loadTrend();}
 function preset(p){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.toggle('on',b.dataset.preset===p));
@@ -1289,7 +1298,44 @@ function planRender(){var oi=document.getElementById('pl_orders'); if(oi&&!oi.va
     rows+'<tr class=tot><td style=text-align:left>Total</td><td id=pl_titems></td><td></td><td id=pl_thrs></td><td id=pl_tppl></td></tr></table>'+
     '<div id=pl_lineup></div>';
   document.getElementById('pl_lineup').innerHTML=planLineup();
-  planCompute();}
+  planCompute();planRenderRoster();}
+// Per-person assignment optimizer: place each available person on pick or pack to balance the line.
+function planRate(person,stage){if(!SPEED||!SPEED.stages||!SPEED.stages[stage])return 0;
+  var r=(SPEED.stages[stage]||[]).find(function(x){return x.person===person;});
+  if(!r)return 0; return r.ranked?(r.pace||r.throughput||0):(r.throughput||r.pace||0);}
+function planRosterPeople(){var set={};['pick','pack'].forEach(function(s){((SPEED&&SPEED.stages&&SPEED.stages[s])||[]).forEach(function(r){if(planRate(r.person,'pick')||planRate(r.person,'pack'))set[r.person]=1;});});
+  return Object.keys(set).sort();}
+function planRenderRoster(){var host=document.getElementById('plan_roster');if(!host)return;
+  var ppl=planRosterPeople();PLAN.roster=ppl;
+  if(!ppl.length){host.innerHTML='<div class=sub>Not enough Speed data yet to optimize by person.</div>';document.getElementById('plan_opt').innerHTML='';return;}
+  var h='<table class=plantbl><tr><th>On floor</th><th style=text-align:left>Person</th><th>Pick /hr</th><th>Pack /hr</th><th>Assign</th><th>Items/day</th></tr>';
+  ppl.forEach(function(p,i){h+='<tr><td><input type=checkbox class=rosck data-p="'+p.replace(/"/g,'&quot;')+'" checked onchange="planOptimize()"></td>'+
+    '<td class=name style=text-align:left>'+p+'</td>'+
+    '<td>'+(planRate(p,'pick')||'<span class=dmt>·</span>')+'</td><td>'+(planRate(p,'pack')||'<span class=dmt>·</span>')+'</td>'+
+    '<td id=asg_'+i+'></td><td id=asgi_'+i+'></td></tr>';});
+  host.innerHTML=h+'</table>';planOptimize();}
+function planOptimize(){if(!PLAN||!PLAN.roster)return;
+  var N=num('pl_orders',0), shift=num('pl_shift',8)||8;
+  var avail=[];document.querySelectorAll('.rosck').forEach(function(ck){if(ck.checked)avail.push(ck.dataset.p);});
+  var aPick=PLAN.act.filter(function(a){return a.key==='pick';})[0], aPack=PLAN.act.filter(function(a){return a.key==='pack';})[0];
+  var ipoP=(aPick&&aPick.ipo)||0.001, ipoK=(aPack&&aPack.ipo)||0.001;
+  var cap={pick:0,pack:0}, assign={}, un=avail.slice(), guard=0;
+  while(un.length&&guard++<200){
+    var oP=cap.pick/ipoP, oK=cap.pack/ipoK, stage=oP<=oK?'pick':'pack';
+    var bi=-1,br=-1;un.forEach(function(p,idx){var r=planRate(p,stage);if(r>br){br=r;bi=idx;}});
+    if(bi<0||br<=0){stage=(stage==='pick')?'pack':'pick';bi=-1;br=-1;un.forEach(function(p,idx){var r=planRate(p,stage);if(r>br){br=r;bi=idx;}});if(bi<0||br<=0)break;}
+    var person=un.splice(bi,1)[0]; assign[person]=stage; cap[stage]+=br*shift;}
+  var oPick=cap.pick/ipoP, oPack=cap.pack/ipoK, orders=Math.floor(Math.min(oPick,oPack));
+  var bneck=oPick<oPack?'pick':'pack';
+  PLAN.roster.forEach(function(p,i){var a=assign[p];
+    set('asg_'+i, a?('<span class=asg'+a+'>'+a+'</span>'):'<span class=dmt>—</span>');
+    set('asgi_'+i, a?fmt(Math.round(planRate(p,a)*shift)):'');});
+  var nP=0,nK=0;for(var k in assign){if(assign[k]==='pick')nP++;else nK++;}
+  var opt=document.getElementById('plan_opt');
+  if(!avail.length){opt.innerHTML='<div class="plancmp short" style="margin-top:12px">Tick at least one person.</div>';return;}
+  opt.innerHTML='<div class="plancmp '+(N&&orders>=N?'ok':(N?'short':'ok'))+'" style="margin-top:14px">'+
+    'With these <b>'+avail.length+'</b> people at '+shift+'h ('+nP+' picking, '+nK+' packing) you can ship about <b>'+fmt(orders)+'</b> orders/day. Bottleneck: <b>'+bneck+'</b>'+
+    (N?(orders>=N?' &mdash; clears your '+fmt(N)+'-order target.':' &mdash; <b>'+fmt(N-orders)+'</b> short of your '+fmt(N)+'-order target; add a '+bneck+'er or more hours.'):'')+'</div>';}
 function set(id,html){var el=document.getElementById(id);if(el)el.innerHTML=html;}
 function planCompute(){if(!PLAN)return;
   var N=num('pl_orders',0), shift=num('pl_shift',8)||8, pv=document.getElementById('pl_people').value;
