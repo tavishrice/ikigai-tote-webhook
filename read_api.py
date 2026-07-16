@@ -161,16 +161,19 @@ def floor_stats():
     ppl = {}
     for (person,d,dow,active_s,ful,repl,first,last,span_s) in rows:
         p = ppl.setdefault(person, dict(person=person, type=PERSON_TYPE.get(person,""),
-            active_days=0, active_s=0.0, span_s=0.0, ful=0, repl=0, days=[]))
+            active_days=0, active_s=0.0, span_s=0.0, ful=0, repl=0, days=[], _first=None, _last=None))
         active_s=float(active_s or 0); span_s=float(span_s or 0)
         p["active_days"]+=1; p["active_s"]+=active_s; p["span_s"]+=span_s
         p["ful"]+=int(ful or 0); p["repl"]+=int(repl or 0)
+        if first and (p["_first"] is None or first < p["_first"]): p["_first"]=first
+        if last  and (p["_last"]  is None or last  > p["_last"]):  p["_last"]=last
         p["days"].append(dict(d=str(d), dow=dow, hours=round(active_s/3600.0,2),
             ful=int(ful or 0), repl=int(repl or 0),
             first=_ampm(first), last=_ampm(last),
             util=(round(100*active_s/span_s) if span_s>0 else 0)))
     out=[]
     for p in ppl.values():
+        p["first_in"]=_ampm(p.pop("_first",None)); p["last_out"]=_ampm(p.pop("_last",None))
         hrs=p["active_s"]/3600.0; items=p["ful"]+p["repl"]
         p["hours"]=round(hrs,2)
         p["hours_per_day"]=round(hrs/p["active_days"],2) if p["active_days"] else 0
@@ -242,68 +245,76 @@ SPEED_FILTER = {"replenish":"AND (raw->>'reason') NOT ILIKE '%%tote%%' AND quant
 
 @app.route("/speed")
 def speed():
-    """Per person x stage working speed (units per ACTIVE hour) for the selected window."""
+    """Per person x activity PACE (typical time per item) + throughput, for the window.
+
+    ACCURATE by construction:
+    (1) Built on each person's WHOLE scan timeline, so a gap counts toward an activity only when the
+        scan before it was the SAME activity — switching tasks is never counted as active time for
+        another task (that was the old bug that tanked multitaskers).
+    (2) Ranked by the MEDIAN gap between consecutive same-activity scans → the typical time to do one
+        item. The median ignores pauses, breaks and one-off slow items, so the number is stable and
+        reflects real pace. (Throughput per active hour is shown alongside for context.)
+    """
     frm, to = _range()
-    rows_by_stage = {}
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
-        for stage in SPEED_STAGES:
-            idle = SPEED_BREAK   # one uniform 45-min break for every activity
-            flt = SPEED_FILTER.get(stage, "")   # constant-only SQL fragment (see SPEED_FILTER)
-            cur.execute(f"""
-            WITH r AS (
-              SELECT person, quantity, ts,
-                EXTRACT(epoch FROM (ts - lag(ts) OVER (PARTITION BY person ORDER BY ts))) g
-              FROM event WHERE stage=%s AND source=%s {flt} AND et_day(ts) BETWEEN %s AND %s),
-            ch AS (  -- collapse <=5s bursts into one chunk (one physical action)
-              SELECT person, quantity, ts,
-                sum(CASE WHEN g IS NULL OR g > %s THEN 1 ELSE 0 END)
-                    OVER (PARTITION BY person ORDER BY ts) cid
-              FROM r),
-            chunks AS (SELECT person, cid, sum(quantity) units, min(ts) st
-                       FROM ch GROUP BY person, cid),
-            iv AS (  -- gap between consecutive chunks = time to process one chunk/box
-              SELECT person, units,
-                EXTRACT(epoch FROM (st - lag(st) OVER (PARTITION BY person ORDER BY st))) gap,
-                (st AT TIME ZONE 'America/New_York')::date d
-              FROM chunks)
-            SELECT person,
-              count(*)              FILTER (WHERE gap>0 AND gap<=%s)                         n,
-              round(sum(gap)        FILTER (WHERE gap>0 AND gap<=%s)/60.0, 1)                active_min,
-              sum(units)            FILTER (WHERE gap>0 AND gap<=%s)                         units,
-              count(DISTINCT d)     FILTER (WHERE gap>0 AND gap<=%s)                         days,
-              round(3600.0*sum(units) FILTER (WHERE gap>0 AND gap<=%s)
-                    / nullif(sum(gap) FILTER (WHERE gap>0 AND gap<=%s),0), 0)               uph,
-              round(percentile_cont(0.5) WITHIN GROUP (ORDER BY gap/nullif(units,0))
-                    FILTER (WHERE gap>0 AND gap<=%s)::numeric, 0)                           med_spi,
-              round(percentile_cont(0.5) WITHIN GROUP (ORDER BY gap)
-                    FILTER (WHERE gap>0 AND gap<=%s)::numeric, 0)                           med_move
-            FROM iv GROUP BY person""",
-            [stage, SPEED_SRC[stage], frm, to, SPEED_BURST] + [idle]*8)
-            movemode = (SPEED_RATE[stage]=="moves")
-            out = []
-            for (person,n,amin,units,days,uph,med_spi,med_move) in cur.fetchall():
-                if not n: continue
-                ranked = (n>=SPEED_GATE["min_intervals"] and (days or 0)>=SPEED_GATE["min_days"]
-                          and (amin or 0)>=SPEED_GATE["min_active_min"])
-                reason = ""
-                if not ranked:
-                    bits=[]
-                    if n<SPEED_GATE["min_intervals"]: bits.append(f"only {n} sample"+("s" if n!=1 else ""))
-                    if (days or 0)<SPEED_GATE["min_days"]: bits.append(f"only {days or 0} day"+("s" if (days or 0)!=1 else ""))
-                    if (amin or 0)<SPEED_GATE["min_active_min"]: bits.append(f"only {amin or 0} active min")
-                    reason=", ".join(bits)
-                if movemode:                              # replenish -> boxes/hr, median sec/box
-                    rate = round(n*60.0/float(amin)) if amin else 0
-                    med  = int(med_move) if med_move is not None else None
-                else:                                     # pick/pack/engrave -> units/hr, median sec/item
-                    rate = int(uph) if uph is not None else 0
-                    med  = int(med_spi) if med_spi is not None else None
-                out.append(dict(person=person, type=PERSON_TYPE.get(person,""),
-                    uph=rate, med_spi=med, n=int(n),
-                    active_min=float(amin) if amin is not None else 0.0,
-                    days=int(days or 0), units=int(units) if units is not None else 0,
-                    moves=int(n), ranked=ranked, reason=reason))
-            rows_by_stage[stage]=out
+        cur.execute("""
+        WITH base AS (   -- tote-moves are a separate pseudo-activity so they don't count as box moves,
+                         -- but still break a pick/pack bout (a real task switch)
+          SELECT person,
+            CASE WHEN stage='replenish' AND ((raw->>'reason') ILIKE '%%tote%%' OR coalesce(quantity,0)<=1)
+                 THEN 'move_tote' ELSE stage END AS estage, quantity, ts
+          FROM event
+          WHERE ((source='shiphero' AND stage IN ('pick','pack','replenish'))
+                 OR (source='logger' AND stage='engrave'))
+            AND et_day(ts) BETWEEN %s AND %s),
+        b2 AS (SELECT person, estage, quantity, ts,
+            EXTRACT(epoch FROM (ts - lag(ts) OVER (PARTITION BY person,estage ORDER BY ts))) sg FROM base),
+        chunked AS (SELECT person, estage, quantity, ts,   -- collapse <=5s bursts into one action
+            sum(CASE WHEN sg IS NULL OR sg > %s THEN 1 ELSE 0 END)
+                OVER (PARTITION BY person,estage ORDER BY ts) cid FROM b2),
+        chunks AS (SELECT person, estage, sum(quantity) units, min(ts) ts
+                   FROM chunked GROUP BY person,estage,cid),
+        tl AS (SELECT person, estage, units, ts,   -- cross-activity timeline
+            EXTRACT(epoch FROM (ts - lag(ts) OVER (PARTITION BY person ORDER BY ts))) gap,
+            lag(estage) OVER (PARTITION BY person ORDER BY ts) pstage,
+            (ts AT TIME ZONE 'America/New_York')::date d FROM chunks),
+        iv AS (SELECT person, estage AS stage, units, gap, d FROM tl
+               WHERE pstage=estage AND gap>0 AND gap<%s)   -- continuous same activity, under the break
+        SELECT person, stage, count(*) n, count(DISTINCT d) days,
+          round(sum(gap)/60.0,1) active_min, sum(units) units,
+          round(percentile_cont(0.5) WITHIN GROUP (ORDER BY gap/nullif(units,0))::numeric,1) med_spi,
+          round(percentile_cont(0.5) WITHIN GROUP (ORDER BY gap)::numeric,1) med_move
+        FROM iv WHERE stage IN ('pick','pack','engrave','replenish')
+        GROUP BY person, stage""", [frm, to, SPEED_BURST, SPEED_BREAK])
+        rows = cur.fetchall()
+    rows_by_stage = {s: [] for s in SPEED_STAGES}
+    for (person, stage, n, days, amin, units, med_spi, med_move) in rows:
+        if not n: continue
+        n=int(n); days=int(days or 0); amin=float(amin or 0); units=int(units or 0)
+        med_spi=float(med_spi) if med_spi is not None else None
+        med_move=float(med_move) if med_move is not None else None
+        ranked = (n>=SPEED_GATE["min_intervals"] and (days or 0)>=SPEED_GATE["min_days"]
+                  and (amin or 0)>=SPEED_GATE["min_active_min"])
+        reason=""
+        if not ranked:
+            bits=[]
+            if n<SPEED_GATE["min_intervals"]: bits.append(f"only {n} timed unit"+("s" if n!=1 else ""))
+            if (days or 0)<SPEED_GATE["min_days"]: bits.append(f"only {days or 0} day"+("s" if (days or 0)!=1 else ""))
+            if (amin or 0)<SPEED_GATE["min_active_min"]: bits.append(f"only {amin or 0} active min")
+            reason=", ".join(bits)
+        active_s = float(amin)*60.0 if amin else 0
+        if SPEED_RATE[stage]=="moves":     # boxes: pace from median gap between box moves
+            med = float(med_move) if med_move is not None else None
+            throughput = round(3600.0*n/active_s) if active_s else 0
+        else:                              # items: pace from median sec/item
+            med = float(med_spi) if med_spi is not None else None
+            throughput = round(3600.0*(units or 0)/active_s) if active_s else 0
+        pace = round(3600.0/med) if med else 0
+        rows_by_stage[stage].append(dict(person=person, type=PERSON_TYPE.get(person,""),
+            pace=pace, throughput=throughput, uph=pace,   # uph=pace so the board ranks by typical pace
+            med_spi=(round(med) if med else None), n=int(n),
+            active_min=float(amin) if amin is not None else 0.0,
+            days=int(days or 0), units=int(units or 0), moves=int(n), ranked=ranked, reason=reason))
     cfg=dict(break_min=SPEED_BREAK//60, burst_s=SPEED_BURST,
              gate=SPEED_GATE, unit=SPEED_UNIT, source=SPEED_SRC, rate=SPEED_RATE)
     return jsonify(range={"from":frm,"to":to}, config=cfg, stages=rows_by_stage)
@@ -324,12 +335,12 @@ WATCH_ENGRAVERS = {"Manu Bekele","Maurice Williams","Halil Gurler"}
 @app.route("/watch")
 def watch():
     frm, to = _range()
-    try:
-        wdays=(dt.date.fromisoformat(to)-dt.date.fromisoformat(frm)).days+1
+    try:   # expected work-days = actual weekdays (Mon-Fri) in the window; 10h each => 50h in a normal week
+        d0=dt.date.fromisoformat(frm); d1=dt.date.fromisoformat(to)
+        exp_days=max(1, sum(1 for i in range((d1-d0).days+1) if (d0+dt.timedelta(days=i)).isoweekday()<=5))
     except Exception:
-        wdays=7
-    exp_days=max(1, round(wdays*WATCH["target_days_wk"]/7.0))       # expected work-days in this window
-    exp_hours=WATCH["target_day_hr"]*exp_days                       # expected floor hours in this window
+        exp_days=5
+    exp_hours=WATCH["target_day_hr"]*exp_days                       # 10h per weekday
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
         cur.execute("""
         WITH ev AS (
@@ -548,6 +559,7 @@ td.mix{white-space:nowrap;font-size:12px}
 </div>
 <div class=ctl>
   <span class=seg id=team class="seg gray"><button class=on data-v=all>Everyone</button><button data-v=FT>Full-timers</button><button data-v=Intern>Interns</button></span>
+  <span class=lbl style=margin-left:14px>Detail</span><span class=seg id=view><button class=on data-v=simple>Simple</button><button data-v=detailed>Detailed</button></span>
 </div>
 <div class=note id=summary></div>
 
@@ -738,6 +750,7 @@ function drawDetail(ppl,unit,v){
     _pack:(v.packsh?p.items_packed_sh:0)+(v.packshop?p.items_packed_shop:0),
     _eng:(v.eng?p.engraved_items:0)}));
   arr.forEach(p=>{p.share=Math.round(p.items/teamItems*100); p.rshare=Math.round(p.restock/teamRestock*100);});
+  const det=DET();
   const K={items_total:'items',orders_total:'orders',replenished:'restock',share:'share',rshare:'rshare'}[sortKey]||sortKey;
   arr.sort((a,b)=>{const x=a[K],y=b[K];return (x>y?1:(x<y?-1:0))*sortDir;});
   const arw=k=>sortKey===k?'<span class=arw>'+(sortDir<0?'▼':'▲')+'</span>':'';
@@ -746,24 +759,25 @@ function drawDetail(ppl,unit,v){
     th('person','Person','')+
     '<th class=srt onclick="sortBy(\'type\')">Type'+arw('type')+'</th>'+
     th('items_total','Fulfillment items','pick + pack + engrave')+
+    (det? th('_pick','Picked','ShipHero')+th('_pack','Packed','SH + Shopify')+th('_eng','Engraved','logger') : '')+
     th('share','Share','of team')+
     th('orders_total','Fulfillment orders','')+
     th('replenished','Restocked','separate')+
     th('rshare','Share','of team')+
     '</tr>';
-  const T={items:0,orders:0,restock:0};
+  const T={items:0,orders:0,restock:0,_pick:0,_pack:0,_eng:0};
   arr.forEach(p=>{
-    const parts=[]; if(p._pick)parts.push('Pick '+fmt(p._pick)); if(p._pack)parts.push('Pack '+fmt(p._pack)); if(p._eng)parts.push('Engrave '+fmt(p._eng));
-    const brk=parts.length?'<div class=brk>'+parts.join(' &middot; ')+'</div>':'';
-    h+='<tr><td class=name>'+p.person+'</td>'+
-      '<td><span class="badge '+(p.type==='Intern'?'in':'ft')+'">'+(p.type==='Intern'?'Intern':(p.type?'Full-timer':'—'))+'</span></td>'+
-      '<td class=fi><b>'+fmt(p.items)+'</b>'+brk+'</td>'+
+    h+='<tr><td class=name>'+p.person+'</td><td>'+badge(p.type)+'</td>'+
+      '<td class=fi><b>'+fmt(p.items)+'</b></td>'+
+      (det? '<td>'+fmt(p._pick)+'</td><td>'+fmt(p._pack)+'</td><td class=eng>'+fmt(p._eng)+'</td>' : '')+
       '<td class=shr>'+p.share+'%</td>'+
       '<td>'+fmt(p.orders)+'</td>'+
       '<td class=p><b>'+fmt(p.restock)+'</b></td>'+
       '<td class=shr>'+(p.restock?p.rshare+'%':'&mdash;')+'</td></tr>';
-    T.items+=p.items;T.orders+=p.orders;T.restock+=p.restock;});
-  h+='<tr class=tot><td>Total</td><td></td><td><b>'+fmt(T.items)+'</b></td><td>100%</td><td>'+fmt(T.orders)+'</td><td class=p><b>'+fmt(T.restock)+'</b></td><td>100%</td></tr>';
+    T.items+=p.items;T.orders+=p.orders;T.restock+=p.restock;T._pick+=p._pick;T._pack+=p._pack;T._eng+=p._eng;});
+  h+='<tr class=tot><td>Total</td><td></td><td><b>'+fmt(T.items)+'</b></td>'+
+    (det? '<td>'+fmt(T._pick)+'</td><td>'+fmt(T._pack)+'</td><td>'+fmt(T._eng)+'</td>' : '')+
+    '<td>100%</td><td>'+fmt(T.orders)+'</td><td class=p><b>'+fmt(T.restock)+'</b></td><td>100%</td></tr>';
   h+='</table>';
   document.getElementById('detail').innerHTML='<div class=tablewrap>'+h+'</div>';
 }
@@ -773,6 +787,7 @@ let FLOOR=null,floorKey=null,floorSort='items',floorDir=-1;
 let ENGR=null,engKey=null,engSort='items',engDir=-1;
 const DOWN=['','Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 function tfilter(p){const t=segval('team');return t==='all'||p.type===t;}
+function DET(){return segval('view')==='detailed';}   // Simple vs Detailed view toggle
 function badge(ty){return '<span class="badge '+(ty==='Intern'?'in':'ft')+'">'+(ty==='Intern'?'Intern':(ty?'Full-timer':'—'))+'</span>';}
 function dhead(d){return '<th class="dcol'+(d.dow>=6?' wknd':'')+'">'+DOWN[d.dow]+'<br><span class=s>'+(+d.d.slice(8))+'</span></th>';}
 function chip(u){const c=u>=80?'ugrn':(u>=55?'uamb':'ured');return '<span class="'+c+'">'+u+'%</span>';}
@@ -784,27 +799,29 @@ async function loadFloor(){const f=document.getElementById('from').value,t=docum
   catch(e){document.getElementById('floortable').innerHTML='<div class=sub>could not load floor data</div>';}}
 function floorSortBy(k){if(floorSort===k)floorDir*=-1;else{floorSort=k;floorDir=-1;}renderFloor();}
 function renderFloor(){if(!FLOOR)return;
-  const days=FLOOR.days,showDays=days.length<=16;
+  const days=FLOOR.days,showDays=DET()&&days.length<=16;
   const ppl=FLOOR.people.filter(tfilter);
   const arr=[...ppl].sort((a,b)=>{const x=a[floorSort],y=b[floorSort];return (x>y?1:(x<y?-1:0))*floorDir;});
   const arw=k=>floorSort===k?'<span class=arw>'+(floorDir<0?'▼':'▲')+'</span>':'';
   const th=(k,l,s)=>'<th class="srt'+(floorSort===k?' act':'')+'" onclick="floorSortBy(\''+k+'\')">'+l+(s?' <span class=s>'+s+'</span>':'')+arw(k)+'</th>';
-  let h='<table><tr>'+th('person','Person','')+'<th>Type</th>'+th('active_days','Days','active')+
+  let h='<table><tr>'+th('person','Person','')+'<th>Type</th>'+
+    '<th>First in</th><th>Last out</th>'+th('active_days','Days','active')+
     th('hours','Hours','active')+th('hours_per_day','Hrs/day','avg')+th('util','Util','active÷floor')+
     th('items','Items','all work')+th('items_per_day','Items/day','')+th('items_per_hr','Items/hr','UPLH');
   if(showDays)h+='<th class=dsep></th>'+days.map(dhead).join('');
-  h+='</tr>';const T={days:0,hours:0,items:0};
+  h+='</tr>';const T={hours:0,items:0};const pad='<td></td><td></td>';
   arr.forEach(p=>{const m={};p.days.forEach(x=>m[x.d]=x);
     h+='<tr><td class=name>'+p.person+'</td><td>'+badge(p.type)+'</td>'+
+      '<td>'+(p.first_in||'—')+'</td><td>'+(p.last_out||'—')+'</td>'+
       '<td>'+p.active_days+'</td><td><b>'+p.hours.toFixed(1)+'</b></td><td>'+p.hours_per_day.toFixed(1)+'</td>'+
       '<td>'+chip(p.util)+'</td><td><b>'+fmt(p.items)+'</b></td><td>'+fmt(p.items_per_day)+'</td><td><b>'+fmt(p.items_per_hr)+'</b></td>';
     if(showDays)h+='<td class=dsep></td>'+days.map(d=>{const x=m[d.d];
       if(!x||(!x.hours&&!x.ful&&!x.repl))return '<td class="dcell'+(d.dow>=6?' wknd':'')+'"><span class=dmt>·</span></td>';
-      return '<td class="dcell'+(d.dow>=6?' wknd':'')+'"><b>'+x.hours.toFixed(1)+'h</b><div class=dsub>'+fmt(x.ful+x.repl)+'</div></td>';}).join('');
-    h+='</tr>';T.days=Math.max(T.days,p.active_days);T.hours+=p.hours;T.items+=p.items;});
-  h+='<tr class=tot><td>Team</td><td></td><td></td><td><b>'+T.hours.toFixed(1)+'</b></td><td></td><td></td><td><b>'+fmt(T.items)+'</b></td><td></td><td><b>'+fmt(T.hours>0?Math.round(T.items/T.hours):0)+'</b></td>'+(showDays?'<td class=dsep></td>'+days.map(()=>'<td></td>').join(''):'')+'</tr>';
+      return '<td class="dcell'+(d.dow>=6?' wknd':'')+'" title="'+(x.first||'')+'–'+(x.last||'')+' · '+x.util+'% util"><b>'+x.hours.toFixed(1)+'h</b><div class=dsub>'+fmt(x.ful+x.repl)+'</div></td>';}).join('');
+    h+='</tr>';T.hours+=p.hours;T.items+=p.items;});
+  h+='<tr class=tot><td>Team</td><td></td>'+pad+'<td></td><td><b>'+T.hours.toFixed(1)+'</b></td><td></td><td></td><td><b>'+fmt(T.items)+'</b></td><td></td><td><b>'+fmt(T.hours>0?Math.round(T.items/T.hours):0)+'</b></td>'+(showDays?'<td class=dsep></td>'+days.map(()=>'<td></td>').join(''):'')+'</tr>';
   h+='</table>';
-  const note='<div class=sub style=margin-top:8px>Sorted by '+floorSort.replace(/_/g,' ')+'. '+(showDays?'Each day cell shows <b>hours</b> over <b>items</b>.':'Per-day breakdown hidden for ranges over ~2 weeks — narrow the dates to see it.')+' <b>Util</b> under 55% (red) means long idle stretches inside the on-floor window.</div>';
+  const note='<div class=sub style=margin-top:8px>Sorted by '+floorSort.replace(/_/g,' ')+'. <b>First in / Last out</b> = earliest and latest scan in the window. '+(showDays?'Each day cell = <b>hours</b> over <b>items</b> (hover for first–last &amp; utilization).':'Switch <b>Detail → Detailed</b> above for the day-by-day grid.')+' <b>Util</b> under 55% (red) = long idle stretches inside the on-floor window.</div>';
   document.getElementById('floortable').innerHTML='<div class=tablewrap>'+h+'</div>'+note;}
 
 async function loadEngraving(){const f=document.getElementById('from').value,t=document.getElementById('to').value,k=f+'|'+t;
@@ -814,7 +831,7 @@ async function loadEngraving(){const f=document.getElementById('from').value,t=d
   catch(e){document.getElementById('engtable').innerHTML='<div class=sub>could not load engraving data</div>';}}
 function engSortBy(k){if(engSort===k)engDir*=-1;else{engSort=k;engDir=-1;}renderEngraving();}
 function renderEngraving(){if(!ENGR)return;
-  const days=ENGR.days,showDays=days.length<=16;
+  const days=ENGR.days,showDays=DET()&&days.length<=16;
   const ppl=ENGR.engravers.filter(tfilter);
   if(!ppl.length){document.getElementById('engtable').innerHTML='<div class=sub style=margin-top:8px>No engraving in this window.</div>';return;}
   const arr=[...ppl].sort((a,b)=>{const x=a[engSort],y=b[engSort];return (x>y?1:(x<y?-1:0))*engDir;});
@@ -838,7 +855,7 @@ function renderEngraving(){if(!ENGR)return;
     h+='</tr>';T.totes+=p.totes;T.items+=p.items;T.hours+=p.hours;T.lid+=p.lid;T.ipe+=p.ipe;T.dotw+=p.dotw;});
   h+='<tr class=tot><td>Total</td><td></td><td></td><td><b>'+fmt(T.totes)+'</b></td><td><b>'+fmt(T.items)+'</b></td><td>'+T.hours.toFixed(1)+'</td><td><b>'+fmt(T.hours>0?Math.round(T.items/T.hours):0)+'</b></td><td></td><td></td><td></td><td class=mix><span class=mlid>'+fmt(T.lid)+'</span> · <span class=mipe>'+fmt(T.ipe)+'</span> · <span class=mdotw>'+fmt(T.dotw)+'</span></td>'+(showDays?'<td class=dsep></td>'+days.map(()=>'<td></td>').join(''):'')+'</tr>';
   h+='</table>';
-  const note='<div class=sub style=margin-top:8px>Each day cell shows <b>items</b> over <b>hours</b>. <b>Totes</b> = engraving jobs; <b>Items</b> = individual engravings. <b>Match</b> under 80% means some scans could not be tied to an order (usually a tote built before tote-tracking, or a mis-scan).</div>';
+  const note='<div class=sub style=margin-top:8px><b>Totes</b> = engraving jobs; <b>Items</b> = individual engravings (LID+IPE+DOTW). '+(showDays?'Each day cell = <b>items</b> over <b>hours</b>.':'Switch <b>Detail → Detailed</b> above for the day-by-day grid.')+' <b>Match</b> under 80% means some scans couldn&rsquo;t be tied to an order (a tote built before tote-tracking, or a mis-scan).</div>';
   document.getElementById('engtable').innerHTML='<div class=tablewrap>'+h+'</div>'+note;}
 async function loadAnalytics(){const f=document.getElementById('from').value,t=document.getElementById('to').value,k=f+'|'+t;
   if(!(FLOOR&&floorKey===k)){document.getElementById('analytics').innerHTML='<div class=sub>loading…</div>';
@@ -898,12 +915,12 @@ function renderSpeed(){
   if(!SPEED)return;const cfg=SPEED.config,S=SPEED.stages,g=cfg.gate;
   // ---- methodology (all assumptions visible) ----
   let m='<div class=mbox><h3>How this is measured — read me</h3>';
-  m+='Speed = <b>units per ACTIVE hour</b> &mdash; the industry &ldquo;units per labor hour&rdquo; (UPLH), but on the labor actually spent on that task.<br>';
-  m+='<b>Active hours</b> = from a person&rsquo;s <b>first scan of a task to their last</b>, with any gap of <code>&ge;'+cfg.break_min+' min</code> removed as a break (lunch, task switch, stepped away). Gaps under '+cfg.break_min+' min DO count &mdash; so genuinely slow stretches count against the rate, but time away never does. Scans within <code>'+cfg.burst_s+'s</code> merge into one action.<br>';
-  m+='<b>Replenishment</b> is ranked as <b>boxes moved per active hour</b> (each bin transfer = one box, any size) &mdash; not units/hr, which would just rank box size. The single-unit tote moves (98% of replenish scans) aren&rsquo;t replenishment and are excluded.<br>';
-  m+='<b>Sample size — ranked only if</b> a person has <code>&ge;'+g.min_intervals+' timed units</code> across <code>&ge;'+g.min_days+' days</code> with <code>&ge;'+g.min_active_min+' active min</code>; otherwise shown as &ldquo;insufficient&rdquo; with the reason.<br>';
-  m+='<b>Window:</b> uses the date range above (<b>'+SPEED.range.from+' → '+SPEED.range.to+'</b>). Prefer a recent window with several days for a fair read.<br>';
-  m+='<b>Scans only:</b> pick/pack/replenish from ShipHero, engraving from the logger. Shopify hand-fulfillment timing isn&rsquo;t granular enough for pace, and off-scanner work isn&rsquo;t captured &mdash; so this is a <b>floor on speed, not a full timesheet</b>.';
+  m+='Two numbers per person, because they answer different questions:<br>';
+  m+='&bull; <b>Pace</b> (the ranking) = how fast when hands are on the work. It&rsquo;s the <b>median time between consecutive scans of the same task</b>, turned into items/hr. Using the <b>median</b> (the middle gap) means one lunch break, a long pause, or switching tasks <b>can&rsquo;t distort it</b> — that&rsquo;s why it stays stable day-to-day and is the fair way to compare people.<br>';
+  m+='&bull; <b>Thru</b> (throughput) = items ÷ active hours on that task (active hours = consecutive same-task scans with gaps &ge;'+cfg.break_min+' min removed as breaks). Throughput is always &le; pace; the gap between them is that person&rsquo;s pauses. <b>High pace + low throughput = fast hands but stop-start</b>; low pace = genuinely slow.<br>';
+  m+='Built on each person&rsquo;s <b>whole scan timeline</b>, so a gap counts toward a task only if the scan before it was the same task — <b>switching tasks never counts against another task</b>. Scans within <code>'+cfg.burst_s+'s</code> merge into one action.<br>';
+  m+='<b>Replenishment</b> is ranked as <b>boxes/hr</b> (each bin transfer = one box, any size); single-unit tote moves (98% of replenish scans) are excluded.<br>';
+  m+='<b>Ranked only if</b> a person has <code>&ge;'+g.min_intervals+' timed units</code> across <code>&ge;'+g.min_days+' days</code>; otherwise &ldquo;insufficient&rdquo; with the reason. <b>Scans only</b> (pick/pack/replenish from ShipHero, engraving from the logger) — a <b>floor on speed, not a timesheet</b>.';
   m+='</div>';
   document.getElementById('speed_method').innerHTML=m;
   // ---- percentiles per stage (among ranked) ----
@@ -915,10 +932,10 @@ function renderSpeed(){
   let b='';
   SP_STAGES.forEach(s=>{
     const rows=S[s]||[],rk=rows.filter(r=>r.ranked).sort((a,b)=>b.uph-a.uph),un=rows.filter(r=>!r.ranked);
-    b+='<div class=card style="padding:14px 16px"><div style="font-weight:700">'+cap(s)+' <span class=sub style="font-weight:400">('+cfg.unit[s]+'/active-hr · break &ge;'+cfg.break_min+'m)</span></div>';
+    b+='<div class=card style="padding:14px 16px"><div style="font-weight:700">'+cap(s)+' <span class=sub style="font-weight:400">(pace = typical '+cfg.unit[s]+'/hr, fastest first)</span></div>';
     if(!rk.length)b+='<div class=sub style=margin-top:6px>No one has enough data yet in this window.</div>';
-    else{b+='<table style=margin-top:6px><tr><th>#</th><th style=text-align:left>Person</th><th>'+cfg.unit[s]+'/hr</th><th>med s/ea</th><th>samples</th><th>days</th></tr>';
-      rk.forEach((r,i)=>{b+='<tr><td>'+(i+1)+'</td><td class=name style=text-align:left>'+r.person+'</td><td><b style="color:'+pctColor(pct[r.person][s].p)+'">'+fmt(r.uph)+'</b></td><td>'+(r.med_spi==null?'—':r.med_spi)+'</td><td>'+r.n+'</td><td>'+r.days+'</td></tr>';});
+    else{b+='<table style=margin-top:6px><tr><th>#</th><th style=text-align:left>Person</th><th>Pace</th><th>Thru</th><th>s/ea</th><th>n</th><th>days</th></tr>';
+      rk.forEach((r,i)=>{b+='<tr><td>'+(i+1)+'</td><td class=name style=text-align:left>'+r.person+'</td><td><b style="color:'+pctColor(pct[r.person][s].p)+'">'+fmt(r.pace)+'</b></td><td class=sub>'+fmt(r.throughput)+'</td><td>'+(r.med_spi==null?'—':r.med_spi+'s')+'</td><td>'+r.n+'</td><td>'+r.days+'</td></tr>';});
       b+='</table>';}
     if(un.length)b+='<div class=sub style=margin-top:8px><b>Insufficient:</b> '+un.map(r=>r.person+' <span class=ins>('+r.reason+')</span>').join(', ')+'</div>';
     b+='</div>';
@@ -941,7 +958,7 @@ function renderSpeed(){
     x+='<td>'+(spActiveMin(S,person)/60).toFixed(1)+'</td></tr>';
   });
   x+='</table></div>';
-  x+='<div class=sub style=margin-top:8px><b>Active hrs (tracked)</b> = time between scans, breaks removed — a floor, not a full timesheet (off-scanner work isn&rsquo;t counted).</div>';
+  x+='<div class=sub style=margin-top:8px>Each cell = that person&rsquo;s <b>pace</b> (typical units/hr) with a percentile bar within the activity (green = fast). <b>Best fit</b> = where they rank highest — assign them there. <b>Active hrs (tracked)</b> = time between same-task scans, breaks removed (a floor, not a full timesheet).</div>';
   document.getElementById('speed_matrix').innerHTML=x;
 }
 // ---------------- Watch List tab ----------------
@@ -978,7 +995,7 @@ function renderWatch(){
   if(insuff.length)h+='<div class=note style=margin-top:14px><b>Not enough data to assess:</b> '+insuff.map(p=>p.person+' <span class=ins>('+p.days+' day'+(p.days===1?'':'s')+')</span>').join(', ')+'</div>';
   document.getElementById('watch_body').innerHTML=h;
 }
-document.getElementById('from').value=etAgo(7);document.getElementById('to').value=etToday();
+document.getElementById('from').value=etAgo(6);document.getElementById('to').value=etToday();
 load();
 </script></body></html>"""
 
