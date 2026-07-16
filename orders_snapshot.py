@@ -149,4 +149,10 @@ def run():
     print(f"[orders_snapshot] {len(rows)} outstanding orders snapshotted", flush=True)
 
 if __name__ == "__main__":
-    run()
+    # Never let a snapshot failure break the ingest cron: log and exit 0.
+    # A failed run leaves the previous snapshot intact (run() truncates only after
+    # a successful fetch), and the dashboard surfaces staleness from snapshot_at.
+    try:
+        run()
+    except Exception as e:
+        print(f"[orders_snapshot] ERROR (non-fatal, keeping last snapshot): {e}", flush=True)

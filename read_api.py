@@ -596,8 +596,11 @@ def outstanding():
             return jsonify(ready=False, orders=0)
         cur.execute("SELECT count(*), COALESCE(sum(total_price),0), COALESCE(sum(items_open),0), "
                     "count(*) FILTER (WHERE on_hold), COALESCE(sum(total_price) FILTER (WHERE on_hold),0), "
-                    "max(snapshot_at) FROM open_order")
-        n, val, items, nhold, valhold, snap = cur.fetchone()
+                    "max(snapshot_at), "
+                    "COALESCE(avg(EXTRACT(epoch FROM (now()-order_date))/86400.0),0), "
+                    "COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(epoch FROM (now()-order_date))/86400.0),0), "
+                    "COALESCE(max(EXTRACT(epoch FROM (now()-order_date))/86400.0),0) FROM open_order")
+        n, val, items, nhold, valhold, snap, avg_age, med_age, max_age = cur.fetchone()
         cur.execute("""
           WITH a AS (SELECT total_price, items_open,
               EXTRACT(epoch FROM (now()-order_date))/86400.0 age FROM open_order WHERE order_date IS NOT NULL)
@@ -607,9 +610,14 @@ def outstanding():
         bk = {int(b): (int(cnt), float(v or 0), int(it or 0)) for b, cnt, v, it in cur.fetchall()}
         cur.execute("""SELECT order_number, order_date, total_price, fulfillment_status, on_hold, hold_reason,
                           items_open, EXTRACT(epoch FROM (now()-order_date))/86400.0 age
-                       FROM open_order ORDER BY order_date ASC NULLS LAST LIMIT 40""")
+                       FROM open_order ORDER BY order_date ASC NULLS LAST LIMIT 50""")
         oldest = [dict(order=r[0], value=float(r[2] or 0), status=r[3], on_hold=bool(r[4]),
                        hold=r[5], items=int(r[6] or 0), age_days=round(float(r[7] or 0),1)) for r in cur.fetchall()]
+        cur.execute("""SELECT order_number, order_date, total_price, hold_reason,
+                          EXTRACT(epoch FROM (now()-order_date))/86400.0 age
+                       FROM open_order WHERE on_hold ORDER BY order_date ASC NULLS LAST LIMIT 60""")
+        holds = [dict(order=r[0], value=float(r[2] or 0), hold=r[3], age_days=round(float(r[4] or 0),1))
+                 for r in cur.fetchall()]
         cur.execute("SELECT COALESCE(fulfillment_status,'unknown'), count(*), COALESCE(sum(total_price),0) "
                     "FROM open_order GROUP BY 1 ORDER BY 2 DESC")
         status = [dict(status=r[0], count=int(r[1]), value=float(r[2] or 0)) for r in cur.fetchall()]
@@ -617,7 +625,9 @@ def outstanding():
                   items=bk.get(i,(0,0,0))[2], aged=(i>=3)) for i in range(6)]
     aged_n = sum(a["count"] for a in aging if a["aged"]); aged_v = sum(a["value"] for a in aging if a["aged"])
     return jsonify(ready=True, orders=int(n or 0), value=float(val or 0), items=int(items or 0),
-                   on_hold=int(nhold or 0), on_hold_value=float(valhold or 0),
+                   avg_value=(float(val or 0)/n if n else 0), avg_age=round(float(avg_age or 0),1),
+                   median_age=round(float(med_age or 0),1), oldest_age=round(float(max_age or 0),1),
+                   on_hold=int(nhold or 0), on_hold_value=float(valhold or 0), on_hold_orders=holds,
                    aged=aged_n, aged_value=aged_v,
                    snapshot_at=(snap.isoformat() if snap else None), aging=aging, oldest=oldest, status=status)
 
@@ -1030,8 +1040,10 @@ function tab(t){curTab=t;['dash','out','floor','log','plan','trend','engt','an',
   var sm=document.getElementById('summary');if(sm)sm.style.display=showU?'':'none';
   if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();if(t==='plan')loadPlanner();if(t==='log')loadLog();if(t==='trend')loadTrend();if(t==='out')loadOutstanding();}
 // ===== Outstanding orders (the demand-side backlog from ShipHero) =====
-let OUT=null;
+let OUT=null, outSort='age', outDir=-1, outFilter='all';
 function money(v){return '$'+Math.round(v||0).toLocaleString();}
+function oSetSort(k){if(outSort===k)outDir=-outDir;else{outSort=k;outDir=(k==='order'?1:-1);}renderOutstanding();}
+function oSetFilt(f){outFilter=f;renderOutstanding();}
 async function loadOutstanding(){var host=document.getElementById('out_body');
   try{OUT=await getj('/outstanding');}catch(e){host.innerHTML='<div class=sub>could not load outstanding orders</div>';return;}
   if(!OUT.ready){host.innerHTML='<div class=logptr style="margin-top:12px">The outstanding-orders snapshot hasn&rsquo;t run yet. Once the ShipHero orders snapshot populates, this fills in automatically.</div>';return;}
@@ -1040,37 +1052,70 @@ function renderOutstanding(){var o=OUT;
   var agedPct=o.orders?Math.round(100*o.aged/o.orders):0;
   var hero='<div class=planhero style="border-left-color:#d97706;background:linear-gradient(180deg,#fffaf3,#fff)">'+
     '<div><div class=phn style=color:#b45309>'+money(o.value)+'</div><div class=phl>owed &mdash; value of open orders</div></div>'+
-    '<div><div class=phn>'+fmt(o.orders)+'</div><div class=phl>orders outstanding'+(o.items?' &middot; '+fmt(o.items)+' items to pick':'')+'</div></div>'+
+    '<div><div class=phn>'+fmt(o.orders)+'</div><div class=phl>orders outstanding</div></div>'+
     '<div class=phd>'+fmt(o.aged)+' <b>aged</b> (3+ days) &middot; '+money(o.aged_value)+'</div></div>';
+  // secondary stats line
+  var strip='<div class=nrow style="margin:8px 0 2px;gap:20px">'+
+    '<span class=sub2><b>'+money(o.avg_value)+'</b> avg order</span>'+
+    '<span class=sub2><b>'+(o.avg_age||0).toFixed(1)+'d</b> avg age</span>'+
+    '<span class=sub2><b>'+(o.median_age||0).toFixed(1)+'d</b> median age</span>'+
+    '<span class=sub2><b>'+(o.oldest_age||0).toFixed(1)+'d</b> oldest</span></div>';
   var cmp='';
   if(o.on_hold)cmp='<div class="plancmp short" style="margin-top:10px"><b>'+fmt(o.on_hold)+'</b> orders ('+money(o.on_hold_value)+') are <b>on hold</b> in ShipHero and can&rsquo;t ship until cleared &mdash; work these first.</div>';
   else if(o.aged>0)cmp='<div class="plancmp short" style="margin-top:10px"><b>'+fmt(o.aged)+'</b> orders are aged 3+ days ('+agedPct+'% of the backlog) &mdash; prioritise the oldest below.</div>';
   else cmp='<div class="plancmp ok" style="margin-top:10px">Nothing aged past 3 days &mdash; the backlog is current.</div>';
-  // aging table
+  // aging table (with % of orders)
   var maxc=Math.max.apply(null,o.aging.map(function(a){return a.count;}).concat([1]));
   var ag='<div class=sub style="margin:16px 0 6px"><b>Aging</b> &mdash; how long orders have been waiting.</div>'+
-    '<table class=plantbl><tr><th style=text-align:left>Age</th><th>Orders</th><th></th><th>Value</th></tr>';
-  o.aging.forEach(function(a){var w=Math.round(100*a.count/maxc);var col=a.aged?(a.label.indexOf("7")===0?'#dc2626':'#d97706'):'#16a34a';
+    '<table class=plantbl><tr><th style=text-align:left>Age</th><th>Orders</th><th>%</th><th></th><th>Value</th></tr>';
+  o.aging.forEach(function(a){var w=Math.round(100*a.count/maxc);var col=a.aged?(a.label.indexOf("7")===0?'#dc2626':'#d97706'):'#16a34a';var pct=o.orders?Math.round(100*a.count/o.orders):0;
     ag+='<tr'+(a.aged?' class=plbn':'')+'><td style=text-align:left>'+a.label+(a.aged?' <span class=s style=color:#b45309>aged</span>':'')+'</td>'+
       '<td><b>'+fmt(a.count)+'</b></td>'+
+      '<td class=sub2>'+pct+'%</td>'+
       '<td style="width:180px"><div style="background:#eef2f7;border-radius:5px;height:14px;overflow:hidden"><div style="height:100%;width:'+w+'%;background:'+col+'"></div></div></td>'+
       '<td>'+money(a.value)+'</td></tr>';});
   ag+='</table>';
+  // on-hold table (dedicated)
+  var hold='';
+  if(o.on_hold_orders&&o.on_hold_orders.length){
+    hold='<div class=sub style="margin:18px 0 6px"><b>On hold</b> ('+fmt(o.on_hold)+') &mdash; flagged in ShipHero (address / payment / fraud / operator); can&rsquo;t ship until cleared.</div>'+
+      '<div class=tablewrap><table><tr><th style=text-align:left>Order</th><th>Age</th><th style=text-align:left>Hold reason</th><th>Value</th></tr>'+
+      o.on_hold_orders.map(function(r){var ac=r.age_days>=7?'ured':(r.age_days>=3?'uamb':'ugrn');
+        return '<tr><td class=name style=text-align:left>'+esc(r.order)+'</td>'+
+          '<td><span class='+ac+'>'+r.age_days.toFixed(1)+'d</span></td>'+
+          '<td style=text-align:left>'+esc(r.hold||'—')+'</td>'+
+          '<td>'+money(r.value)+'</td></tr>';}).join('')+
+      '</table></div>';}
   // status breakdown
   var st='';
   if(o.status&&o.status.length>1){st='<div class=sub style="margin:16px 0 6px"><b>By status</b></div><div class=lineup>'+
     o.status.map(function(s){return '<div class=lncol><div class=lnh>'+esc(s.status)+'</div><div class=lnrow><span>'+fmt(s.count)+' orders</span><b>'+money(s.value)+'</b></div></div>';}).join('')+'</div>';}
-  // oldest orders
-  var ol='<div class=sub style="margin:18px 0 6px"><b>Oldest open orders</b> &mdash; work these down first.</div>'+
-    '<div class=tablewrap><table><tr><th style=text-align:left>Order</th><th>Age</th><th>Value</th><th style=text-align:left>Status</th></tr>'+
-    o.oldest.map(function(r){var ac=r.age_days>=7?'ured':(r.age_days>=3?'uamb':'ugrn');
+  // oldest orders (filterable + sortable)
+  function oth(k,label,align){var ar=(outSort===k)?(outDir>0?' ▲':' ▼'):'';
+    return '<th onclick="oSetSort(\''+k+'\')" style="cursor:pointer'+(align?';text-align:'+align:'')+'">'+label+ar+'</th>';}
+  var rows=o.oldest.slice();
+  if(outFilter==='aged')rows=rows.filter(function(r){return r.age_days>=3;});
+  else if(outFilter==='hold')rows=rows.filter(function(r){return r.on_hold;});
+  rows.sort(function(a,b){if(outSort==='order')return (a.order<b.order?-1:a.order>b.order?1:0)*outDir;
+    var av=(outSort==='value'?a.value:a.age_days),bv=(outSort==='value'?b.value:b.age_days);return (av-bv)*outDir;});
+  var chips='<div class=nrow style="margin:6px 0 8px">'+
+    ['all','aged','hold'].map(function(f){var lbl={all:'All',aged:'Aged 3+ d',hold:'On hold'}[f];
+      return '<button class="pill'+(outFilter===f?' on':'')+'" onclick="oSetFilt(\''+f+'\')">'+lbl+'</button>';}).join('')+'</div>';
+  var ol='<div class=sub style="margin:18px 0 4px"><b>Oldest open orders</b> &mdash; work these down first. Click a column header to sort.</div>'+chips+
+    '<div class=tablewrap><table><tr>'+oth('order','Order','left')+oth('age','Age')+oth('value','Value')+'<th style=text-align:left>Status</th></tr>'+
+    rows.map(function(r){var ac=r.age_days>=7?'ured':(r.age_days>=3?'uamb':'ugrn');
       return '<tr><td class=name style=text-align:left>'+esc(r.order)+'</td>'+
         '<td><span class='+ac+'>'+r.age_days.toFixed(1)+'d</span></td>'+
         '<td>'+money(r.value)+'</td>'+
         '<td style=text-align:left>'+esc(r.status||'')+(r.on_hold?' <span class=s style=color:#dc2626>on hold'+(r.hold?' ('+esc(r.hold)+')':'')+'</span>':'')+'</td></tr>';}).join('')+
-    '</table></div>';
-  var stamp=o.snapshot_at?('<div class=sub style="margin-top:12px">Snapshot from '+new Date(o.snapshot_at).toLocaleString()+'.</div>'):'';
-  document.getElementById('out_body').innerHTML=hero+cmp+ag+st+ol+stamp;}
+    '</table></div>'+(rows.length?'':'<div class=sub2 style="padding:8px 2px">No orders match this filter.</div>');
+  // staleness-aware snapshot stamp
+  var stamp='';
+  if(o.snapshot_at){var ageMin=(Date.now()-new Date(o.snapshot_at).getTime())/60000;
+    var human=ageMin<60?Math.round(ageMin)+' min':(ageMin/60).toFixed(1)+' h';var stale=ageMin>120;
+    stamp='<div class=sub style="margin-top:14px">Snapshot '+human+' ago &middot; '+new Date(o.snapshot_at).toLocaleString()+
+      (stale?' &middot; <span style="color:#b45309;font-weight:600">may be stale &mdash; auto-refresh pending</span>':'')+'.</div>';}
+  document.getElementById('out_body').innerHTML=hero+strip+cmp+ag+hold+st+ol+stamp;}
 function dateEdit(){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.remove('on'));load();}   // manual date change: drop preset highlight + reload
 function preset(p){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.toggle('on',b.dataset.preset===p));
   let f=etToday(),t=etToday();
