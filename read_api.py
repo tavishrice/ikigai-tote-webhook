@@ -612,6 +612,8 @@ h1{margin:0;font-size:22px;font-weight:700;letter-spacing:-.02em}
 .tab.on{color:var(--accent);border-bottom-color:var(--accent)}
 .ctl{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:11px}
 .ctl .lbl{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;font-weight:600;margin-right:2px}
+.arf{font-size:12.5px;color:var(--ink-2);display:inline-flex;align-items:center;gap:5px;cursor:pointer;font-weight:600}
+.arf input{cursor:pointer;width:15px;height:15px}
 .seg{display:inline-flex;background:#0f172a;border-radius:var(--r-sm);padding:3px;gap:2px}
 .seg button{border:0;background:transparent;color:#cbd5e1;padding:6px 13px;border-radius:6px;font:inherit;font-size:12.5px;font-weight:600;cursor:pointer;transition:background .12s,color .12s}
 .seg button:hover{color:#fff}
@@ -813,6 +815,10 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
   <button class=pill data-preset=30 onclick="preset('30')">Last 30 days</button>
   <input type=date id=from onchange="dateEdit()"> <span style=color:#9ca3af>to</span> <input type=date id=to onchange="dateEdit()">
   <button class=pill onclick="load()">Apply</button><span id=status></span>
+  <span class=spacer></span>
+  <label class=arf title="Auto-refresh — for leaving on a wall or TV display"><input type=checkbox id=autoref onchange="toggleAuto()"> Auto-refresh</label>
+  <select id=autoint class=nin style="padding:5px 6px" onchange="toggleAuto()"><option value=2>2 min</option><option value=5 selected>5 min</option><option value=15>15 min</option></select>
+  <span id=refstamp class=sub></span>
 </div>
 <div class=ctl id=ctl1>
   <span class=lbl>Unit</span><span class=seg id=unit><button class=on data-v=both>Both</button><button data-v=items>Items</button><button data-v=orders>Orders</button></span>
@@ -917,10 +923,11 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 <div id=plan class=hide>
   <div class=card>
     <h2>Day plan <span style="color:#9ca3af;font-weight:400">&mdash; who&rsquo;s in, where they go, and will we clear the orders</span></h2>
-    <div class=sub style=margin:0>Set who&rsquo;s on the floor today and their hours (10 is a full day here). <b>Auto-assign</b> finds the pick/pack split that <b>maximizes total orders</b> &mdash; it uses each person&rsquo;s own all-time pace and comparative advantage (a 300-pick / 56-pack rep is worth far more on pick than a 170 / 30 rep), not team averages. Override any <b>station</b> yourself, flip anyone <b>in/out</b>, or change <b>hours</b>, and the orders, bottleneck and verdict recompute live. Restock / receiving / returns &rarr; set the person to <b>Other</b>.</div>
+    <div class=sub style=margin:0>Set who&rsquo;s on the floor and their hours (10 = a full day), and a realistic <b>Utilization %</b> (nobody runs at peak pace for 10 hours straight). <b>Auto-assign</b> pours every person-hour into whatever station is the current bottleneck, using each person&rsquo;s own all-time pace &mdash; so engraving only draws the few hours its demand needs and every spare hour (over-capacity pickers, extra engravers) cascades to the bottleneck. It will <b>split</b> a person&rsquo;s day when that&rsquo;s optimal (e.g. 2h engrave + 8h pack, shown next to their output). Override any <b>station</b>, flip <b>in/out</b>, or change <b>hours</b> and it recomputes live. Restock / receiving / returns &rarr; <b>Other</b>.</div>
     <div class=planbar>
       <div class=lf><label>Order target</label><input id=pl_orders type=number min=0 step=10 oninput=planCompute()></div>
       <div class=lf><label>Default hours</label><input id=pl_defhrs type=number min=1 max=14 step=0.5 value=10 oninput=planCompute()></div>
+      <div class=lf><label>Utilization %</label><input id=pl_util type=number min=10 max=100 step=5 value=80 oninput=planCompute() title="Nobody works at peak pace for 10 hours straight — this discounts every rate to a realistic sustained level."></div>
       <div class=lf><label>&nbsp;</label><button class=pill onclick="planAllHours()">Set all to default</button></div>
       <div class=lf><label>&nbsp;</label><button class="pill add" onclick="planRecommend()">Auto-assign</button></div>
     </div>
@@ -959,7 +966,8 @@ function etAgo(n){return etDstr(new Date(Date.now()-n*86400000));}
 function segval(id){return document.querySelector('#'+id+' button.on').dataset.v;}
 function seg(id,v){document.querySelectorAll('#'+id+' button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));render();}
 document.querySelectorAll('.seg').forEach(s=>s.addEventListener('click',e=>{if(e.target.dataset.v){seg(s.id,e.target.dataset.v);}}));
-function tab(t){['dash','floor','log','plan','trend','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
+let curTab='dash';
+function tab(t){curTab=t;['dash','floor','log','plan','trend','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
   document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('on',el.dataset.tab===t));
   // Only show the controls a tab actually uses (Unit/Stage/Source + exports = Dashboard only;
   // Team/Detail = Dashboard/Floor/Engraving/Analytics), so no toggle is ever an inert no-op.
@@ -984,6 +992,30 @@ async function load(){document.getElementById('status').textContent='loading…'
   if(!document.getElementById('speed').classList.contains('hide')){speedKey=null;loadSpeed();}
   if(!document.getElementById('watch').classList.contains('hide')){watchKey=null;loadWatch();}
   }catch(e){document.getElementById('status').textContent='could not reach API';}}
+// ---- Auto-refresh (leave it on a wall / TV): re-pull live data on an interval, no full page reload ----
+let autoTimer=null, wakeLock=null;
+function stampRefresh(){var el=document.getElementById('refstamp');if(el)el.textContent='updated '+new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});}
+async function refreshNow(){
+  var a=document.activeElement;   // don't rebuild / steal focus while someone is editing an input
+  if(a&&/^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName)&&a.id!=='autoref'&&a.id!=='autoint')return;
+  speedKey=null;floorKey=null;watchKey=null;engKey=null;pspeedKey=null;
+  await load();
+  if(curTab==='engt')loadEngraving(); else if(curTab==='an')loadAnalytics();
+  else if(curTab==='plan')loadPlanner(); else if(curTab==='trend')loadTrendData(); else if(curTab==='log')loadLog();
+  stampRefresh();
+}
+async function reqWake(){try{if('wakeLock' in navigator)wakeLock=await navigator.wakeLock.request('screen');}catch(e){}}
+function relWake(){try{if(wakeLock){wakeLock.release();wakeLock=null;}}catch(e){}}
+document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'&&autoTimer)reqWake();});
+function toggleAuto(){
+  var on=document.getElementById('autoref').checked, mins=parseInt(document.getElementById('autoint').value,10)||5;
+  try{localStorage.setItem('wh_auto',on?mins:'0');}catch(e){}
+  if(autoTimer){clearInterval(autoTimer);autoTimer=null;}
+  if(on){autoTimer=setInterval(refreshNow, mins*60*1000);reqWake();refreshNow();}
+  else{relWake();var el=document.getElementById('refstamp');if(el)el.textContent='';}
+}
+function initAuto(){try{var v=parseInt(localStorage.getItem('wh_auto')||'0',10);
+  if(v>0){document.getElementById('autoref').checked=true;var s=document.getElementById('autoint');if(s&&[2,5,15].indexOf(v)>=0)s.value=v;toggleAuto();}}catch(e){}}
 function fmt(n){return (n||0).toLocaleString();}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function ampm(iso){if(!iso)return '';return new Date(iso).toLocaleTimeString([], {hour:'numeric',minute:'2-digit',timeZone:'America/New_York'})+' ET';}
@@ -1322,34 +1354,56 @@ function planRenderRoster(){var host=document.getElementById('plan_roster');if(!
     '<td style=text-align:left><select class=plsel id=plsel_'+i+' onchange="planEdit()">'+planStationOpts(p,p.assign)+'</select></td>'+
     '<td id=plout_'+i+'></td></tr>';});
   host.innerHTML=h+'</table>';}
-function planToggleIn(i){PLAN.people[i].inn=document.getElementById('plin_'+i).checked;
+function planToggleIn(i){PLAN.people[i].inn=document.getElementById('plin_'+i).checked;PLAN.people[i].alloc=null;
   var tr=document.getElementById('plros').rows[i+1];if(tr)tr.className=PLAN.people[i].inn?'':'plout';planCompute();}
-function planEdit(){PLAN.people.forEach(function(p,i){var hv=document.getElementById('plhrs_'+i);if(hv)p.hours=parseFloat(hv.value)||0;
-  var sv=document.getElementById('plsel_'+i);if(sv)p.assign=sv.value;});planCompute();}
-function planAllHours(){var def=num('pl_defhrs',10)||10;PLAN.people.forEach(function(p,i){p.hours=def;var el=document.getElementById('plhrs_'+i);if(el)el.value=def;});planCompute();}
-// Auto-assign finds the pick/pack split that maximizes orders (min of the two stage capacities) — the true
-// optimum by comparative advantage, not an average. Exact search when the crew is small; greedy if huge.
+function planEdit(){PLAN.people.forEach(function(p,i){
+  var hv=document.getElementById('plhrs_'+i), sv=document.getElementById('plsel_'+i);
+  var nh=hv?(parseFloat(hv.value)||0):p.hours, ns=sv?sv.value:p.assign;
+  if(nh!==p.hours||ns!==p.assign)p.alloc=null;   // person edited by hand -> drop their auto-split, honour the manual choice
+  p.hours=nh;p.assign=ns;});planCompute();}
+function planAllHours(){var def=num('pl_defhrs',10)||10;PLAN.people.forEach(function(p,i){p.hours=def;p.alloc=null;var el=document.getElementById('plhrs_'+i);if(el)el.value=def;});planCompute();}
+// Auto-assign: find the exact-optimal pick/pack split (max-min by comparative advantage), and reserve ONLY
+// the engraver-hours the engraving demand needs — iterated so it converges to the achievable order count.
+// Every spare hour (an over-capacity picker, an engraver past what's needed) cascades to the bottleneck.
+// A person can be SPLIT (e.g. 8h engrave + 2h pack) when that's optimal.
 function planRecommend(silent){if(!PLAN)return;
-  var ipoP=PLAN.ipo.pick>0.2?PLAN.ipo.pick:3.5, ipoK=PLAN.ipo.pack>0.2?PLAN.ipo.pack:3.5;
-  var R=[];PLAN.people.forEach(function(p,i){if(p.inn){p.assign='Other';R.push(i);}});
-  if(R.length){
-    if(R.length<=18){var nC=1<<R.length, best=null;
-      for(var m=0;m<nC;m++){var pc=0,kc=0;
-        for(var j=0;j<R.length;j++){var p=PLAN.people[R[j]];if(m&(1<<j))pc+=p.pick*p.hours; else kc+=p.pack*p.hours;}
-        var ord=Math.min(pc/ipoP,kc/ipoK); if(best===null||ord>best.o)best={o:ord,m:m};}
-      for(var j2=0;j2<R.length;j2++)PLAN.people[R[j2]].assign=(best.m&(1<<j2))?'Pick':'Pack';
-    }else{var cap={Pick:0,Pack:0}, un=R.slice(), g=0;
-      while(un.length&&g++<500){var oP=cap.Pick/ipoP,oK=cap.Pack/ipoK,st=oP<=oK?'Pick':'Pack',rk=st==='Pick'?'pick':'pack';
-        var bi=-1,br=-1;un.forEach(function(i,jj){var r=PLAN.people[i][rk];if(r>br){br=r;bi=jj;}});
-        if(bi<0)break; var pi=un.splice(bi,1)[0];PLAN.people[pi].assign=st;cap[st]+=PLAN.people[pi][rk]*PLAN.people[pi].hours;}}}
+  var ipoP=PLAN.ipo.pick>0.2?PLAN.ipo.pick:3.5, ipoK=PLAN.ipo.pack>0.2?PLAN.ipo.pack:3.5, ipoE=PLAN.ipo.engrave||0;
+  var crew=[];PLAN.people.forEach(function(p,i){p.alloc=null;if(p.inn){p.assign='Other';crew.push(i);}});
+  if(!crew.length){if(!silent){planRenderRoster();planCompute();}return;}
+  function bestPP(idxs,hoursOf){   // optimal pick/pack partition; exact for <=18, greedy above
+    if(idxs.length<=18){var nC=1<<idxs.length,best={o:-1,m:0};
+      for(var m=0;m<nC;m++){var pc=0,kc=0;for(var j=0;j<idxs.length;j++){var p=PLAN.people[idxs[j]],h=hoursOf(idxs[j]);if(m&(1<<j))pc+=p.pick*h;else kc+=p.pack*h;}
+        var o=Math.min(pc/ipoP,kc/ipoK);if(o>best.o)best={o:o,m:m};}
+      var a={};for(var q=0;q<idxs.length;q++)a[idxs[q]]=(best.m&(1<<q))?'Pick':'Pack';return {o:best.o,asg:a};}
+    var cap={Pick:0,Pack:0},un=idxs.slice(),g=0,asg={};
+    while(un.length&&g++<600){var st=(cap.Pick/ipoP<=cap.Pack/ipoK)?'Pick':'Pack',rk=st==='Pick'?'pick':'pack',bi=-1,br=-1;
+      un.forEach(function(i,jj){var r=PLAN.people[i][rk];if(r>br){br=r;bi=jj;}});if(bi<0)break;var pi=un.splice(bi,1)[0];asg[pi]=st;cap[st]+=PLAN.people[pi][rk]*hoursOf(pi);}
+    return {o:Math.min(cap.Pick/ipoP,cap.Pack/ipoK),asg:asg};}
+  var engers=crew.filter(function(i){return PLAN.people[i].eng>0;}).sort(function(a,b){return PLAN.people[b].eng-PLAN.people[a].eng;});
+  var ordEst=bestPP(crew,function(i){return PLAN.people[i].hours;}).o, engH={}, asg={};
+  var ppH=function(i){return PLAN.people[i].hours-(engH[i]||0);};
+  for(var it=0;it<6;it++){
+    engH={}; var need=(ipoE>0?ordEst*ipoE:0);
+    for(var e=0;e<engers.length&&need>0.5;e++){var ei=engers[e],er=PLAN.people[ei].eng,H=PLAN.people[ei].hours,use=Math.min(H,need/er);engH[ei]=use;need-=use*er;}
+    var ppCrew=crew.filter(function(i){return ppH(i)>0.05;});
+    var bp=bestPP(ppCrew,ppH); asg=bp.asg;
+    var cP=0,cK=0,cE=0;crew.forEach(function(i){var eh=engH[i]||0,ph=ppH(i);cE+=PLAN.people[i].eng*eh;if(asg[i]==='Pick')cP+=PLAN.people[i].pick*ph;else if(asg[i]==='Pack')cK+=PLAN.people[i].pack*ph;});
+    var o=Math.min(cP/ipoP,cK/ipoK,(ipoE>0?cE/ipoE:1e12));
+    if(Math.abs(o-ordEst)<1){ordEst=o;break;} ordEst=o;}
+  crew.forEach(function(i){var eH=engH[i]||0, pH=ppH(i), st=asg[i]||(PLAN.people[i].pack>=PLAN.people[i].pick?'Pack':'Pick');
+    if(eH>0.1&&pH>0.1){var a={Pick:0,Pack:0,Engrave:eH};a[st]=pH;PLAN.people[i].alloc=a;PLAN.people[i].assign=(eH>=pH?'Engrave':st);}
+    else if(eH>0.1){PLAN.people[i].alloc=null;PLAN.people[i].assign='Engrave';}
+    else{PLAN.people[i].alloc=null;PLAN.people[i].assign=st;}});
   if(!silent){planRenderRoster();planCompute();}}
 function planCompute(){if(!PLAN)return;
-  var N=num('pl_orders',0);
+  var N=num('pl_orders',0), util=num('pl_util',80)/100; if(!(util>0))util=0.8;
   var cap={Pick:0,Pack:0,Engrave:0}, hrs={Pick:0,Pack:0,Engrave:0,Other:0}, nA={Pick:0,Pack:0,Engrave:0,Other:0};
-  PLAN.people.forEach(function(p,i){var out=0;
-    if(p.inn){var a=p.assign, rate=(a==='Pick'?p.pick:a==='Pack'?p.pack:a==='Engrave'?p.eng:0);
-      out=Math.round(rate*p.hours); if(cap[a]!=null)cap[a]+=out; if(hrs[a]!=null)hrs[a]+=p.hours; nA[a]=(nA[a]||0)+1;}
-    set('plout_'+i, p.inn?(out?fmt(out)+' items':'<span class=dmt>—</span>'):'<span class=dmt>out</span>');});
+  function rt(p,st){return st==='Pick'?p.pick:st==='Pack'?p.pack:st==='Engrave'?p.eng:0;}
+  PLAN.people.forEach(function(p,i){var out=0,label='';
+    if(p.inn){
+      if(p.alloc){var segs=[];['Pick','Pack','Engrave'].forEach(function(st){var h=p.alloc[st]||0;if(h>0.05){var it=Math.round(rt(p,st)*h*util);out+=it;cap[st]+=it;hrs[st]+=h;nA[st]++;segs.push(st.slice(0,2)+' '+h.toFixed(1)+'h');}});label=segs.join(' · ');}
+      else{var a=p.assign,it=Math.round(rt(p,a)*p.hours*util);out=it;if(cap[a]!=null)cap[a]+=it;if(hrs[a]!=null)hrs[a]+=p.hours;nA[a]=(nA[a]||0)+1;}}
+    set('plout_'+i, p.inn?((out?'<b>'+fmt(out)+'</b> items':'<span class=dmt>—</span>')+(label?' <span class=s>'+label+'</span>':'')):'<span class=dmt>out</span>');});
   var ipoP=PLAN.ipo.pick>0.2?PLAN.ipo.pick:3.5, ipoK=PLAN.ipo.pack>0.2?PLAN.ipo.pack:3.5, ipoE=PLAN.ipo.engrave||0;
   var oPick=cap.Pick/ipoP, oPack=cap.Pack/ipoK, orders=Math.floor(Math.min(oPick,oPack));
   var bneck=oPick<=oPack?'Pick':'Pack';
@@ -1593,7 +1647,7 @@ function renderWatch(){
   document.getElementById('watch_body').innerHTML=h;
 }
 document.getElementById('from').value=etAgo(6);document.getElementById('to').value=etToday();
-load();
+load();initAuto();
 </script></body></html>"""
 
 if __name__ == "__main__":
