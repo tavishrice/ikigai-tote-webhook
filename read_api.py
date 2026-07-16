@@ -433,6 +433,53 @@ def speed():
              gate=SPEED_GATE, unit=SPEED_UNIT, source=SPEED_SRC, rate=SPEED_RATE)
     return jsonify(range={"from":frm,"to":to}, config=cfg, stages=rows_by_stage)
 
+@app.route("/trend")
+def trend():
+    """One person's PACE trend over time. Same robust median-sec-per-item method as /speed, but bucketed
+    by ISO week per activity, so you can see whether someone is getting faster (a new hire ramping, say).
+    pace = items/hr from the median gap between consecutive same-activity chunks; units = throughput volume.
+    Weeks with too few timed items show volume only (pace null)."""
+    person=(request.args.get("person") or "").strip()
+    if not person: return jsonify(ok=False, error="need a person"), 400
+    try: wks=max(2, min(26, int(request.args.get("weeks") or 8)))
+    except Exception: wks=8
+    to = request.args.get("to") or (dt.datetime.now(_ET).date()).isoformat()
+    frm = request.args.get("from") or (dt.date.fromisoformat(to) - dt.timedelta(days=wks*7-1)).isoformat()
+    MIN_N = 8   # min timed items in a week to trust that week's pace
+    with connect() as c, c.cursor(row_factory=tuple_row) as cur:
+        cur.execute("""
+        WITH base AS (
+          SELECT CASE WHEN stage='replenish' AND ((raw->>'reason') ILIKE '%%tote%%' OR coalesce(quantity,0)<=1)
+                      THEN 'move_tote' ELSE stage END AS estage, quantity, ts
+          FROM event
+          WHERE person=%s AND ((source='shiphero' AND stage IN ('pick','pack','replenish'))
+                               OR (source='logger' AND stage='engrave'))
+            AND et_day(ts) BETWEEN %s AND %s),
+        b2 AS (SELECT estage, quantity, ts,
+            EXTRACT(epoch FROM (ts - lag(ts) OVER (PARTITION BY estage ORDER BY ts))) sg FROM base),
+        chunked AS (SELECT estage, quantity, ts,
+            sum(CASE WHEN sg IS NULL OR sg > %s THEN 1 ELSE 0 END) OVER (PARTITION BY estage ORDER BY ts) cid FROM b2),
+        chunks AS (SELECT estage, sum(quantity) units, min(ts) ts FROM chunked GROUP BY estage,cid),
+        tl AS (SELECT estage, units, ts,
+            EXTRACT(epoch FROM (ts - lag(ts) OVER (ORDER BY ts))) gap,
+            lag(estage) OVER (ORDER BY ts) pstage FROM chunks),
+        iv AS (SELECT estage AS stage, units, gap,
+            (date_trunc('week',(ts AT TIME ZONE 'America/New_York'))::date) wk
+            FROM tl WHERE pstage=estage AND gap>0 AND gap<%s)
+        SELECT wk, stage, count(*) n, sum(units) units,
+          round(percentile_cont(0.5) WITHIN GROUP (ORDER BY gap/nullif(units,0))::numeric,1) med_spi
+        FROM iv WHERE stage IN ('pick','pack','engrave')
+        GROUP BY wk, stage ORDER BY wk""", [person, frm, to, SPEED_BURST, SPEED_BREAK])
+        rows = cur.fetchall()
+    wkmap = {}
+    for (wk, stage, n, units, med_spi) in rows:
+        w = wkmap.setdefault(str(wk), {"wk": str(wk)})
+        n=int(n or 0); units=int(units or 0); med=float(med_spi) if med_spi is not None else None
+        uph = round(3600.0/med) if (med and n>=MIN_N) else None
+        w[stage] = dict(uph=uph, units=units, n=n)
+    weeks = [wkmap[k] for k in sorted(wkmap.keys())]
+    return jsonify(ok=True, person=person, range={"from":frm,"to":to}, min_n=MIN_N, weeks=weeks)
+
 # ---------------- Watch List (metric-based flags) ----------------
 # A single metric always lies: pace ignores whether you showed up; hours ignore whether you worked.
 # So this looks at pace + hours + UTILIZATION (active/floor) + output + attendance + consistency together,
@@ -680,6 +727,10 @@ td.sub2{color:var(--muted)}
 .lnh{font-weight:700;font-size:12.5px;margin-bottom:6px;color:var(--ink-2)}
 .lnrow{display:flex;justify-content:space-between;font-size:12px;padding:2px 0}
 .lnrow b{font-variant-numeric:tabular-nums}
+.logptr{margin-top:14px;font-size:12.5px;color:var(--muted);background:#f7f9fc;border:1px solid var(--line);border-radius:9px;padding:9px 13px}
+.tablink{color:var(--accent);font-weight:700;cursor:pointer}.tablink:hover{text-decoration:underline}
+.trendkpis{display:flex;gap:14px;flex-wrap:wrap;margin:12px 0 6px}
+.trendkpi{font-size:13px;background:#fbfcfe;border:1px solid var(--line);border-radius:9px;padding:8px 12px}
 /* Log off-scanner time card */
 .logcard{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:#fbfcfe;margin-top:16px}
 .logtitle{font-size:13px;font-weight:700;color:var(--ink-2);margin-bottom:10px}
@@ -731,7 +782,9 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 <div class=tabs>
   <div class="tab on" data-tab=dash onclick="tab('dash')">Dashboard</div>
   <div class=tab data-tab=floor onclick="tab('floor')">Floor Time</div>
+  <div class=tab data-tab=log onclick="tab('log')">Log time</div>
   <div class=tab data-tab=plan onclick="tab('plan')">Planner</div>
+  <div class=tab data-tab=trend onclick="tab('trend')">Trends</div>
   <div class=tab data-tab=speed onclick="tab('speed')">Speed &amp; Rankings</div>
   <div class=tab data-tab=engt onclick="tab('engt')">Engraving</div>
   <div class=tab data-tab=watch onclick="tab('watch')">Watch List</div>
@@ -784,8 +837,16 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
     <div class=sub style=margin:0>The headline <b>Hours</b> is the raw window from a person&rsquo;s <b>first scan to their last</b> (First in &rarr; Last out) &mdash; the default measure of time on the floor, and the one we trust most today. <b>Active</b> strips 45-min+ breaks out of that window; it&rsquo;s a stricter, still-maturing calculation, so it sits beside Hours rather than replacing it. The gap between them is break / off-scanner time &mdash; log the real off-scanner work under <b>Proj h</b> to keep it honest. <b>Util</b> = active &divide; span; <b>Items/hr</b> = units per floor-hour. All floor work (pick + pack + engrave + restock), Eastern time.</div>
     <div id=floorcover></div>
     <div id=floortable></div>
+    <div class=logptr>Off-scanner work (returns, cleanup, meetings, training) is logged in the <b><span class=tablink onclick="tab('log')">Log time</span></b> tab &mdash; it feeds the <b>Proj h</b> column and the coverage bars above.</div>
+  </div>
+</div>
+
+<div id=log class=hide>
+  <div class=card>
+    <h2>Log time <span style="color:#9ca3af;font-weight:400">&mdash; account for real work that doesn&rsquo;t hit a scanner</span></h2>
+    <div class=sub style=margin:0>Returns, floor resets, receiving, cleanup, meetings, training &mdash; the work that never scans. Logging it here closes each person&rsquo;s unexplained-time gap (see the coverage bars on <span class=tablink onclick="tab('floor')">Floor Time</span>) and feeds their <b>Proj h</b>. Pick a person and a date and their scan schedule appears &mdash; tap any gap to fill it in.</div>
     <div class=logcard>
-      <div class=logtitle>Log off-scanner time <span class=s>&mdash; returns, cleanup, meetings, training: real work that doesn&rsquo;t hit a scanner</span></div>
+      <div class=logtitle>Log off-scanner time</div>
       <div class=logrow>
         <div class=lf><label>Person</label>
           <select id=n_person onchange="onPersonPick()"><option value="">Select&hellip;</option></select>
@@ -852,6 +913,20 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
   </div>
 </div>
 
+<div id=trend class=hide>
+  <div class=card>
+    <h2>Individual trends <span style="color:#9ca3af;font-weight:400">&mdash; is this person getting faster over time?</span></h2>
+    <div class=sub style=margin:0>One person&rsquo;s pace (items/hr) week by week, per activity, using the robust median method (typical time per item, pauses ignored). Great for watching a new hire ramp. History starts when scan-tracking began, so early weeks may be short and will fill in over time.</div>
+    <div class=planbar>
+      <div class=lf><label>Person</label><select id=tr_person onchange="loadTrendData()"></select></div>
+      <div class=lf><label>Weeks</label><select id=tr_weeks onchange="loadTrendData()"><option>8</option><option selected>12</option><option>20</option></select></div>
+    </div>
+    <div id=tr_summary></div>
+    <div class=chartwrap style="max-width:840px"><canvas id=trendChart></canvas></div>
+    <div id=tr_table></div>
+  </div>
+</div>
+
 <div class=foot>
   <b>Chart colours:</b> <span class=s-sh>Picked&middot;ShipHero</span>, <span style=color:#16a34a>Packed&middot;ShipHero</span>, <span class=s-shop>Packed&middot;Shopify</span>, <span class=s-eng>Engraved</span> &mdash; these four stack into the <b>Fulfillment</b> bar. <span class=s-repl>Replenished</span> is drawn as its own separate bar (a parallel track, never added into the fulfillment/items total).
 </div>
@@ -865,9 +940,9 @@ function etAgo(n){return new Date(Date.now()-4*3600*1000-n*86400000).toISOString
 function segval(id){return document.querySelector('#'+id+' button.on').dataset.v;}
 function seg(id,v){document.querySelectorAll('#'+id+' button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));render();}
 document.querySelectorAll('.seg').forEach(s=>s.addEventListener('click',e=>{if(e.target.dataset.v){seg(s.id,e.target.dataset.v);}}));
-function tab(t){['dash','floor','plan','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
+function tab(t){['dash','floor','log','plan','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
   document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('on',el.dataset.tab===t));
-  if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();if(t==='plan')loadPlanner();}
+  if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();if(t==='plan')loadPlanner();if(t==='log')loadLog();if(t==='trend')loadTrend();}
 function preset(p){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.toggle('on',b.dataset.preset===p));
   let f=etToday(),t=etToday();
   if(p==='yest'){f=t=etAgo(1);}else if(p==='7'){f=etAgo(6);}else if(p==='30'){f=etAgo(29);}
@@ -1088,8 +1163,7 @@ function renderCoverage(ppl){var cw=document.getElementById('floorcover');if(!cw
       '<div class=covbar><i class=cov-sc style="width:'+w(r.sc)+'%"></i><i class=cov-lg style="width:'+w(r.lg)+'%"></i><i class=cov-un style="width:'+w(r.unex)+'%"></i></div>'+
       '<div class=covmeta><b>'+r.sp.toFixed(1)+'h</b> on floor'+(r.unex>0.05?' &middot; '+r.unex.toFixed(1)+'h gap <span class=covlog onclick="covLogFor(\''+r.person.replace(/'/g,"\\'")+'\')">&#43; log</span>':' &middot; <span style="color:#15803d">clear</span>')+'</div></div>';});
   h+='</div>';cw.innerHTML=h;}
-function covLogFor(person){var sel=document.getElementById('n_person');if(sel){sel.value=person;onPersonPick();}
-  var el=document.querySelector('.logcard');if(el)el.scrollIntoView({behavior:'smooth',block:'center'});}
+function covLogFor(person){tab('log');var sel=document.getElementById('n_person');if(sel){sel.value=person;onPersonPick();}}
 function renderFloor(){if(!FLOOR)return;
   const days=FLOOR.days,showDays=DET()&&days.length<=16;
   const ppl=FLOOR.people.filter(tfilter);
@@ -1119,12 +1193,16 @@ function renderFloor(){if(!FLOOR)return;
   h+='</table>';
   const note='<div class=sub style=margin-top:8px>Sorted by '+floorSort.replace(/_/g,' ')+'. <b>Hours (1st&rarr;last)</b> is the default measure of time on the floor — earliest to latest scan. <b>Active</b> strips 45-min+ breaks out of that window (a stricter, still-maturing calculation, so we lead with the fuller number). The gap between them is what <b>Proj h</b> is for — log real off-scanner work (returns, cleanup, meetings) below and it becomes accounted-for time instead of a mystery gap. '+(showDays?'Day cell = <b>span h</b> over <b>items</b> (hover for active + util).':'Switch <b>Detail → Detailed</b> for the day-by-day grid.')+'</div>';
   document.getElementById('floortable').innerHTML='<div class=tablewrap>'+h+'</div>'+note;
-  // roster dropdown + existing-notes list for the annotation panel
-  fillRoster();
+  renderLogPanel();}
+// The Log-time tab shares the roster + notes list; keep it fresh whenever floor or log loads.
+function renderLogPanel(){fillRoster();if(!FLOOR)return;
   const allNotes=[];FLOOR.people.forEach(p=>(p.notes||[]).forEach(n=>allNotes.push(Object.assign({person:p.person},n))));
   allNotes.sort((a,b)=>a.d<b.d?1:-1);
   const nl=document.getElementById('n_list');
-  if(nl)nl.innerHTML=allNotes.length?('<div class=schead style=margin-top:12px><b>Logged off-scanner time</b> in this range</div><div>'+allNotes.map(n=>'<span class=notechip><b>'+n.person+'</b> '+n.d+(n.hours?' · '+n.hours+'h':'')+(n.note?' · '+n.note:'')+' <span class=x title="delete" onclick="delNote('+n.id+')">✕</span></span>').join('')+'</div>'):'';}
+  if(nl)nl.innerHTML=allNotes.length?('<div class=schead style="margin-top:10px"><b>Logged off-scanner time</b> in this range</div><div>'+allNotes.map(n=>'<span class=notechip><b>'+n.person+'</b> '+n.d+(n.hours?' · '+n.hours+'h':'')+(n.note?' · '+n.note:'')+' <span class=x title="delete" onclick="delNote('+n.id+')">✕</span></span>').join('')+'</div>'):'<div class=sub style="margin-top:8px">No off-scanner time logged in this range yet.</div>';}
+async function loadLog(){const f=document.getElementById('from').value,t=document.getElementById('to').value,k=f+'|'+t;
+  if(!(FLOOR&&floorKey===k)){try{FLOOR=await getj('/floor?from='+f+'&to='+t);floorKey=k;}catch(e){}}
+  renderLogPanel();var d=document.getElementById('n_date');if(d&&!d.value)d.value=t||etToday();}
 
 function nRoster(){const s=new Set();if(DATA&&DATA.people)DATA.people.forEach(p=>s.add(p.person));if(FLOOR&&FLOOR.people)FLOOR.people.forEach(p=>s.add(p.person));return [...s].sort((a,b)=>a.localeCompare(b));}
 function fillRoster(){const sel=document.getElementById('n_person');if(!sel)return;const cur=sel.value;
@@ -1243,6 +1321,38 @@ function planLineup(){if(!SPEED||!SPEED.stages)return '';
     h+='</div>';});
   return h+'</div>';}
 function planReset(){if(!PLAN)return;PLAN.act.forEach(function(a){var el=document.getElementById('pl_rate_'+a.key);if(el)el.value=Math.round(a.rate);});planCompute();}
+
+// ===== Individual trends: one person's weekly pace per activity =====
+let TREND=null, trendChartObj=null;
+function loadTrend(){var sel=document.getElementById('tr_person');
+  if(sel&&sel.options.length===0){var r=nRoster();sel.innerHTML=r.map(function(n){return '<option>'+n+'</option>';}).join('');}
+  if(sel&&!sel.value&&sel.options.length)sel.value=sel.options[0].value;
+  loadTrendData();}
+async function loadTrendData(){var person=(document.getElementById('tr_person')||{}).value, weeks=(document.getElementById('tr_weeks')||{}).value||12;
+  if(!person){return;}
+  document.getElementById('tr_summary').innerHTML='<div class=sub>loading…</div>';
+  try{TREND=await getj('/trend?person='+encodeURIComponent(person)+'&weeks='+weeks);renderTrend();}
+  catch(e){document.getElementById('tr_summary').innerHTML='<div class=sub>could not load trend</div>';}}
+function trendActs(){return [['pick','Pick','#2563eb'],['pack','Pack','#16a34a'],['engrave','Engrave','#0d9488']];}
+function renderTrend(){if(!TREND)return;var acts=trendActs(),weeks=TREND.weeks;
+  var labels=weeks.map(function(w){return w.wk.slice(5);});
+  var sHtml='';
+  acts.forEach(function(a){var pts=[];weeks.forEach(function(w){var o=w[a[0]]||{};if(o.uph!=null)pts.push(o.uph);});
+    if(!pts.length)return;var first=pts[0],last=pts[pts.length-1],delta=last-first,pct=first?Math.round(100*delta/first):0;
+    var dir=delta>0?'&#9650; improving':(delta<0?'&#9660; slower':'&ndash; flat'),col=delta>0?'#15803d':(delta<0?'#b91c1c':'#64748b');
+    sHtml+='<span class=trendkpi><b style="color:'+a[2]+'">'+a[1]+'</b> '+first+' &rarr; <b>'+last+'</b> /hr <span style="color:'+col+'">'+(delta>=0?'+':'')+pct+'% '+dir+'</span></span>';});
+  document.getElementById('tr_summary').innerHTML='<div class=trendkpis>'+(sHtml||'<span class=sub>Not enough timed data yet for '+TREND.person+' &mdash; needs a few more days of scans.</span>')+'</div>';
+  if(window.Chart){var ds=acts.map(function(a){return {label:a[1],data:weeks.map(function(w){var o=w[a[0]]||{};return o.uph==null?null:o.uph;}),
+      borderColor:a[2],backgroundColor:a[2],tension:.3,spanGaps:true,pointRadius:4,borderWidth:2};});
+    if(trendChartObj)trendChartObj.destroy();
+    trendChartObj=new Chart(document.getElementById('trendChart'),{type:'line',data:{labels:labels,datasets:ds},
+      options:{responsive:true,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{label:function(c){return c.dataset.label+': '+(c.parsed.y==null?'—':c.parsed.y+' /hr');}}}},
+        scales:{y:{title:{display:true,text:'items / hr (typical pace)'},beginAtZero:true}}}});}
+  var th='<tr><th style=text-align:left>Week of</th>';acts.forEach(function(a){th+='<th>'+a[1]+' /hr</th><th>'+a[1]+' units</th>';});th+='</tr>';
+  var body=weeks.map(function(w){var r='<tr><td class=name style=text-align:left>'+w.wk+'</td>';
+    acts.forEach(function(a){var o=w[a[0]]||{};r+='<td>'+(o.uph!=null?'<b>'+o.uph+'</b>':'<span class=dmt>·</span>')+'</td><td>'+(o.units?fmt(o.units):'<span class=dmt>·</span>')+'</td>';});
+    return r+'</tr>';}).join('');
+  document.getElementById('tr_table').innerHTML='<div class=tablewrap style="margin-top:14px"><table>'+th+body+'</table></div>';}
 async function loadEngraving(){const f=document.getElementById('from').value,t=document.getElementById('to').value,k=f+'|'+t;
   if(ENGR&&engKey===k){renderEngraving();return;}
   document.getElementById('engtable').innerHTML='<div class=sub>loading…</div>';
