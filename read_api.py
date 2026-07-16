@@ -372,20 +372,21 @@ def watch():
         p["pace_pct"]=pct(paces,p["pace"]) if inc else None
         p["out_pct"]=pct(outs,p["output"]) if inc else None
         f=[]
+        ftr = (p["type"]=="FT")   # hours/attendance flags apply to FULL-TIMERS only (interns are part-time by design)
         if not eng:   # engravers exempt for now (engraving time not cleanly tracked)
             if p["floor_hr"]>=WATCH["min_floor_hr"] and p["util"]<WATCH["util_low"]:
                 f.append(dict(t="Bursty / idle", d=f"on floor {p['floor_hr']}h but active only {p['active_hr']}h ({p['util']}%)", sev="r"))
-            if p["floor_hr"] < 0.7*exp_hours and (p["days"]>=2 or exp_days<=2):
+            if ftr and p["floor_hr"] < 0.7*exp_hours and (p["days"]>=2 or exp_days<=2):
                 f.append(dict(t="Under hours", d=f"~{p['floor_hr']}h on floor vs ~{exp_hours}h target (50h/wk) — verify vs PTO", sev="r"))
-            if p["days"]>=2 and p["avg_span"]<WATCH["short_day_hr"]:
+            if ftr and p["days"]>=2 and p["avg_span"]<WATCH["short_day_hr"]:
                 f.append(dict(t="Short shifts", d=f"averages {p['avg_span']}h/day vs 10h target", sev="r"))
-            if exp_days>=3 and p["days"] < exp_days-1:
+            if ftr and exp_days>=3 and p["days"] < exp_days-1:
                 f.append(dict(t="Missed days", d=f"present {p['days']} of ~{exp_days} expected days — check PTO app", sev="r"))
-            if inc and p["out_pct"]<=WATCH["out_bottom_pct"] and p["floor_hr"]>=WATCH["min_floor_hr"]:
+            if ftr and inc and p["out_pct"]<=WATCH["out_bottom_pct"] and p["floor_hr"]>=WATCH["min_floor_hr"]:
                 f.append(dict(t="Low output", d=f"{p['output']} items — bottom {WATCH['out_bottom_pct']}% despite {p['floor_hr']}h on floor", sev="r"))
-            if inc and p["pace_pct"]>=WATCH["pace_hi_pct"] and p["out_pct"]<=WATCH["out_lo_pct"]:
+            if ftr and inc and p["pace_pct"]>=WATCH["pace_hi_pct"] and p["out_pct"]<=WATCH["out_lo_pct"]:
                 f.append(dict(t="Fast but low total", d=f"top-tier pace but low total output ({p['output']})", sev="a"))
-            if p["days"]>=3 and p["med_day"]>0 and p["best_day"]>=WATCH["incon_ratio"]*p["med_day"]:
+            if ftr and p["days"]>=3 and p["med_day"]>0 and p["best_day"]>=WATCH["incon_ratio"]*p["med_day"]:
                 f.append(dict(t="Inconsistent", d=f"best day {p['best_day']} vs typical {p['med_day']}/day", sev="a"))
         p["flags"]=f
     hard=lambda p:sum(1 for x in p["flags"] if x["sev"]=="r")
@@ -863,7 +864,7 @@ function renderAnalytics(){if(!FLOOR)return;
   const grp=(ty)=>{const g=ppl.filter(p=>p.type===ty);if(!g.length)return null;
     const gh=g.reduce((a,p)=>a+p.hours,0),gi=g.reduce((a,p)=>a+p.items,0);
     return {n:g.length,hours:Math.round(gh),items:gi,uplh:gh>0?Math.round(gi/gh):0,util:Math.round(g.reduce((a,p)=>a+p.util,0)/g.length)};};
-  const ft=grp('Full-timer'),it=grp('Intern');
+  const ft=grp('FT'),it=grp('Intern');
   if(ft||it){h+='<div class=card style="margin-top:14px;padding:14px 16px"><div style="font-weight:700;margin-bottom:6px">Full-timers vs Interns</div>'+
     '<table><tr><th style=text-align:left>Group</th><th>People</th><th>Active hrs</th><th>Items</th><th>UPLH</th><th>Avg util</th></tr>'+
     [['Full-timers',ft],['Interns',it]].filter(x=>x[1]).map(x=>'<tr><td class=name>'+x[0]+'</td><td>'+x[1].n+'</td><td>'+x[1].hours+'</td><td>'+fmt(x[1].items)+'</td><td><b>'+x[1].uplh+'</b></td><td>'+x[1].util+'%</td></tr>').join('')+
@@ -959,7 +960,7 @@ function renderWatch(){
   const eng=P.filter(p=>p.engraver), main=P.filter(p=>!p.engraver&&(p.cohort||p.flags.length)), insuff=P.filter(p=>!p.engraver&&!p.cohort&&!p.flags.length);
   let h='<div class=mbox><h3>How to read this — leads, not verdicts</h3>';
   h+='A single metric always lies: fast pace hides that someone barely showed up; long hours hide that they were idle. This weighs <b>pace + hours + utilization + output + attendance</b> together and flags specific patterns with the evidence. A flag is a place to <b>look</b>, not a verdict — a low number can be legit (e.g. waiting on restock). Investigate anyone flagged with the activity-audit / performance-review tools.<br>';
-  h+='<b>Standard:</b> 50h/week = 10h/day × 5 days. This window&rsquo;s target: ~<b>'+c.exp_days+' work-days / '+c.exp_hours+'h</b>. <b>Utilization</b> = active scan time ÷ time on floor.<br>';
+  h+='<b>Standard (full-timers):</b> 50h/week = 10h/day × 5 days. This window&rsquo;s target: ~<b>'+c.exp_days+' work-days / '+c.exp_hours+'h</b>. <b>Utilization</b> = active time (45-min-break rule) ÷ time on floor. <b>Interns are part-time</b>, so the hours/attendance flags (under-hours, short-shifts, missed-days) don&rsquo;t apply to them — only output &amp; utilization do.<br>';
   h+='<b>Flags:</b> Bursty/idle (util &lt;'+c.util_low+'%) · Under hours (&lt;70% of target) · Short shifts (avg &lt;'+c.short_day_hr+'h/day) · Missed days (check the <b>PTO app</b>) · Low output (bottom '+c.out_bottom_pct+'%) · Fast-but-low-total · Inconsistent.<br>';
   h+='<b>Presence</b> comes from scan timestamps (a lower bound on real clock time) and does not yet cross-check the PTO app or scheduled shifts — so verify hours/attendance flags there. <b>Engravers ('+c.engravers.join(', ')+')</b> are shown separately and un-flagged for now, since engraving time isn&rsquo;t cleanly tracked.</div>';
   h+='<div class=card><h2>Flags &amp; profiles</h2><div class=sub style=margin:0>Most-flagged first. Hover a chip for the evidence. Util is coloured (red &lt;50%, amber 50–65%, green &gt;65%).</div>';
