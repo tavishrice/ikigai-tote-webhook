@@ -1029,7 +1029,7 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 <div id=dataqc class=hide>
   <div class=card>
     <h2>Data issues &amp; warnings <span style="color:#9ca3af;font-weight:400">&mdash; question weird numbers before they drive a decision</span></h2>
-    <div class=sub style=margin:0>Automated checks on the scan data itself: whether today is just a partial (in-progress) day, whether any badge looks like it&rsquo;s scanning from two places at once (double-login / two machines), day-over-day anomalies to sanity-check, and how fresh the data is. This view ignores the date range above.</div>
+    <div class=sub style=margin:0>Automated checks on the scan data itself: whether today is just a partial (in-progress) day, day-over-day anomalies worth a sanity-check, how fresh the data is, and an honest note on what the scan data can and can&rsquo;t tell us about shared logins. This view ignores the date range above.</div>
     <div id=dataqc_body><div class=sub style=margin-top:12px>loading&hellip;</div></div>
   </div>
 </div>
@@ -1304,14 +1304,8 @@ function renderDataqc(){if(!DATAQC)return;var q=DATAQC;var host=document.getElem
       out+='<tr><td class=name style=text-align:left>'+esc(r.person)+'</td><td><b>'+fmt(r.today)+'</b></td><td class=sub2>'+fmt(r.median)+'</td>'+
         '<td><b style="color:'+col+'">'+(pc==null?'&mdash;':pc+'%')+'</b></td><td class=sub2>'+(r.last||'&middot;')+'</td></tr>';});
     out+='</table></div>';}
-  out+='<div class=sub style="margin:18px 0 6px"><b>Double-scan / shared-login check</b> &mdash; two <b>different orders scanned within 3 seconds</b>. A few are normal (a fast picker finishes one order and immediately starts the next), so the signal is the <b>share</b> of a person&rsquo;s scans that do this &mdash; a genuinely shared badge (two people scanning on one login) drives it far higher. Under ~15% is clean; this is a &ldquo;look closer,&rdquo; never proof.</div>'+
-    '<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th title="scans <3s apart on DIFFERENT orders">Order-jumps &lt;3s</th><th>% of scans</th><th title="scans <1s apart — bursts/bulk, usually normal">Sub-1s bursts</th><th>Total scans</th><th>Status</th></tr>';
-  (q.concurrency||[]).forEach(function(r){var ratio=r.tot>0?(r.jump/r.tot):0;var bad=(ratio>=0.15&&r.jump>=25);var pctc=Math.round(100*ratio);
-    out+='<tr><td class=name style=text-align:left>'+esc(r.person)+'</td><td class=sub2>'+fmt(r.jump)+'</td>'+
-      '<td><b style="color:'+(bad?'#b91c1c':(pctc>=8?'#b45309':'#15803d'))+'">'+pctc+'%</b></td>'+
-      '<td class=sub2>'+fmt(r.sub1)+'</td><td class=sub2>'+fmt(r.tot)+'</td>'+
-      '<td>'+(bad?'<span class="wchip r">look closer &mdash; unusually high share</span>':'<span class=wok>ok</span>')+'</td></tr>';});
-  out+='</table></div>';
+  out+='<div class=sub style="margin:18px 0 6px"><b>Shared login / two machines &mdash; what we can and can&rsquo;t see</b></div>'+
+    '<div class="plancmp" style="background:#f8fafc;border-left-color:#94a3b8"><div style="line-height:1.55">ShipHero records <b>who</b> scanned (the badge), <b>which order</b>, <b>which warehouse</b>, and <b>when</b> &mdash; but <b>not which workstation/machine</b> a scan came from. That means timing alone <b>cannot</b> tell a shared badge (two people on one login) apart from one fast person clearing a queue &ldquo;pack, pack, pack&rdquo; or doing a normal <b>batch pick</b> across several orders &mdash; all three look identical in the data. So we deliberately <b>don&rsquo;t flag it here</b>, rather than risk pointing at your fastest people. If you suspect a login is shared, the dependable check is the actual device sign-ins. The day this scan data ever carries a workstation/terminal id, this page can turn it into a real, trustworthy flag.</div></div>';
   out+='<div class=sub style="margin:18px 0 6px"><b>Day-over-day anomalies</b> (completed days only) &mdash; a person&rsquo;s most recent finished day that&rsquo;s far off their own recent baseline. Worth a sanity-check: could be a genuinely slow/heavy day, PTO, or a data gap.</div>';
   if(!(q.anomalies&&q.anomalies.length))out+='<div class=sub2>None &mdash; every completed day is within a normal range of each person&rsquo;s baseline.</div>';
   else{out+='<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th>Day</th><th>Fulfillment</th><th>Their baseline</th><th>% of baseline</th><th>Flag</th></tr>';
