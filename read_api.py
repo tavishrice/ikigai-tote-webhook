@@ -474,13 +474,22 @@ def trend():
     Weeks with too few timed items show volume only (pace null)."""
     person=(request.args.get("person") or "").strip()
     if not person or person in EXCLUDED: return jsonify(ok=False, error="unknown person"), 400
-    try: wks=max(2, min(26, int(request.args.get("weeks") or 8)))
-    except Exception: wks=8
+    gran = "day" if (request.args.get("gran") == "day") else "week"
     to = request.args.get("to") or (dt.datetime.now(_ET).date()).isoformat()
-    frm = request.args.get("from") or (dt.date.fromisoformat(to) - dt.timedelta(days=wks*7-1)).isoformat()
-    MIN_N = 8   # min timed items in a week to trust that week's pace
+    if gran == "day":                   # per-DAY buckets: see a person improve within a week
+        try: nd = max(5, min(45, int(request.args.get("days") or 14)))
+        except Exception: nd = 14
+        frm = request.args.get("from") or (dt.date.fromisoformat(to) - dt.timedelta(days=nd-1)).isoformat()
+        MIN_N = 4                        # min timed items in a DAY to trust that day's pace
+        bucket = "((ts AT TIME ZONE 'America/New_York')::date)"
+    else:                               # per-ISO-week buckets (default)
+        try: wks=max(2, min(26, int(request.args.get("weeks") or 8)))
+        except Exception: wks=8
+        frm = request.args.get("from") or (dt.date.fromisoformat(to) - dt.timedelta(days=wks*7-1)).isoformat()
+        MIN_N = 8                        # min timed items in a WEEK to trust that week's pace
+        bucket = "(date_trunc('week',(ts AT TIME ZONE 'America/New_York'))::date)"
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
-        cur.execute("""
+        cur.execute(("""
         WITH base AS (
           SELECT CASE WHEN stage='replenish' AND ((raw->>'reason') ILIKE '%%tote%%' OR coalesce(quantity,0)<=1)
                       THEN 'move_tote' ELSE stage END AS estage, quantity, ts
@@ -497,12 +506,12 @@ def trend():
             EXTRACT(epoch FROM (ts - lag(ts) OVER (ORDER BY ts))) gap,
             lag(estage) OVER (ORDER BY ts) pstage FROM chunks),
         iv AS (SELECT estage AS stage, units, gap,
-            (date_trunc('week',(ts AT TIME ZONE 'America/New_York'))::date) wk
+            {BUCKET} wk
             FROM tl WHERE pstage=estage AND gap>0 AND gap<%s)
         SELECT wk, stage, count(*) n, sum(units) units,
           round(percentile_cont(0.5) WITHIN GROUP (ORDER BY gap/nullif(units,0))::numeric,1) med_spi
         FROM iv WHERE stage IN ('pick','pack','engrave')
-        GROUP BY wk, stage ORDER BY wk""", [person, frm, to, SPEED_BURST, SPEED_BREAK])
+        GROUP BY wk, stage ORDER BY wk""").replace("{BUCKET}", bucket), [person, frm, to, SPEED_BURST, SPEED_BREAK])
         rows = cur.fetchall()
     wkmap = {}
     for (wk, stage, n, units, med_spi) in rows:
@@ -511,7 +520,7 @@ def trend():
         uph = round(3600.0/med) if (med and n>=MIN_N) else None
         w[stage] = dict(uph=uph, units=units, n=n)
     weeks = [wkmap[k] for k in sorted(wkmap.keys())]
-    return jsonify(ok=True, person=person, range={"from":frm,"to":to}, min_n=MIN_N, weeks=weeks)
+    return jsonify(ok=True, person=person, gran=gran, range={"from":frm,"to":to}, min_n=MIN_N, weeks=weeks)
 
 # ---------------- Watch List (metric-based flags) ----------------
 # A single metric always lies: pace ignores whether you showed up; hours ignore whether you worked.
@@ -685,6 +694,60 @@ def daily():
             pick=int(pick), pack=int(pack), engrave=int(eng), fulfillment=ful, restock=int(restock),
             hours=round(hrs, 1), uplh=(round((ful + int(restock)) / hrs) if hrs > 0 else 0)))
     return jsonify(range={"from": frm, "to": to}, days=days)
+
+@app.route("/dataqc")
+def dataqc():
+    """Data-integrity guardrails so a weird number gets questioned before it drives a decision:
+      (1) DOUBLE-SCAN / two machines on one login — a person's scans jumping between DIFFERENT
+          orders within seconds (physically impossible for one human); near-zero is clean.
+      (2) IN-PROGRESS day — today's numbers are partial, so a low 'today' isn't a collapse.
+      (3) ANOMALIES — a completed day far off a person's own recent baseline, flagged for review.
+      (4) FRESHNESS — how long since the last scan landed."""
+    import statistics
+    now = dt.datetime.now(_ET); today = now.date()
+    with connect() as c, c.cursor(row_factory=tuple_row) as cur:
+        cur.execute("SELECT max(ts) FROM event"); last_ts = cur.fetchone()[0]
+        cur.execute("""WITH s AS (SELECT person, order_number,
+              EXTRACT(epoch FROM (ts-lag(ts) OVER w)) g,
+              order_number IS DISTINCT FROM lag(order_number) OVER w diff
+            FROM event WHERE stage IN ('pick','pack') AND person <> ALL(%s) AND et_day(ts)>=%s
+            WINDOW w AS (PARTITION BY person ORDER BY ts))
+          SELECT person, count(*) FILTER (WHERE g>=0 AND g<3 AND diff) jump,
+            count(*) FILTER (WHERE g>=0 AND g<1) sub1, count(*) tot
+          FROM s GROUP BY person HAVING count(*)>50 ORDER BY jump DESC, sub1 DESC""",
+          [list(EXCLUDED), str(today-dt.timedelta(days=30))])
+        conc = [dict(person=r[0], jump=int(r[1]), sub1=int(r[2]), tot=int(r[3])) for r in cur.fetchall()]
+        cur.execute("""SELECT person, et_day(ts) d,
+            COALESCE(sum(quantity) FILTER (WHERE stage IN ('pick','pack','engrave')),0) ful, max(ts) l
+          FROM event WHERE person <> ALL(%s) AND is_floor_labor(stage,subtype) AND et_day(ts)>=%s
+          GROUP BY person, et_day(ts)""", [list(EXCLUDED), str(today-dt.timedelta(days=21))])
+        by = {}
+        for (p, d, ful, l) in cur.fetchall():
+            by.setdefault(p, []).append((d, int(ful), l))
+    anomalies = []; today_rows = []
+    for p, rows in by.items():
+        rows.sort(key=lambda x: x[0])
+        comp = [r for r in rows if r[0] != today and r[1] > 0]          # completed active days
+        med = statistics.median([r[1] for r in comp]) if comp else 0
+        tr = [r for r in rows if r[0] == today]
+        if tr:
+            today_rows.append(dict(person=p, today=tr[0][1], median=round(med),
+                pct=(round(100*tr[0][1]/med) if med > 0 else None), last=_ampm(tr[0][2])))
+        if len(comp) >= 4:
+            last_d = comp[-1]; base = statistics.median([r[1] for r in comp[:-1]])
+            if base > 0:
+                pct = round(100*last_d[1]/base)
+                if pct < 50 or pct > 200:
+                    anomalies.append(dict(person=p, d=str(last_d[0]), ful=last_d[1],
+                        base=round(base), pct=pct, kind=("drop" if pct < 50 else "spike")))
+    anomalies.sort(key=lambda a: a["pct"])
+    today_rows.sort(key=lambda r: (r["pct"] if r["pct"] is not None else 999))
+    dow = today.isoweekday()
+    return jsonify(now=now.isoformat(), today=str(today), today_dow=dow,
+        today_hm=now.strftime("%-I:%M %p"), is_weekend=(dow >= 6),
+        last_ts=(last_ts.isoformat() if last_ts else None),
+        last_min_ago=(round((now - last_ts.astimezone(_ET)).total_seconds()/60) if last_ts else None),
+        concurrency=conc, anomalies=anomalies, today_partial=today_rows)
 
 @app.route("/")
 def dashboard():
@@ -907,7 +970,6 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 <div class=sub>Live contribution from ShipHero <b>+ direct-in-Shopify fulfillments + engraving</b>. <b>Fulfillment</b> (pick + pack + engrave) and <b>Restock</b> are two separate tracks.</div>
 <div class=tabs>
   <div class="tab on" data-tab=dash onclick="tab('dash')">Dashboard</div>
-  <div class=tab data-tab=daily onclick="tab('daily')">Daily</div>
   <div class=tab data-tab=out onclick="tab('out')">Outstanding</div>
   <div class=tab data-tab=floor onclick="tab('floor')">Floor Time</div>
   <div class=tab data-tab=log onclick="tab('log')">Log time</div>
@@ -917,6 +979,7 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
   <div class=tab data-tab=engt onclick="tab('engt')">Engraving</div>
   <div class=tab data-tab=watch onclick="tab('watch')">Watch List</div>
   <div class=tab data-tab=an onclick="tab('an')">Analytics</div>
+  <div class=tab data-tab=dataqc onclick="tab('dataqc')">Data Issues</div>
 </div>
 <div class=ctl>
   <button class=pill data-preset=today onclick="preset('today')">Today</button>
@@ -963,12 +1026,11 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
   </div>
 </div>
 
-<div id=daily class=hide>
+<div id=dataqc class=hide>
   <div class=card>
-    <h2>Daily report <span style="color:#9ca3af;font-weight:400">&mdash; one row per working day</span></h2>
-    <div class=sub style=margin:0>Day-by-day team performance for the selected range. Inactive days (weekends, holidays &mdash; no scans) are dropped automatically. <b>Fulfillment</b> = pick + pack + engrave items (MagNano-corrected); <b>UPLH</b> = (fulfillment + restock) ÷ active person-hours (45-min-break rule).</div>
-    <div style="height:280px;margin:14px 0 4px"><canvas id=daily_chart></canvas></div>
-    <div id=daily_body><div class=sub style=margin-top:12px>loading&hellip;</div></div>
+    <h2>Data issues &amp; warnings <span style="color:#9ca3af;font-weight:400">&mdash; question weird numbers before they drive a decision</span></h2>
+    <div class=sub style=margin:0>Automated checks on the scan data itself: whether today is just a partial (in-progress) day, whether any badge looks like it&rsquo;s scanning from two places at once (double-login / two machines), day-over-day anomalies to sanity-check, and how fresh the data is. This view ignores the date range above.</div>
+    <div id=dataqc_body><div class=sub style=margin-top:12px>loading&hellip;</div></div>
   </div>
 </div>
 <div id=out class=hide>
@@ -1073,10 +1135,12 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 <div id=trend class=hide>
   <div class=card>
     <h2>Individual trends <span style="color:#9ca3af;font-weight:400">&mdash; is this person getting faster over time?</span></h2>
-    <div class=sub style=margin:0>One person&rsquo;s pace (items/hr) week by week, per activity, using the robust median method (typical time per item, pauses ignored). Great for watching a new hire ramp. History starts when scan-tracking began, so early weeks may be short and will fill in over time.</div>
+    <div class=sub style=margin:0>One person&rsquo;s pace (items/hr) per activity, using the robust median method (typical time per item, pauses ignored). Switch <b>Weekly</b> (watch a new hire ramp over months) or <b>Daily</b> (see day-by-day improvement across a week). History starts when scan-tracking began.</div>
     <div class=planbar>
       <div class=lf><label>Person</label><select id=tr_person onchange="loadTrendData()"></select></div>
-      <div class=lf><label>Weeks</label><select id=tr_weeks onchange="loadTrendData()"><option>8</option><option selected>12</option><option>20</option></select></div>
+      <div class=lf><label>View</label><select id=tr_gran onchange="loadTrendData()"><option value=week selected>Weekly</option><option value=day>Daily</option></select></div>
+      <div class=lf id=tr_wkwrap><label>Weeks</label><select id=tr_weeks onchange="loadTrendData()"><option>8</option><option selected>12</option><option>20</option></select></div>
+      <div class=lf id=tr_daywrap style=display:none><label>Days</label><select id=tr_days onchange="loadTrendData()"><option>14</option><option selected>21</option><option>30</option></select></div>
     </div>
     <div id=tr_summary></div>
     <div class=chartwrap style="max-width:840px"><canvas id=trendChart></canvas></div>
@@ -1099,7 +1163,7 @@ function segval(id){return document.querySelector('#'+id+' button.on').dataset.v
 function seg(id,v){document.querySelectorAll('#'+id+' button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));render();}
 document.querySelectorAll('.seg').forEach(s=>s.addEventListener('click',e=>{if(e.target.dataset.v){seg(s.id,e.target.dataset.v);}}));
 let curTab='dash';
-function tab(t){curTab=t;['dash','daily','out','floor','log','plan','trend','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
+function tab(t){curTab=t;['dash','dataqc','out','floor','log','plan','trend','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
   document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('on',el.dataset.tab===t));
   // Only show the controls a tab actually uses (Unit/Stage/Source + exports = Dashboard only;
   // Team/Detail = Dashboard/Floor/Engraving/Analytics), so no toggle is ever an inert no-op.
@@ -1107,7 +1171,7 @@ function tab(t){curTab=t;['dash','daily','out','floor','log','plan','trend','eng
   var c1=document.getElementById('ctl1');if(c1)c1.style.display=showU?'':'none';
   var c2=document.getElementById('ctl2');if(c2)c2.style.display=showTV?'':'none';
   var sm=document.getElementById('summary');if(sm)sm.style.display=showU?'':'none';
-  if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();if(t==='plan')loadPlanner();if(t==='log')loadLog();if(t==='trend')loadTrend();if(t==='out')loadOutstanding();if(t==='daily')loadDaily();}
+  if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();if(t==='plan')loadPlanner();if(t==='log')loadLog();if(t==='trend')loadTrend();if(t==='out')loadOutstanding();if(t==='dataqc')loadDataqc();}
 // ===== Outstanding orders (the demand-side backlog from ShipHero) =====
 let OUT=null, outSort='age', outDir=-1, outFilter='all';
 function money(v){return '$'+Math.round(v||0).toLocaleString();}
@@ -1220,6 +1284,41 @@ function renderDaily(){if(!DAILY)return;const D=DAILY.days||[];const host=docume
         y1:{beginAtZero:true,position:'right',grid:{display:false},title:{display:true,text:'Orders / UPLH',color:'#64748b',font:{size:11,weight:'600'}}}},
       plugins:{legend:{position:'bottom'},title:{display:true,text:'Daily output, orders shipped & UPLH',color:'#0f172a',font:{size:13,weight:'600'}}}}});
 }
+// ===== Data issues & warnings =====
+let DATAQC=null;
+async function loadDataqc(){var host=document.getElementById('dataqc_body');
+  host.innerHTML='<div class=sub>running checks&hellip;</div>';
+  try{DATAQC=await getj('/dataqc');}catch(e){host.innerHTML='<div class=sub>could not run data checks</div>';return;}
+  renderDataqc();}
+function renderDataqc(){if(!DATAQC)return;var q=DATAQC;var host=document.getElementById('dataqc_body');if(!host)return;
+  var fm=q.last_min_ago;var fcol=fm==null?'#64748b':(fm<=15?'#15803d':(fm<=60?'#b45309':'#b91c1c'));
+  var out='<div class=nrow style="margin:6px 0 2px;gap:20px">'+
+    '<span class=sub2>Data freshness: <b style="color:'+fcol+'">'+(fm==null?'no data':(fm+' min ago'))+'</b></span>'+
+    '<span class=sub2>Now: <b>'+q.today_hm+'</b> &middot; '+q.today+'</span></div>';
+  if(q.is_weekend)out+='<div class="plancmp ok" style="margin-top:10px">Today is a weekend &mdash; low or no activity is expected.</div>';
+  else out+='<div class="plancmp short" style="margin-top:10px"><b>Today is in progress</b> (as of '+q.today_hm+'). Today&rsquo;s numbers are partial &mdash; a low &ldquo;today&rdquo; is almost always just the day not being over, not a real collapse. Compare completed days on the <span class=tablink onclick="tab(\'daily\')">Daily</span> tab.</div>';
+  if(q.today_partial&&q.today_partial.length){
+    out+='<div class=sub style="margin:16px 0 6px"><b>Today so far vs each person&rsquo;s typical day</b> &mdash; context for &ldquo;why is X so low today.&rdquo;</div>'+
+      '<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th>Today (fulfillment)</th><th>Typical day</th><th>% of typical</th><th>Last scan</th></tr>';
+    q.today_partial.forEach(function(r){var pc=r.pct;var col=pc==null?'#64748b':(pc<40?'#b45309':'#334155');
+      out+='<tr><td class=name style=text-align:left>'+esc(r.person)+'</td><td><b>'+fmt(r.today)+'</b></td><td class=sub2>'+fmt(r.median)+'</td>'+
+        '<td><b style="color:'+col+'">'+(pc==null?'&mdash;':pc+'%')+'</b></td><td class=sub2>'+(r.last||'&middot;')+'</td></tr>';});
+    out+='</table></div>';}
+  out+='<div class=sub style="margin:18px 0 6px"><b>Double-scan / two-machines check</b> &mdash; a badge scanning two <b>different orders within 3 seconds</b> is physically impossible for one person, so a high count means one login may be shared across machines and its per-person numbers can&rsquo;t be trusted. <b>0 is clean.</b></div>'+
+    '<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th title="scans <3s apart on DIFFERENT orders">Impossible jumps</th><th title="scans <1s apart — bursts/bulk, usually normal">Sub-1s bursts</th><th>Total scans</th><th>Status</th></tr>';
+  (q.concurrency||[]).forEach(function(r){var bad=r.jump>=10;
+    out+='<tr><td class=name style=text-align:left>'+esc(r.person)+'</td><td><b style="color:'+(bad?'#b91c1c':'#15803d')+'">'+fmt(r.jump)+'</b></td>'+
+      '<td class=sub2>'+fmt(r.sub1)+'</td><td class=sub2>'+fmt(r.tot)+'</td>'+
+      '<td>'+(bad?'<span class="wchip r">review &mdash; possible shared login</span>':'<span class=wok>ok</span>')+'</td></tr>';});
+  out+='</table></div>';
+  out+='<div class=sub style="margin:18px 0 6px"><b>Day-over-day anomalies</b> (completed days only) &mdash; a person&rsquo;s most recent finished day that&rsquo;s far off their own recent baseline. Worth a sanity-check: could be a genuinely slow/heavy day, PTO, or a data gap.</div>';
+  if(!(q.anomalies&&q.anomalies.length))out+='<div class=sub2>None &mdash; every completed day is within a normal range of each person&rsquo;s baseline.</div>';
+  else{out+='<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th>Day</th><th>Fulfillment</th><th>Their baseline</th><th>% of baseline</th><th>Flag</th></tr>';
+    q.anomalies.forEach(function(a){var drop=a.kind==='drop';
+      out+='<tr><td class=name style=text-align:left>'+esc(a.person)+'</td><td>'+a.d.slice(5)+'</td><td><b>'+fmt(a.ful)+'</b></td><td class=sub2>'+fmt(a.base)+'</td>'+
+        '<td><b style="color:'+(drop?'#b91c1c':'#b45309')+'">'+a.pct+'%</b></td><td><span class="wchip '+(drop?'r':'a')+'">'+(drop?'sharp drop':'spike')+'</span></td></tr>';});
+    out+='</table></div>';}
+  host.innerHTML=out;}
 function dateEdit(){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.remove('on'));load();}   // manual date change: drop preset highlight + reload
 function preset(p){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.toggle('on',b.dataset.preset===p));
   let f=etToday(),t=etToday();
@@ -1242,11 +1341,11 @@ function stampRefresh(){var el=document.getElementById('refstamp');if(el)el.text
 async function refreshNow(){
   var a=document.activeElement;   // don't rebuild / steal focus while someone is editing an input
   if(a&&/^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName)&&a.id!=='autoref'&&a.id!=='autoint')return;
-  speedKey=null;floorKey=null;watchKey=null;engKey=null;pspeedKey=null;dailyKey=null;
+  speedKey=null;floorKey=null;watchKey=null;engKey=null;pspeedKey=null;
   await load();
   if(curTab==='engt')loadEngraving(); else if(curTab==='an')loadAnalytics();
   else if(curTab==='plan')loadPlanner(); else if(curTab==='trend')loadTrendData(); else if(curTab==='log')loadLog();
-  else if(curTab==='out')loadOutstanding(); else if(curTab==='daily')loadDaily();
+  else if(curTab==='out')loadOutstanding(); else if(curTab==='dataqc')loadDataqc();
   stampRefresh();
 }
 async function reqWake(){try{if('wakeLock' in navigator)wakeLock=await navigator.wakeLock.request('screen');}catch(e){}}
@@ -1683,10 +1782,16 @@ function loadTrend(){var sel=document.getElementById('tr_person');
   if(sel&&sel.options.length===0){var r=nRoster();sel.innerHTML=r.map(function(n){return '<option value="'+esc(n)+'">'+esc(n)+'</option>';}).join('');}
   if(sel&&!sel.value&&sel.options.length)sel.value=sel.options[0].value;
   loadTrendData();}
-async function loadTrendData(){var person=(document.getElementById('tr_person')||{}).value, weeks=(document.getElementById('tr_weeks')||{}).value||12;
+async function loadTrendData(){var person=(document.getElementById('tr_person')||{}).value;
+  var gran=(document.getElementById('tr_gran')||{}).value||'week';
+  var wk=document.getElementById('tr_wkwrap'),dw=document.getElementById('tr_daywrap');
+  if(wk)wk.style.display=(gran==='day')?'none':''; if(dw)dw.style.display=(gran==='day')?'':'none';
   if(!person){return;}
   document.getElementById('tr_summary').innerHTML='<div class=sub>loading…</div>';
-  try{TREND=await getj('/trend?person='+encodeURIComponent(person)+'&weeks='+weeks);renderTrend();}
+  var url='/trend?person='+encodeURIComponent(person)+(gran==='day'
+    ?'&gran=day&days='+((document.getElementById('tr_days')||{}).value||21)
+    :'&weeks='+((document.getElementById('tr_weeks')||{}).value||12));
+  try{TREND=await getj(url);renderTrend();}
   catch(e){document.getElementById('tr_summary').innerHTML='<div class=sub>could not load trend</div>';}}
 function trendActs(){return [['pick','Pick','#2563eb'],['pack','Pack','#16a34a'],['engrave','Engrave','#0d9488']];}
 function renderTrend(){if(!TREND)return;var acts=trendActs(),weeks=TREND.weeks;
@@ -1703,7 +1808,7 @@ function renderTrend(){if(!TREND)return;var acts=trendActs(),weeks=TREND.weeks;
     trendChartObj=new Chart(document.getElementById('trendChart'),{type:'line',data:{labels:labels,datasets:ds},
       options:{responsive:true,plugins:{legend:{position:'bottom'},tooltip:{callbacks:{label:function(c){return c.dataset.label+': '+(c.parsed.y==null?'—':c.parsed.y+' /hr');}}}},
         scales:{y:{title:{display:true,text:'items / hr (typical pace)'},beginAtZero:true}}}});}
-  var th='<tr><th style=text-align:left>Week of</th>';acts.forEach(function(a){th+='<th>'+a[1]+' /hr</th><th>'+a[1]+' units</th>';});th+='</tr>';
+  var th='<tr><th style=text-align:left>'+(TREND.gran==='day'?'Day':'Week of')+'</th>';acts.forEach(function(a){th+='<th>'+a[1]+' /hr</th><th>'+a[1]+' units</th>';});th+='</tr>';
   var body=weeks.map(function(w){var r='<tr><td class=name style=text-align:left>'+w.wk+'</td>';
     acts.forEach(function(a){var o=w[a[0]]||{};r+='<td>'+(o.uph!=null?'<b>'+o.uph+'</b>':'<span class=dmt>·</span>')+'</td><td>'+(o.units?fmt(o.units):'<span class=dmt>·</span>')+'</td>';});
     return r+'</tr>';}).join('');
