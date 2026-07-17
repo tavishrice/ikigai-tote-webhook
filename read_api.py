@@ -1022,7 +1022,7 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 <script>
 const C={pick:'#2563eb',pack:'#16a34a',fulfill:'#d97706',repl:'#7c3aed',engrave:'#0d9488'};
 if(window.Chart){Chart.defaults.font.family="'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif";Chart.defaults.font.size=12;Chart.defaults.color='#475569';Chart.defaults.plugins.legend.labels.usePointStyle=true;Chart.defaults.plugins.legend.labels.boxWidth=8;Chart.defaults.plugins.legend.labels.boxHeight=8;Chart.defaults.plugins.legend.labels.padding=16;}
-let DATA=null, sortKey='items_total', sortDir=-1, chart=null;
+let DATA=null, sortKey='items_total', sortDir=-1, chart=null, anTrend=null, anRank=null, anMix=null, anSort='items', anDir=-1;
 function etDstr(d){return d.toLocaleDateString('en-CA',{timeZone:'America/New_York'});}   // YYYY-MM-DD in real ET
 function etToday(){return etDstr(new Date());}
 function etAgo(n){return etDstr(new Date(Date.now()-n*86400000));}
@@ -1641,32 +1641,87 @@ async function loadAnalytics(){const f=document.getElementById('from').value,t=d
   if(!(FLOOR&&floorKey===k)){document.getElementById('analytics').innerHTML='<div class=sub>loading…</div>';
     try{FLOOR=await getj('/floor?from='+f+'&to='+t);floorKey=k;}catch(e){document.getElementById('analytics').innerHTML='<div class=sub>could not load</div>';return;}}
   renderAnalytics();}
+function anSetSort(k){if(anSort===k)anDir=-anDir;else{anSort=k;anDir=(k==='person'||k==='type'?1:-1);}renderAnalytics();}
 function renderAnalytics(){if(!FLOOR)return;
-  const ppl=FLOOR.people.filter(tfilter);
   const el=document.getElementById('analytics'); if(!el)return;
+  [anTrend,anRank,anMix].forEach(c=>{try{if(c)c.destroy();}catch(e){}});anTrend=anRank=anMix=null;
+  const ppl=FLOOR.people.filter(tfilter);
   if(!ppl.length){el.innerHTML='<div class=sub>No activity in this window.</div>';return;}
   const sum=(g)=>ppl.reduce((a,p)=>a+g(p),0);
-  const H=sum(p=>p.hours), I=sum(p=>p.items), FUL=sum(p=>p.ful_items), REP=sum(p=>p.repl_items);
-  const uplh=H>0?Math.round(I/H):0;
+  const H=sum(p=>p.hours), SPAN=sum(p=>p.span_h), I=sum(p=>p.items), FUL=sum(p=>p.ful_items), REP=sum(p=>p.repl_items);
+  const pdays=sum(p=>p.active_days);
+  const uplh=H>0?Math.round(I/H):0, fulHr=H>0?Math.round(FUL/H):0;
   const avgUtil=Math.round(ppl.reduce((a,p)=>a+p.util,0)/ppl.length);
   const uphs=ppl.map(p=>p.items_per_hr).filter(x=>x>0).sort((a,b)=>a-b);
   const _n=uphs.length, med=_n?(_n%2?uphs[(_n-1)/2]:Math.round((uphs[_n/2-1]+uphs[_n/2])/2)):0, top=_n?uphs[_n-1]:0, bot=_n?uphs[0]:0;
-  let h='<div class=note style=margin-top:0>Team effectiveness for <b>'+FLOOR.range.from+' → '+FLOOR.range.to+'</b>. <b>UPLH</b> = items per active labour hour (the core warehouse productivity KPI). Active hours use the 45-min-break rule.</div>';
-  h+='<div class=cards>'+card('People','active','s-sel',ppl.length)+card('Active hours','all work','s-sel',Math.round(H))
-    +card('Items','pick+pack+engrave+restock','s-sel',I)+card('Team UPLH','items / active hr','s-sel',uplh)
-    +card('Avg utilization','active ÷ on-floor','s-repl',avgUtil+'%')+'</div>';
-  // per-person UPLH distribution + FT vs Intern
-  h+='<div class=cards style=margin-top:12px>'+card('Top UPLH','person best','s-sel',top)+card('Median UPLH','person','s-sel',med)+card('Bottom UPLH','person','s-sel',bot)
-    +card('Fulfillment items','pick+pack+engrave','s-sel',FUL)+card('Restocked','separate track','s-repl',REP)+'</div>';
+  // dashboard rollup (same range & team filter) for orders + fulfillment mix
+  let shipped=0, stage=null;
+  if(DATA&&DATA.people){const dp=DATA.people.filter(teamFilter);stage={pick:0,packsh:0,packshop:0,eng:0};
+    dp.forEach(p=>{stage.pick+=p.items_picked_sh||0;stage.packsh+=p.items_packed_sh||0;stage.packshop+=p.items_packed_shop||0;stage.eng+=p.engraved_items||0;});
+    shipped=(DATA.shipped&&DATA.shipped.total)||0;}
+  const teamLbl=segval('team')==='all'?'':' &middot; <b>'+(segval('team')==='FT'?'Full-timers':'Interns')+'</b> only';
+  let h='<div class=note style=margin-top:0>Team performance for <b>'+FLOOR.range.from+' → '+FLOOR.range.to+'</b>'+teamLbl+'. <b>UPLH</b> = items per active labour hour (the core productivity KPI); active hours use the 45-min-break rule.</div>';
+  h+='<div class=cards>'+card('People','on the floor','s-sel',ppl.length)+
+    (shipped?card('Orders shipped','out the door','s-sh',shipped):'')+
+    card('Fulfillment','pick+pack+engrave','s-sel',FUL)+card('Restocked','separate track','s-repl',REP)+
+    card('Active hrs','hands-on','s-sel',Math.round(H))+card('Floor hrs','first→last','s-sel',Math.round(SPAN))+'</div>';
+  h+='<div class=cards style=margin-top:10px>'+card('Team UPLH','items / active hr','s-sel',uplh)+
+    card('Fulfillment/hr','ful items / active hr','s-sel',fulHr)+card('Avg utilization','active ÷ on-floor','s-repl',avgUtil+'%')+
+    card('Top UPLH','best person','s-sel',top)+card('Median UPLH','person','s-sel',med)+card('Bottom UPLH','person','s-sel',bot)+'</div>';
+  // chart placeholders
+  h+='<div style="height:300px;margin:16px 0 4px"><canvas id=anTrendC></canvas></div>';
+  h+='<div style="display:flex;gap:16px;flex-wrap:wrap;margin:6px 0">'+
+     '<div style="flex:2 1 360px;min-width:300px;height:340px"><canvas id=anRankC></canvas></div>'+
+     '<div style="flex:1 1 240px;min-width:240px;height:340px"><canvas id=anMixC></canvas></div></div>';
+  // detailed per-person table (sortable)
+  const teamItems=I||1; ppl.forEach(p=>{p._share=Math.round(100*p.items/teamItems);});
+  const cols=[['person','Person','left'],['type','Type','left'],['active_days','Days'],['hours','Active h'],['span_h','Floor h'],['util','Util%'],['items','Items'],['items_per_hr','UPLH'],['items_per_day','Items/day'],['ful_items','Fulfill'],['repl_items','Restock'],['_share','Share']];
+  function ath(k,label,align){var ar=(anSort===k)?(anDir>0?' ▲':' ▼'):'';return '<th onclick="anSetSort(\''+k+'\')" style="cursor:pointer'+(align?';text-align:'+align:'')+'">'+label+ar+'</th>';}
+  const rows=[...ppl].sort((a,b)=>{const k=anSort;if(k==='person'||k==='type'){const av=(a[k]||''),bv=(b[k]||'');return (av<bv?-1:av>bv?1:0)*anDir;}return ((a[k]||0)-(b[k]||0))*anDir;});
+  let tbl='<div class=sub style="margin:16px 0 6px"><b>Full team &mdash; detailed metrics.</b> Click a column header to sort.</div>'+
+    '<div class=tablewrap><table><tr>'+cols.map(c=>ath(c[0],c[1],c[2])).join('')+'</tr>';
+  rows.forEach(p=>{const ty=p.type==='FT'?'FT':(p.type==='Intern'?'Intern':'—');
+    tbl+='<tr><td class=name style=text-align:left>'+esc(p.person)+'</td><td style=text-align:left>'+ty+'</td>'+
+      '<td>'+fmt(p.active_days)+'</td><td>'+p.hours.toFixed(1)+'</td><td class=sub2>'+p.span_h.toFixed(1)+'</td>'+
+      '<td>'+chip(p.util)+'</td><td><b>'+fmt(p.items)+'</b></td><td><b>'+fmt(p.items_per_hr)+'</b></td>'+
+      '<td>'+fmt(p.items_per_day)+'</td><td>'+fmt(p.ful_items)+'</td><td>'+fmt(p.repl_items)+'</td>'+
+      '<td><div style="display:flex;align-items:center;gap:6px;min-width:96px"><span style="width:34px;text-align:right">'+p._share+'%</span><div style="flex:1;height:6px;background:#eef2f7;border-radius:3px;overflow:hidden"><div style="height:100%;width:'+p._share+'%;background:'+C.pick+'"></div></div></div></td></tr>';});
+  tbl+='<tr class=tot><td>Team</td><td></td><td>'+fmt(pdays)+'</td><td>'+H.toFixed(1)+'</td><td class=sub2>'+SPAN.toFixed(1)+'</td><td>'+avgUtil+'%</td><td><b>'+fmt(I)+'</b></td><td><b>'+fmt(uplh)+'</b></td><td></td><td>'+fmt(FUL)+'</td><td>'+fmt(REP)+'</td><td>100%</td></tr></table></div>';
+  // FT vs Intern
   const grp=(ty)=>{const g=ppl.filter(p=>p.type===ty);if(!g.length)return null;
-    const gh=g.reduce((a,p)=>a+p.hours,0),gi=g.reduce((a,p)=>a+p.items,0);
-    return {n:g.length,hours:Math.round(gh),items:gi,uplh:gh>0?Math.round(gi/gh):0,util:Math.round(g.reduce((a,p)=>a+p.util,0)/g.length)};};
+    const gh=g.reduce((a,p)=>a+p.hours,0),gi=g.reduce((a,p)=>a+p.items,0),gd=g.reduce((a,p)=>a+p.active_days,0);
+    return {n:g.length,hours:Math.round(gh),items:gi,uplh:gh>0?Math.round(gi/gh):0,util:Math.round(g.reduce((a,p)=>a+p.util,0)/g.length),ipd:gd>0?Math.round(gi/gd):0};};
   const ft=grp('FT'),it=grp('Intern');
-  if(ft||it){h+='<div class=card style="margin-top:14px;padding:14px 16px"><div style="font-weight:700;margin-bottom:6px">Full-timers vs Interns</div>'+
-    '<table><tr><th style=text-align:left>Group</th><th>People</th><th>Active hrs</th><th>Items</th><th>UPLH</th><th>Avg util</th></tr>'+
-    [['Full-timers',ft],['Interns',it]].filter(x=>x[1]).map(x=>'<tr><td class=name>'+x[0]+'</td><td>'+x[1].n+'</td><td>'+x[1].hours+'</td><td>'+fmt(x[1].items)+'</td><td><b>'+x[1].uplh+'</b></td><td>'+x[1].util+'%</td></tr>').join('')+
-    '</table></div>';}
-  el.innerHTML=h;}
+  let cmp='';
+  if(ft&&it){cmp='<div class=sub style="margin:16px 0 6px"><b>Full-timers vs Interns</b></div>'+
+    '<table class=plantbl><tr><th style=text-align:left>Group</th><th>People</th><th>Active hrs</th><th>Items</th><th>UPLH</th><th>Items/day</th><th>Avg util</th></tr>'+
+    [['Full-timers',ft],['Interns',it]].map(x=>'<tr><td class=name style=text-align:left>'+x[0]+'</td><td>'+x[1].n+'</td><td>'+x[1].hours+'</td><td>'+fmt(x[1].items)+'</td><td><b>'+x[1].uplh+'</b></td><td>'+x[1].ipd+'</td><td>'+x[1].util+'%</td></tr>').join('')+'</table>';}
+  el.innerHTML=h+tbl+cmp;
+  if(curTab!=='an')return;   // only build charts when the tab is actually visible
+  // daily team output + UPLH trend
+  const dm={};ppl.forEach(p=>p.days.forEach(d=>{const x=dm[d.d]||(dm[d.d]={ful:0,repl:0,hrs:0});x.ful+=d.ful;x.repl+=d.repl;x.hrs+=d.hours;}));
+  const days=Object.keys(dm).sort(), fulA=days.map(k=>dm[k].ful), replA=days.map(k=>dm[k].repl), uplhA=days.map(k=>dm[k].hrs>0?Math.round((dm[k].ful+dm[k].repl)/dm[k].hrs):0);
+  anTrend=new Chart(document.getElementById('anTrendC'),{data:{labels:days,datasets:[
+    {type:'bar',label:'Fulfillment',data:fulA,backgroundColor:C.fulfill,stack:'s',yAxisID:'y',order:3},
+    {type:'bar',label:'Restocked',data:replA,backgroundColor:C.repl,stack:'s',yAxisID:'y',order:3},
+    {type:'line',label:'UPLH',data:uplhA,borderColor:'#0f172a',backgroundColor:'#0f172a',yAxisID:'y1',tension:.3,pointRadius:3,order:1}]},
+    options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
+      scales:{x:{stacked:true,grid:{display:false},ticks:{font:{size:10}}},
+        y:{stacked:true,beginAtZero:true,position:'left',grid:{color:'#eef1f5'},title:{display:true,text:'Items / day',color:'#64748b',font:{size:11,weight:'600'}}},
+        y1:{beginAtZero:true,position:'right',grid:{display:false},title:{display:true,text:'UPLH',color:'#64748b',font:{size:11,weight:'600'}}}},
+      plugins:{legend:{position:'bottom'},title:{display:true,text:'Daily team output & UPLH trend',color:'#0f172a',font:{size:13,weight:'600'}}}}});
+  // UPLH by person (ranked, coloured by type)
+  const rk=[...ppl].filter(p=>p.items_per_hr>0).sort((a,b)=>a.items_per_hr-b.items_per_hr);
+  anRank=new Chart(document.getElementById('anRankC'),{type:'bar',data:{labels:rk.map(p=>p.person),datasets:[{label:'UPLH',data:rk.map(p=>p.items_per_hr),backgroundColor:rk.map(p=>p.type==='Intern'?'#94a3b8':C.pick)}]},
+    options:{indexAxis:'y',responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},title:{display:true,text:'UPLH by person (blue = full-timer, grey = intern)',color:'#0f172a',font:{size:12,weight:'600'}}},
+      scales:{x:{beginAtZero:true,grid:{color:'#eef1f5'},title:{display:true,text:'items / active hr',color:'#64748b',font:{size:10}}},y:{grid:{display:false},ticks:{font:{size:10}}}}}});
+  // fulfillment mix doughnut
+  if(stage&&(stage.pick+stage.packsh+stage.packshop+stage.eng)>0){
+    anMix=new Chart(document.getElementById('anMixC'),{type:'doughnut',data:{labels:['Picked·SH','Packed·SH','Packed·Shopify','Engraved'],datasets:[{data:[stage.pick,stage.packsh,stage.packshop,stage.eng],backgroundColor:[C.pick,C.pack,C.fulfill,C.engrave]}]},
+      options:{responsive:true,maintainAspectRatio:false,cutout:'55%',
+        plugins:{legend:{position:'bottom',labels:{font:{size:10},boxWidth:12}},title:{display:true,text:'Fulfillment mix',color:'#0f172a',font:{size:12,weight:'600'}}}}});}
+}
 function copyChat(){const v=vis();const rows=DATA.people.filter(teamFilter).map(p=>{
     var parts=[];
     if(v.pick)parts.push('picked '+p.items_picked_sh);
