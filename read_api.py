@@ -363,16 +363,19 @@ def person_day():
 # DO count as active time, so genuinely slow stretches count against the rate, but time away never does.
 # Speed = units done in that active time ÷ active hours. Near-simultaneous scans (<=5s) merge into one
 # "chunk" first (fixes replenishment bulk pallet scans stamped at the same second).
-SPEED_STAGES = ["pick", "pack", "engrave", "replenish"]
+SPEED_STAGES = ["pick", "pack", "engrave", "replenish", "pick_mgn", "pick_norm"]
 SPEED_BREAK  = 2700   # seconds = 45 min: a gap this long or longer splits active time (a break)
-SPEED_SRC  = {"pick":"shiphero","pack":"shiphero","replenish":"shiphero","engrave":"logger"}
+SPEED_SRC  = {"pick":"shiphero","pack":"shiphero","replenish":"shiphero","engrave":"logger",
+              "pick_mgn":"shiphero","pick_norm":"shiphero"}
 SPEED_BURST = 5          # scans within this many seconds = one physical action (chunk)
 SPEED_GATE = {"min_intervals":30, "min_days":2, "min_active_min":15}  # ranked only if all three met
-SPEED_UNIT = {"pick":"items","pack":"items","engrave":"totes","replenish":"boxes"}
+SPEED_UNIT = {"pick":"items","pack":"items","engrave":"totes","replenish":"boxes",
+              "pick_mgn":"items","pick_norm":"items"}
 # Rate mode: "units" = units per active hour (pick/pack/engrave). "moves" = discrete actions per active
 # hour — replenish is ranked as BOXES/hr, because a 40-unit box isn't 40x the work of a 1-unit move, so
 # units/hr would just rank box size, not speed.
-SPEED_RATE = {"pick":"units","pack":"units","engrave":"units","replenish":"moves"}
+SPEED_RATE = {"pick":"units","pack":"units","engrave":"units","replenish":"moves",
+              "pick_mgn":"units","pick_norm":"units"}
 
 @app.route("/speed")
 def speed():
@@ -390,33 +393,46 @@ def speed():
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
         cur.execute("""
         WITH base AS (   -- tote-moves are a separate pseudo-activity so they don't count as box moves,
-                         -- but still break a pick/pack bout (a real task switch)
+                         -- but still break a pick/pack bout (a real task switch). mgn flags a MagNano-case
+                         -- pick (SPC-MGN) so picking can be split into MagNano vs normal without disturbing
+                         -- the shared timeline (task-switch handling) or the overall 'pick' the planner uses.
           SELECT person,
             CASE WHEN stage='replenish' AND ((raw->>'reason') ILIKE '%%tote%%' OR coalesce(quantity,0)<=1)
-                 THEN 'move_tote' ELSE stage END AS estage, quantity, ts
+                 THEN 'move_tote' ELSE stage END AS estage,
+            (stage='pick' AND left(sku,7)='SPC-MGN') AS mgn, quantity, ts
           FROM event
           WHERE ((source='shiphero' AND stage IN ('pick','pack','replenish'))
                  OR (source='logger' AND stage='engrave'))
             AND et_day(ts) BETWEEN %s AND %s),
-        b2 AS (SELECT person, estage, quantity, ts,
+        b2 AS (SELECT person, estage, mgn, quantity, ts,
             EXTRACT(epoch FROM (ts - lag(ts) OVER (PARTITION BY person,estage ORDER BY ts))) sg FROM base),
-        chunked AS (SELECT person, estage, quantity, ts,   -- collapse <=5s bursts into one action
+        chunked AS (SELECT person, estage, mgn, quantity, ts,   -- collapse <=5s bursts into one action
             sum(CASE WHEN sg IS NULL OR sg > %s THEN 1 ELSE 0 END)
                 OVER (PARTITION BY person,estage ORDER BY ts) cid FROM b2),
-        chunks AS (SELECT person, estage, sum(quantity) units, min(ts) ts
+        chunks AS (SELECT person, estage, bool_or(mgn) mgn, sum(quantity) units, min(ts) ts
                    FROM chunked GROUP BY person,estage,cid),
-        tl AS (SELECT person, estage, units, ts,   -- cross-activity timeline
+        tl AS (SELECT person, estage, mgn, units, ts,   -- cross-activity timeline
             EXTRACT(epoch FROM (ts - lag(ts) OVER (PARTITION BY person ORDER BY ts))) gap,
             lag(estage) OVER (PARTITION BY person ORDER BY ts) pstage,
             (ts AT TIME ZONE 'America/New_York')::date d FROM chunks),
-        iv AS (SELECT person, estage AS stage, units, gap, d FROM tl
+        iv AS (SELECT person, estage AS stage, mgn, units, gap, d FROM tl
                WHERE pstage=estage AND gap>0 AND gap<%s)   -- continuous same activity, under the break
         SELECT person, stage, count(*) n, count(DISTINCT d) days,
           round(sum(gap)/60.0,1) active_min, sum(units) units,
           round(percentile_cont(0.5) WITHIN GROUP (ORDER BY gap/nullif(units,0))::numeric,1) med_spi,
           round(percentile_cont(0.5) WITHIN GROUP (ORDER BY gap)::numeric,1) med_move
         FROM iv WHERE stage IN ('pick','pack','engrave','replenish')
-        GROUP BY person, stage""", [frm, to, SPEED_BURST, SPEED_BREAK])
+        GROUP BY person, stage
+        UNION ALL   -- MagNano-only pick pace (same intervals, shared timeline)
+        SELECT person, 'pick_mgn', count(*), count(DISTINCT d), round(sum(gap)/60.0,1), sum(units),
+          round(percentile_cont(0.5) WITHIN GROUP (ORDER BY gap/nullif(units,0))::numeric,1),
+          round(percentile_cont(0.5) WITHIN GROUP (ORDER BY gap)::numeric,1)
+        FROM iv WHERE stage='pick' AND mgn GROUP BY person
+        UNION ALL   -- everything-else pick pace
+        SELECT person, 'pick_norm', count(*), count(DISTINCT d), round(sum(gap)/60.0,1), sum(units),
+          round(percentile_cont(0.5) WITHIN GROUP (ORDER BY gap/nullif(units,0))::numeric,1),
+          round(percentile_cont(0.5) WITHIN GROUP (ORDER BY gap)::numeric,1)
+        FROM iv WHERE stage='pick' AND NOT mgn GROUP BY person""", [frm, to, SPEED_BURST, SPEED_BREAK])
         rows = cur.fetchall()
     rows_by_stage = {s: [] for s in SPEED_STAGES}
     for (person, stage, n, days, amin, units, med_spi, med_move) in rows:
@@ -968,6 +984,11 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
     <h2>Speed leaderboards <span style="color:#9ca3af;font-weight:400">&mdash; units per active hour, fastest first</span></h2>
     <div class=sub style=margin:0>Only people with enough data are ranked; everyone else is listed as &ldquo;insufficient&rdquo; with the reason. Uses the date range above.</div>
     <div id=speed_boards class=spgrid style=margin-top:12px></div>
+  </div>
+  <div class=card style=margin-top:16px>
+    <h2>Picking speed &mdash; MagNano vs Normal <span style="color:#9ca3af;font-weight:400">&mdash; MagNano cases pick much faster</span></h2>
+    <div class=sub style=margin:0>MagNano cases snap together as one strip, so picking them racks up items far faster than a normal pick. This splits each picker&rsquo;s pace (same median method) on MagNano cases vs everything else, so an easy MagNano-heavy day is obvious.</div>
+    <div id=speed_split style=margin-top:8px></div>
   </div>
   <div class=card style=margin-top:16px>
     <h2>Where the time goes <span style="color:#9ca3af;font-weight:400">&mdash; tracked hours by activity, per person</span></h2>
@@ -1781,6 +1802,29 @@ function renderSpeed(){
     b+='</div>';
   });
   document.getElementById('speed_boards').innerHTML=b;
+  // ---- MagNano vs Normal picking split ----
+  const spEl=document.getElementById('speed_split');
+  if(spEl){
+    const ppl=new Set();['pick_mgn','pick_norm'].forEach(s=>(S[s]||[]).forEach(r=>ppl.add(r.person)));
+    const srows=[...ppl].map(p=>{const m=(S['pick_mgn']||[]).find(r=>r.person===p),nn=(S['pick_norm']||[]).find(r=>r.person===p);
+        return {person:p,type:(m&&m.type)||(nn&&nn.type)||'',
+          mgn:(m&&m.ranked)?m.pace:null, mgn_n:m?m.n:0, mgn_thru:m?m.throughput:0,
+          norm:(nn&&nn.ranked)?nn.pace:null, norm_n:nn?nn.n:0, norm_thru:nn?nn.throughput:0};})
+      .filter(r=>(r.mgn!=null||r.norm!=null) && (segval('team')==='all'||r.type===segval('team')))
+      .sort((a,b)=>(b.mgn||0)-(a.mgn||0));
+    if(!srows.length)spEl.innerHTML='<div class=sub>No ranked picking data in this window yet.</div>';
+    else{let sp='<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th>Type</th>'+
+        '<th title="typical MagNano items/hr (pace)">MagNano /hr</th><th title="timed intervals">n</th>'+
+        '<th title="typical normal-pick items/hr (pace)">Normal /hr</th><th title="timed intervals">n</th>'+
+        '<th title="how many times faster MagNano picks vs normal">MagNano &times;</th></tr>';
+      srows.forEach(r=>{const mult=(r.mgn&&r.norm)?(r.mgn/r.norm):null;
+        sp+='<tr><td class=name style=text-align:left>'+esc(r.person)+'</td><td>'+badge(r.type)+'</td>'+
+          '<td><b>'+(r.mgn!=null?fmt(r.mgn):'<span class=dmt>&middot;</span>')+'</b></td><td class=sub2>'+(r.mgn_n||'&middot;')+'</td>'+
+          '<td><b>'+(r.norm!=null?fmt(r.norm):'<span class=dmt>&middot;</span>')+'</b></td><td class=sub2>'+(r.norm_n||'&middot;')+'</td>'+
+          '<td>'+(mult?'<b style="color:'+(mult>=1.5?'#b45309':'#334155')+'">'+mult.toFixed(1)+'&times;</b>':'<span class=dmt>&mdash;</span>')+'</td></tr>';});
+      sp+='</table></div><div class=sub2 style="margin-top:6px">Pace = typical items/hr when hands are on the task (median method, same as the boards above). A person only appears in a column once they have enough timed MagNano (or normal) picks to rank.</div>';
+      spEl.innerHTML=sp;}
+  }
   // ---- hours by activity (where each person's time went) ----
   const HB={};
   SP_STAGES.forEach(s=>(S[s]||[]).forEach(r=>{(HB[r.person]=HB[r.person]||{type:r.type})[s]=(r.active_min||0)/60;}));
