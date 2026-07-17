@@ -647,6 +647,45 @@ def outstanding():
                    aged=aged_n, aged_value=aged_v,
                    snapshot_at=(snap.isoformat() if snap else None), aging=aging, oldest=oldest, status=status)
 
+@app.route("/daily")
+def daily():
+    """Per-DAY team report for the window: one row per active working day (empty days —
+    weekends, holidays — are dropped), so you can scan day-by-day performance. Orders
+    shipped, fulfillment (pick/pack/engrave, MagNano-corrected), restock, people on the
+    floor, active person-hours (45-min-break rule) and the day's UPLH."""
+    frm, to = _range()
+    with connect() as c, c.cursor(row_factory=tuple_row) as cur:
+        cur.execute("""
+        WITH ev AS (
+          SELECT person, ts, et_day(ts) d, stage, subtype, quantity, order_number
+          FROM event WHERE et_day(ts) BETWEEN %s AND %s AND person <> ALL(%s)),
+        act AS (   -- total active person-seconds/day = consecutive floor-labor gaps under the 45-min break
+          SELECT d, sum(CASE WHEN gap>0 AND gap<%s THEN gap ELSE 0 END) active_s
+          FROM (SELECT d, EXTRACT(epoch FROM (ts - lag(ts) OVER (PARTITION BY person,d ORDER BY ts))) gap
+                FROM ev WHERE is_floor_labor(stage,subtype)) g GROUP BY d),
+        shp AS (SELECT d, count(DISTINCT order_number) shipped
+                FROM ev WHERE stage='pack' AND order_number IS NOT NULL GROUP BY d)
+        SELECT e.d, EXTRACT(isodow FROM e.d)::int dow,
+          count(DISTINCT e.person) FILTER (WHERE is_floor_labor(e.stage,e.subtype))  people,
+          COALESCE(sum(e.quantity) FILTER (WHERE e.stage='pick'),0)                  pick,
+          COALESCE(sum(e.quantity) FILTER (WHERE e.stage='pack'),0)                  pack,
+          COALESCE(sum(e.quantity) FILTER (WHERE e.stage='engrave'),0)               engrave,
+          COALESCE(sum(e.quantity) FILTER (WHERE e.stage='replenish'),0)             restock,
+          COALESCE(max(a.active_s),0) active_s, COALESCE(max(s.shipped),0) shipped
+        FROM ev e LEFT JOIN act a USING(d) LEFT JOIN shp s USING(d)
+        GROUP BY e.d ORDER BY e.d""", [frm, to, list(EXCLUDED), ACTIVE_BREAK])
+        rows = cur.fetchall()
+    days = []
+    for (d, dow, people, pick, pack, eng, restock, active_s, shipped) in rows:
+        ful = int(pick) + int(pack) + int(eng)
+        if ful == 0 and int(restock) == 0 and not shipped:
+            continue                                   # skip inactive days (weekends / holidays)
+        hrs = float(active_s or 0) / 3600.0
+        days.append(dict(d=str(d), dow=int(dow), people=int(people or 0), shipped=int(shipped or 0),
+            pick=int(pick), pack=int(pack), engrave=int(eng), fulfillment=ful, restock=int(restock),
+            hours=round(hrs, 1), uplh=(round((ful + int(restock)) / hrs) if hrs > 0 else 0)))
+    return jsonify(range={"from": frm, "to": to}, days=days)
+
 @app.route("/")
 def dashboard():
     return Response(DASHBOARD_HTML, mimetype="text/html")
@@ -868,6 +907,7 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 <div class=sub>Live contribution from ShipHero <b>+ direct-in-Shopify fulfillments + engraving</b>. <b>Fulfillment</b> (pick + pack + engrave) and <b>Restock</b> are two separate tracks.</div>
 <div class=tabs>
   <div class="tab on" data-tab=dash onclick="tab('dash')">Dashboard</div>
+  <div class=tab data-tab=daily onclick="tab('daily')">Daily</div>
   <div class=tab data-tab=out onclick="tab('out')">Outstanding</div>
   <div class=tab data-tab=floor onclick="tab('floor')">Floor Time</div>
   <div class=tab data-tab=log onclick="tab('log')">Log time</div>
@@ -923,6 +963,14 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
   </div>
 </div>
 
+<div id=daily class=hide>
+  <div class=card>
+    <h2>Daily report <span style="color:#9ca3af;font-weight:400">&mdash; one row per working day</span></h2>
+    <div class=sub style=margin:0>Day-by-day team performance for the selected range. Inactive days (weekends, holidays &mdash; no scans) are dropped automatically. <b>Fulfillment</b> = pick + pack + engrave items (MagNano-corrected); <b>UPLH</b> = (fulfillment + restock) ÷ active person-hours (45-min-break rule).</div>
+    <div style="height:280px;margin:14px 0 4px"><canvas id=daily_chart></canvas></div>
+    <div id=daily_body><div class=sub style=margin-top:12px>loading&hellip;</div></div>
+  </div>
+</div>
 <div id=out class=hide>
   <div class=card>
     <h2>Outstanding orders <span style="color:#9ca3af;font-weight:400">&mdash; the backlog we owe: how much, how aged, what status</span></h2>
@@ -1051,7 +1099,7 @@ function segval(id){return document.querySelector('#'+id+' button.on').dataset.v
 function seg(id,v){document.querySelectorAll('#'+id+' button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));render();}
 document.querySelectorAll('.seg').forEach(s=>s.addEventListener('click',e=>{if(e.target.dataset.v){seg(s.id,e.target.dataset.v);}}));
 let curTab='dash';
-function tab(t){curTab=t;['dash','out','floor','log','plan','trend','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
+function tab(t){curTab=t;['dash','daily','out','floor','log','plan','trend','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
   document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('on',el.dataset.tab===t));
   // Only show the controls a tab actually uses (Unit/Stage/Source + exports = Dashboard only;
   // Team/Detail = Dashboard/Floor/Engraving/Analytics), so no toggle is ever an inert no-op.
@@ -1059,7 +1107,7 @@ function tab(t){curTab=t;['dash','out','floor','log','plan','trend','engt','an',
   var c1=document.getElementById('ctl1');if(c1)c1.style.display=showU?'':'none';
   var c2=document.getElementById('ctl2');if(c2)c2.style.display=showTV?'':'none';
   var sm=document.getElementById('summary');if(sm)sm.style.display=showU?'':'none';
-  if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();if(t==='plan')loadPlanner();if(t==='log')loadLog();if(t==='trend')loadTrend();if(t==='out')loadOutstanding();}
+  if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();if(t==='plan')loadPlanner();if(t==='log')loadLog();if(t==='trend')loadTrend();if(t==='out')loadOutstanding();if(t==='daily')loadDaily();}
 // ===== Outstanding orders (the demand-side backlog from ShipHero) =====
 let OUT=null, outSort='age', outDir=-1, outFilter='all';
 function money(v){return '$'+Math.round(v||0).toLocaleString();}
@@ -1137,6 +1185,41 @@ function renderOutstanding(){var o=OUT;
     stamp='<div class=sub style="margin-top:14px">Snapshot '+human+' ago &middot; '+new Date(o.snapshot_at).toLocaleString()+
       (stale?' &middot; <span style="color:#b45309;font-weight:600">may be stale &mdash; auto-refresh pending</span>':'')+'.</div>';}
   document.getElementById('out_body').innerHTML=hero+strip+cmp+ag+hold+st+ol+stamp;}
+// ===== Daily report =====
+let DAILY=null, dailyKey=null, dailyChart=null;
+const DOW=['','Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+async function loadDaily(){var host=document.getElementById('daily_body');
+  const f=document.getElementById('from').value,t=document.getElementById('to').value,k=f+'|'+t;
+  if(DAILY&&dailyKey===k){renderDaily();return;}
+  host.innerHTML='<div class=sub>loading&hellip;</div>';
+  try{DAILY=await getj('/daily?from='+f+'&to='+t);dailyKey=k;}catch(e){host.innerHTML='<div class=sub>could not load daily report</div>';return;}
+  renderDaily();}
+function renderDaily(){if(!DAILY)return;const D=DAILY.days||[];const host=document.getElementById('daily_body');if(!host)return;
+  if(!D.length){host.innerHTML='<div class=sub>No activity in this range.</div>';if(dailyChart){dailyChart.destroy();dailyChart=null;}return;}
+  let h='<div class=tablewrap><table><tr><th style=text-align:left>Day</th><th>People</th><th>Orders shipped</th><th>Fulfillment</th><th>Pick</th><th>Pack</th><th>Engrave</th><th>Restock</th><th>Active h</th><th>UPLH</th></tr>';
+  const T={people:0,shipped:0,ful:0,pick:0,pack:0,eng:0,rest:0,hrs:0};
+  D.forEach(function(r){
+    h+='<tr><td class=name style=text-align:left>'+DOW[r.dow]+' '+r.d.slice(5)+'</td>'+
+      '<td>'+fmt(r.people)+'</td><td><b>'+fmt(r.shipped)+'</b></td><td><b>'+fmt(r.fulfillment)+'</b></td>'+
+      '<td>'+fmt(r.pick)+'</td><td>'+fmt(r.pack)+'</td><td>'+fmt(r.engrave)+'</td><td>'+fmt(r.restock)+'</td>'+
+      '<td>'+r.hours.toFixed(1)+'</td><td><b>'+fmt(r.uplh)+'</b></td></tr>';
+    T.people+=r.people;T.shipped+=r.shipped;T.ful+=r.fulfillment;T.pick+=r.pick;T.pack+=r.pack;T.eng+=r.engrave;T.rest+=r.restock;T.hrs+=r.hours;});
+  const nd=D.length;
+  h+='<tr class=tot><td>Total ('+nd+'d)</td><td>'+Math.round(T.people/nd)+'<span class=sub2> avg</span></td><td><b>'+fmt(T.shipped)+'</b></td><td><b>'+fmt(T.ful)+'</b></td><td>'+fmt(T.pick)+'</td><td>'+fmt(T.pack)+'</td><td>'+fmt(T.eng)+'</td><td>'+fmt(T.rest)+'</td><td>'+T.hrs.toFixed(1)+'</td><td><b>'+fmt(T.hrs>0?Math.round((T.ful+T.rest)/T.hrs):0)+'</b></td></tr></table></div>';
+  host.innerHTML=h;
+  if(curTab!=='daily')return;
+  const labels=D.map(r=>DOW[r.dow]+' '+r.d.slice(5));
+  if(dailyChart)dailyChart.destroy();
+  dailyChart=new Chart(document.getElementById('daily_chart'),{data:{labels:labels,datasets:[
+    {type:'bar',label:'Fulfillment items',data:D.map(r=>r.fulfillment),backgroundColor:C.fulfill,yAxisID:'y',order:3},
+    {type:'line',label:'Orders shipped',data:D.map(r=>r.shipped),borderColor:C.pack,backgroundColor:C.pack,yAxisID:'y1',tension:.3,pointRadius:3,order:1},
+    {type:'line',label:'UPLH',data:D.map(r=>r.uplh),borderColor:'#0f172a',backgroundColor:'#0f172a',yAxisID:'y1',tension:.3,pointRadius:2,borderDash:[4,3],order:2}]},
+    options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
+      scales:{x:{grid:{display:false},ticks:{font:{size:10}}},
+        y:{beginAtZero:true,position:'left',grid:{color:'#eef1f5'},title:{display:true,text:'Fulfillment items / day',color:'#64748b',font:{size:11,weight:'600'}}},
+        y1:{beginAtZero:true,position:'right',grid:{display:false},title:{display:true,text:'Orders / UPLH',color:'#64748b',font:{size:11,weight:'600'}}}},
+      plugins:{legend:{position:'bottom'},title:{display:true,text:'Daily output, orders shipped & UPLH',color:'#0f172a',font:{size:13,weight:'600'}}}}});
+}
 function dateEdit(){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.remove('on'));load();}   // manual date change: drop preset highlight + reload
 function preset(p){document.querySelectorAll('.pill[data-preset]').forEach(b=>b.classList.toggle('on',b.dataset.preset===p));
   let f=etToday(),t=etToday();
@@ -1159,11 +1242,11 @@ function stampRefresh(){var el=document.getElementById('refstamp');if(el)el.text
 async function refreshNow(){
   var a=document.activeElement;   // don't rebuild / steal focus while someone is editing an input
   if(a&&/^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName)&&a.id!=='autoref'&&a.id!=='autoint')return;
-  speedKey=null;floorKey=null;watchKey=null;engKey=null;pspeedKey=null;
+  speedKey=null;floorKey=null;watchKey=null;engKey=null;pspeedKey=null;dailyKey=null;
   await load();
   if(curTab==='engt')loadEngraving(); else if(curTab==='an')loadAnalytics();
   else if(curTab==='plan')loadPlanner(); else if(curTab==='trend')loadTrendData(); else if(curTab==='log')loadLog();
-  else if(curTab==='out')loadOutstanding();
+  else if(curTab==='out')loadOutstanding(); else if(curTab==='daily')loadDaily();
   stampRefresh();
 }
 async function reqWake(){try{if('wakeLock' in navigator)wakeLock=await navigator.wakeLock.request('screen');}catch(e){}}
