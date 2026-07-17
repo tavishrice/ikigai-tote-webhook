@@ -1304,12 +1304,13 @@ function renderDataqc(){if(!DATAQC)return;var q=DATAQC;var host=document.getElem
       out+='<tr><td class=name style=text-align:left>'+esc(r.person)+'</td><td><b>'+fmt(r.today)+'</b></td><td class=sub2>'+fmt(r.median)+'</td>'+
         '<td><b style="color:'+col+'">'+(pc==null?'&mdash;':pc+'%')+'</b></td><td class=sub2>'+(r.last||'&middot;')+'</td></tr>';});
     out+='</table></div>';}
-  out+='<div class=sub style="margin:18px 0 6px"><b>Double-scan / two-machines check</b> &mdash; a badge scanning two <b>different orders within 3 seconds</b> is physically impossible for one person, so a high count means one login may be shared across machines and its per-person numbers can&rsquo;t be trusted. <b>0 is clean.</b></div>'+
-    '<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th title="scans <3s apart on DIFFERENT orders">Impossible jumps</th><th title="scans <1s apart — bursts/bulk, usually normal">Sub-1s bursts</th><th>Total scans</th><th>Status</th></tr>';
-  (q.concurrency||[]).forEach(function(r){var bad=r.jump>=10;
-    out+='<tr><td class=name style=text-align:left>'+esc(r.person)+'</td><td><b style="color:'+(bad?'#b91c1c':'#15803d')+'">'+fmt(r.jump)+'</b></td>'+
+  out+='<div class=sub style="margin:18px 0 6px"><b>Double-scan / shared-login check</b> &mdash; two <b>different orders scanned within 3 seconds</b>. A few are normal (a fast picker finishes one order and immediately starts the next), so the signal is the <b>share</b> of a person&rsquo;s scans that do this &mdash; a genuinely shared badge (two people scanning on one login) drives it far higher. Under ~15% is clean; this is a &ldquo;look closer,&rdquo; never proof.</div>'+
+    '<div class=tablewrap><table><tr><th style=text-align:left>Person</th><th title="scans <3s apart on DIFFERENT orders">Order-jumps &lt;3s</th><th>% of scans</th><th title="scans <1s apart — bursts/bulk, usually normal">Sub-1s bursts</th><th>Total scans</th><th>Status</th></tr>';
+  (q.concurrency||[]).forEach(function(r){var ratio=r.tot>0?(r.jump/r.tot):0;var bad=(ratio>=0.15&&r.jump>=25);var pctc=Math.round(100*ratio);
+    out+='<tr><td class=name style=text-align:left>'+esc(r.person)+'</td><td class=sub2>'+fmt(r.jump)+'</td>'+
+      '<td><b style="color:'+(bad?'#b91c1c':(pctc>=8?'#b45309':'#15803d'))+'">'+pctc+'%</b></td>'+
       '<td class=sub2>'+fmt(r.sub1)+'</td><td class=sub2>'+fmt(r.tot)+'</td>'+
-      '<td>'+(bad?'<span class="wchip r">review &mdash; possible shared login</span>':'<span class=wok>ok</span>')+'</td></tr>';});
+      '<td>'+(bad?'<span class="wchip r">look closer &mdash; unusually high share</span>':'<span class=wok>ok</span>')+'</td></tr>';});
   out+='</table></div>';
   out+='<div class=sub style="margin:18px 0 6px"><b>Day-over-day anomalies</b> (completed days only) &mdash; a person&rsquo;s most recent finished day that&rsquo;s far off their own recent baseline. Worth a sanity-check: could be a genuinely slow/heavy day, PTO, or a data gap.</div>';
   if(!(q.anomalies&&q.anomalies.length))out+='<div class=sub2>None &mdash; every completed day is within a normal range of each person&rsquo;s baseline.</div>';
