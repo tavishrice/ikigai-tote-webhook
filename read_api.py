@@ -65,6 +65,53 @@ PERSON_TYPE = _Roster({
 # submissions; Brennen Myrick: departed). Their historical rows stay in the DB but never surface.
 EXCLUDED = {"Roland Tilk", "Brennen Myrick"}
 
+try:
+    from known_aliases import NON_EMPLOYEES
+except Exception:
+    NON_EMPLOYEES = set()
+
+_CANON_VIEW_DDL = (
+    "CREATE OR REPLACE VIEW event_canon AS "
+    "SELECT ev.id, ev.ts, COALESCE(e.name, ev.person) AS person, "
+    "ev.stage, ev.station, ev.action, ev.order_number, ev.tote_barcode, "
+    "ev.sku, ev.quantity, ev.subtype, ev.source, ev.ext_id, "
+    "ev.dedup_key, ev.raw, ev.ingested_at "
+    "FROM event ev "
+    "LEFT JOIN person_alias a ON a.alias = ev.person "
+    "LEFT JOIN employee e ON e.id = a.employee_id")
+
+def _ensure_canon():
+    try:
+        with connect() as _c:
+            _c.cursor().execute(_CANON_VIEW_DDL); _c.commit()
+    except Exception:
+        pass
+_ensure_canon()
+
+def _decode_hint(pn):
+    if isinstance(pn, str) and pn.startswith("User-"):
+        import base64
+        try:
+            return base64.b64decode(pn[5:]).decode("ascii", "ignore")
+        except Exception:
+            return ""
+    return ""
+
+def _unmatched(cur):
+    """Source identities in event not resolved to an employee (excluding hidden
+    people + known non-employees) -- the Data Issues 'unidentified' list."""
+    cur.execute("""
+        SELECT ev.person, string_agg(DISTINCT ev.source, ',') srcs, count(*) c,
+               to_char(max(ts) AT TIME ZONE 'America/New_York','YYYY-MM-DD') last
+        FROM event ev
+        LEFT JOIN person_alias a ON a.alias = ev.person
+        LEFT JOIN employee e ON e.id = a.employee_id
+        WHERE e.id IS NULL AND ev.person <> ALL(%s)
+        GROUP BY ev.person ORDER BY c DESC""",
+        [list(EXCLUDED | NON_EMPLOYEES)])
+    return [dict(person=r[0], sources=r[1], events=int(r[2]), last=r[3],
+                 hint=_decode_hint(r[0])) for r in cur.fetchall()]
+
 @app.after_request
 def cors(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -113,7 +160,8 @@ def roster():
                         "COALESCE(teams::text,'[]') FROM employee "
                         "WHERE is_active AND dash_type<>'' ORDER BY dash_type, name")
             tagged=[dict(name=r[0], type=r[1], hr_status=r[2], teams=r[4]) for r in cur.fetchall()]
-        return jsonify(employees=emp, aliases=al, tagged=tagged)
+            unmatched=_unmatched(cur)
+        return jsonify(employees=emp, aliases=al, tagged=tagged, unmatched=unmatched)
     except Exception as e:
         return jsonify(error=str(e), employees=0, aliases=0, tagged=[])
 
@@ -124,7 +172,7 @@ def warehouse():
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
         cur.execute("""
         WITH e AS (SELECT person,stage,subtype,source,order_number,quantity,ts,tote_barcode
-                   FROM event WHERE et_day(ts) BETWEEN %s AND %s)
+                   FROM event_canon WHERE et_day(ts) BETWEEN %s AND %s)
         SELECT person,
           COALESCE(sum(quantity) FILTER (WHERE stage='pick'),0)                                  pk_items,
           count(DISTINCT order_number) FILTER (WHERE stage='pick')                                pk_orders,
@@ -195,7 +243,7 @@ def floor_stats():
         cur.execute("""
         WITH ev AS (
           SELECT person, ts, (ts AT TIME ZONE 'America/New_York')::date d, stage, quantity
-          FROM event WHERE is_floor_labor(stage,subtype) AND et_day(ts) BETWEEN %s AND %s),
+          FROM event_canon WHERE is_floor_labor(stage,subtype) AND et_day(ts) BETWEEN %s AND %s),
         seq AS (
           SELECT person, d, ts, stage, quantity,
             EXTRACT(epoch FROM (ts - lag(ts) OVER w)) gap,
@@ -373,7 +421,7 @@ def person_day():
     except Exception: return jsonify(ok=False, error="bad date"), 400
     if not person or person in EXCLUDED: return jsonify(ok=False, error="unknown person"), 400
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
-        cur.execute("""SELECT ts FROM event
+        cur.execute("""SELECT ts FROM event_canon
                        WHERE person=%s AND is_floor_labor(stage,subtype) AND et_day(ts)=%s
                        ORDER BY ts""", [person, day])
         ts=[r[0] for r in cur.fetchall()]
@@ -450,7 +498,7 @@ def speed():
             CASE WHEN stage='replenish' AND ((raw->>'reason') ILIKE '%%tote%%' OR coalesce(quantity,0)<=1)
                  THEN 'move_tote' ELSE stage END AS estage,
             (stage='pick' AND left(sku,7)='SPC-MGN') AS mgn, quantity, ts
-          FROM event
+          FROM event_canon
           WHERE ((source='shiphero' AND stage IN ('pick','pack','replenish'))
                  OR (source='logger' AND stage='engrave'))
             AND et_day(ts) BETWEEN %s AND %s),
@@ -543,7 +591,7 @@ def trend():
         WITH base AS (
           SELECT CASE WHEN stage='replenish' AND ((raw->>'reason') ILIKE '%%tote%%' OR coalesce(quantity,0)<=1)
                       THEN 'move_tote' ELSE stage END AS estage, quantity, ts
-          FROM event
+          FROM event_canon
           WHERE person=%s AND ((source='shiphero' AND stage IN ('pick','pack','replenish'))
                                OR (source='logger' AND stage='engrave'))
             AND et_day(ts) BETWEEN %s AND %s),
@@ -600,7 +648,7 @@ def watch():
           SELECT person, ts, quantity, stage,
             EXTRACT(epoch FROM (ts - lag(ts) OVER (PARTITION BY person,
                   (ts AT TIME ZONE 'America/New_York')::date ORDER BY ts))) gap
-          FROM event
+          FROM event_canon
           WHERE ((source='shiphero' AND stage IN ('pick','pack','replenish'))
                  OR (source='logger' AND stage='engrave'))
             AND et_day(ts) BETWEEN %s AND %s),
@@ -717,7 +765,7 @@ def daily():
         cur.execute("""
         WITH ev AS (
           SELECT person, ts, et_day(ts) d, stage, subtype, quantity, order_number
-          FROM event WHERE et_day(ts) BETWEEN %s AND %s AND person <> ALL(%s)),
+          FROM event_canon WHERE et_day(ts) BETWEEN %s AND %s AND person <> ALL(%s)),
         act AS (   -- total active person-seconds/day = consecutive floor-labor gaps under the 45-min break
           SELECT d, sum(CASE WHEN gap>0 AND gap<%s THEN gap ELSE 0 END) active_s
           FROM (SELECT d, EXTRACT(epoch FROM (ts - lag(ts) OVER (PARTITION BY person,d ORDER BY ts))) gap
@@ -760,7 +808,7 @@ def dataqc():
         cur.execute("""WITH s AS (SELECT person, order_number,
               EXTRACT(epoch FROM (ts-lag(ts) OVER w)) g,
               order_number IS DISTINCT FROM lag(order_number) OVER w diff
-            FROM event WHERE stage IN ('pick','pack') AND person <> ALL(%s) AND et_day(ts)>=%s
+            FROM event_canon WHERE stage IN ('pick','pack') AND person <> ALL(%s) AND et_day(ts)>=%s
             WINDOW w AS (PARTITION BY person ORDER BY ts))
           SELECT person, count(*) FILTER (WHERE g>=0 AND g<3 AND diff) jump,
             count(*) FILTER (WHERE g>=0 AND g<1) sub1, count(*) tot
@@ -769,11 +817,12 @@ def dataqc():
         conc = [dict(person=r[0], jump=int(r[1]), sub1=int(r[2]), tot=int(r[3])) for r in cur.fetchall()]
         cur.execute("""SELECT person, et_day(ts) d,
             COALESCE(sum(quantity) FILTER (WHERE stage IN ('pick','pack','engrave')),0) ful, max(ts) l
-          FROM event WHERE person <> ALL(%s) AND is_floor_labor(stage,subtype) AND et_day(ts)>=%s
+          FROM event_canon WHERE person <> ALL(%s) AND is_floor_labor(stage,subtype) AND et_day(ts)>=%s
           GROUP BY person, et_day(ts)""", [list(EXCLUDED), str(today-dt.timedelta(days=21))])
         by = {}
         for (p, d, ful, l) in cur.fetchall():
             by.setdefault(p, []).append((d, int(ful), l))
+        unidentified = _unmatched(cur)
     anomalies = []; today_rows = []
     for p, rows in by.items():
         rows.sort(key=lambda x: x[0])
@@ -797,7 +846,8 @@ def dataqc():
         today_hm=now.strftime("%-I:%M %p"), is_weekend=(dow >= 6),
         last_ts=(last_ts.isoformat() if last_ts else None),
         last_min_ago=(round((now - last_ts.astimezone(_ET)).total_seconds()/60) if last_ts else None),
-        concurrency=conc, anomalies=anomalies, today_partial=today_rows)
+        concurrency=conc, anomalies=anomalies, today_partial=today_rows,
+        unidentified=unidentified)
 
 @app.route("/")
 def dashboard():
@@ -1345,6 +1395,10 @@ function renderDataqc(){if(!DATAQC)return;var q=DATAQC;var host=document.getElem
   var out='<div class=nrow style="margin:6px 0 2px;gap:20px">'+
     '<span class=sub2>Data freshness: <b style="color:'+fcol+'">'+(fm==null?'no data':(fm+' min ago'))+'</b></span>'+
     '<span class=sub2>Now: <b>'+q.today_hm+'</b> &middot; '+q.today+'</span></div>';
+  if((q.unidentified||[]).length){out+='<div class=sub style="margin:16px 0 6px"><b>Unidentified people</b> &mdash; source scans not matched to an employee. Nobody is named a number &mdash; map them in known_aliases.py (or tell me who they are).</div>'+
+    '<div class=tablewrap><table><tr><th style=text-align:left>Raw identity</th><th>Decoded</th><th>Source</th><th>Events</th><th>Last seen</th></tr>'+
+    q.unidentified.map(function(u){return '<tr><td class=name style=text-align:left>'+esc(u.person)+'</td><td class=sub2>'+esc(u.hint||'')+'</td><td class=sub2>'+esc(u.sources||'')+'</td><td><b>'+fmt(u.events)+'</b></td><td class=sub2>'+esc(u.last||'')+'</td></tr>';}).join('')+
+    '</table></div>';}
   if(q.is_weekend)out+='<div class="plancmp ok" style="margin-top:10px">Today is a weekend &mdash; low or no activity is expected.</div>';
   else out+='<div class="plancmp short" style="margin-top:10px"><b>Today is in progress</b> (as of '+q.today_hm+'). Today&rsquo;s numbers are partial &mdash; a low &ldquo;today&rdquo; is almost always just the day not being over, not a real collapse. Compare completed days on the <span class=tablink onclick="tab(\'daily\')">Daily</span> tab.</div>';
   if(q.today_partial&&q.today_partial.length){
