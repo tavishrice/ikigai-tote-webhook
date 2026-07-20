@@ -189,8 +189,8 @@ def warehouse():
           count(DISTINCT order_number) FILTER (WHERE stage='pick')                                pk_orders,
           COALESCE(sum(quantity) FILTER (WHERE stage='pack' AND source='shiphero'),0)             packsh_items,
           count(DISTINCT order_number) FILTER (WHERE stage='pack' AND source='shiphero')          packsh_orders,
-          COALESCE(sum(quantity) FILTER (WHERE stage='pack' AND source='shopify'),0)              packshop_items,
-          count(DISTINCT order_number) FILTER (WHERE stage='pack' AND source='shopify')           packshop_orders,
+          COALESCE(sum(quantity) FILTER (WHERE stage='pack' AND ((source='shopify' AND et_day(ts) < DATE '2026-07-21') OR (source='logger' AND et_day(ts) >= DATE '2026-07-21'))),0)              packshop_items,
+          count(DISTINCT order_number) FILTER (WHERE stage='pack' AND ((source='shopify' AND et_day(ts) < DATE '2026-07-21') OR (source='logger' AND et_day(ts) >= DATE '2026-07-21')))           packshop_orders,
           COALESCE(sum(quantity) FILTER (WHERE stage='replenish'),0)                              repl_units,
           COALESCE(sum(quantity) FILTER (WHERE stage='engrave'),0)                                 eng_items,
           count(DISTINCT order_number) FILTER (WHERE stage='engrave')                             eng_orders,
@@ -775,7 +775,7 @@ def daily():
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
         cur.execute("""
         WITH ev AS (
-          SELECT person, ts, et_day(ts) d, stage, subtype, quantity, order_number
+          SELECT person, ts, et_day(ts) d, stage, subtype, source, quantity, order_number
           FROM event_canon WHERE et_day(ts) BETWEEN %s AND %s AND person <> ALL(%s)),
         act AS (   -- total active person-seconds/day = consecutive floor-labor gaps under the 45-min break
           SELECT d, sum(CASE WHEN gap>0 AND gap<%s THEN gap ELSE 0 END) active_s
@@ -786,7 +786,7 @@ def daily():
         SELECT e.d, EXTRACT(isodow FROM e.d)::int dow,
           count(DISTINCT e.person) FILTER (WHERE is_floor_labor(e.stage,e.subtype))  people,
           COALESCE(sum(e.quantity) FILTER (WHERE e.stage='pick'),0)                  pick,
-          COALESCE(sum(e.quantity) FILTER (WHERE e.stage='pack'),0)                  pack,
+          COALESCE(sum(e.quantity) FILTER (WHERE e.stage='pack' AND NOT (e.source='shopify' AND e.d >= DATE '2026-07-21')),0)                  pack,
           COALESCE(sum(e.quantity) FILTER (WHERE e.stage='engrave'),0)               engrave,
           COALESCE(sum(e.quantity) FILTER (WHERE e.stage='replenish'),0)             restock,
           COALESCE(max(a.active_s),0) active_s, COALESCE(max(s.shipped),0) shipped
