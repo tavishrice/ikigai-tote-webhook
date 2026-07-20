@@ -19,13 +19,48 @@ from db import connect
 
 app = Flask(__name__)
 
-PERSON_TYPE = {
+import time
+class _Roster(dict):
+    """FT / Intern / Seasonal roster for the dashboard's Type column.
+
+    Seeded with the static fallback below (used only if the DB roster is empty
+    or unreachable). At runtime .get() overlays the LIVE roster synced daily
+    from the HR Employee Database (Notion) into the employee + person_alias
+    tables by hr_sync.py -- so new warehouse hires / interns / seasonals show up
+    automatically without editing code. dash_type in {'FT','Intern','Seasonal',''}.
+    """
+    _at = 0.0
+    _live = {}
+
+    @classmethod
+    def _refresh(cls):
+        now = time.time()
+        if cls._live and now - cls._at < 300:      # 5-min cache
+            return
+        try:
+            with connect() as c:
+                cur = c.cursor()
+                cur.execute(
+                    "SELECT a.alias, e.dash_type "
+                    "FROM person_alias a JOIN employee e ON e.id = a.employee_id "
+                    "WHERE e.is_active AND COALESCE(e.dash_type,'') <> ''")
+                cls._live = {row[0]: row[1] for row in cur.fetchall()}
+                cls._at = now
+        except Exception:
+            pass          # tables not created yet / transient DB issue -> keep fallback
+
+    def get(self, key, default=""):
+        self._refresh()
+        v = _Roster._live.get(key)
+        return v if v else dict.get(self, key, default)
+
+PERSON_TYPE = _Roster({
     "Nic Cox":"FT","Halil Gurler":"FT","Kadil Ladson":"FT","Manu Bekele":"FT",
     "Maurice Williams":"FT","Jeffrey Kwan":"FT","Shambria Green":"FT","Breton Rice":"FT",
     "Esra Altug":"Intern","Simay Guner":"Intern","Cindy Lin":"Intern",
     "Lara Nielsen":"Intern","Patrick Robin":"Intern",
     "Broghan Rice":"","Daniella Gross":"",
-}
+})
 # People no longer on the team — hidden from every view (Roland Tilk: terminated for fraudulent
 # submissions; Brennen Myrick: departed). Their historical rows stay in the DB but never surface.
 EXCLUDED = {"Roland Tilk", "Brennen Myrick"}
@@ -66,6 +101,21 @@ def health():
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
         cur.execute("SELECT count(*) FROM event"); n = cur.fetchone()[0]
     return jsonify(status="ok", events=n)
+
+@app.route("/roster")
+def roster():
+    """Read-only view of the HR-synced people roster (for verification/debug)."""
+    try:
+        with connect() as c, c.cursor(row_factory=tuple_row) as cur:
+            cur.execute("SELECT count(*) FROM employee"); emp=cur.fetchone()[0]
+            cur.execute("SELECT count(*) FROM person_alias"); al=cur.fetchone()[0]
+            cur.execute("SELECT name, dash_type, hr_status, is_active, "
+                        "COALESCE(teams::text,'[]') FROM employee "
+                        "WHERE is_active AND dash_type<>'' ORDER BY dash_type, name")
+            tagged=[dict(name=r[0], type=r[1], hr_status=r[2], teams=r[4]) for r in cur.fetchall()]
+        return jsonify(employees=emp, aliases=al, tagged=tagged)
+    except Exception as e:
+        return jsonify(error=str(e), employees=0, aliases=0, tagged=[])
 
 @app.route("/warehouse")
 def warehouse():
@@ -830,7 +880,7 @@ td.name{font-weight:600;color:var(--ink)}
 .tablewrap::-webkit-scrollbar-thumb{background:#d7dbe2;border-radius:8px}
 .tablewrap::-webkit-scrollbar-track{background:transparent}
 .badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:10.5px;font-weight:600}
-.badge.ft{background:var(--accent-weak);color:var(--accent)}.badge.in{background:#f3f0ff;color:var(--violet)}
+.badge.ft{background:var(--accent-weak);color:var(--accent)}.badge.in{background:#f3f0ff;color:var(--violet)}.badge.sea{background:#fff7ed;color:#c2410c}
 .o{color:var(--amber)}.p{color:var(--violet);font-weight:600}.eng{color:var(--teal);font-weight:600}
 tr.tot td{font-weight:700;color:var(--ink);border-top:1.5px solid var(--line);background:#fcfcfd}
 .red{color:var(--red);font-weight:600}
@@ -1004,7 +1054,7 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
   <button class=pill onclick="dl('json')">JSON</button>
 </div>
 <div class=ctl id=ctl2>
-  <span class="seg gray" id=team><button class=on data-v=all>Everyone</button><button data-v=FT>Full-timers</button><button data-v=Intern>Interns</button></span>
+  <span class="seg gray" id=team><button class=on data-v=all>Everyone</button><button data-v=FT>Full-timers</button><button data-v=Seasonal>Seasonal</button><button data-v=Intern>Interns</button></span>
   <span class=lbl style=margin-left:14px>Detail</span><span class=seg id=view><button class=on data-v=simple>Simple</button><button data-v=detailed>Detailed</button></span>
 </div>
 <div class=note id=summary></div>
@@ -1531,7 +1581,7 @@ let ENGR=null,engKey=null,engSort='items',engDir=-1;
 const DOWN=['','Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 function tfilter(p){const t=segval('team');return t==='all'||p.type===t;}
 function DET(){return segval('view')==='detailed';}   // Simple vs Detailed view toggle
-function badge(ty){return '<span class="badge '+(ty==='Intern'?'in':'ft')+'">'+(ty==='Intern'?'Intern':(ty?'Full-timer':'—'))+'</span>';}
+function badge(ty){var cls=ty==='Intern'?'in':(ty==='Seasonal'?'sea':'ft');var lbl=ty==='Intern'?'Intern':(ty==='Seasonal'?'Seasonal':(ty==='FT'?'Full-timer':(ty?ty:'—')));return '<span class="badge '+cls+'">'+lbl+'</span>';}
 function dhead(d){return '<th class="dcol'+(d.dow>=6?' wknd':'')+'">'+DOWN[d.dow]+'<br><span class=s>'+(+d.d.slice(8))+'</span></th>';}
 function chip(u){const c=u>=80?'ugrn':(u>=55?'uamb':'ured');return '<span class="'+c+'">'+u+'%</span>';}
 
@@ -1863,7 +1913,8 @@ function renderAnalytics(){if(!FLOOR)return;
   if(DATA&&DATA.people){const dp=DATA.people.filter(teamFilter);stage={pick:0,packsh:0,packshop:0,eng:0};
     dp.forEach(p=>{stage.pick+=p.items_picked_sh||0;stage.packsh+=p.items_packed_sh||0;stage.packshop+=p.items_packed_shop||0;stage.eng+=p.engraved_items||0;});
     shipped=(DATA.shipped&&DATA.shipped.total)||0;}
-  const teamLbl=segval('team')==='all'?'':' &middot; <b>'+(segval('team')==='FT'?'Full-timers':'Interns')+'</b> only';
+  const _tl={FT:'Full-timers',Intern:'Interns',Seasonal:'Seasonal'};
+  const teamLbl=segval('team')==='all'?'':' &middot; <b>'+(_tl[segval('team')]||segval('team'))+'</b> only';
   let h='<div class=note style=margin-top:0>Team performance for <b>'+FLOOR.range.from+' → '+FLOOR.range.to+'</b>'+teamLbl+'. <b>UPLH</b> = items per active labour hour (the core productivity KPI); active hours use the 45-min-break rule.</div>';
   h+='<div class=cards>'+card('People','on the floor','s-sel',ppl.length)+
     (shipped?card('Orders shipped','out the door','s-sh',shipped):'')+
@@ -1884,7 +1935,7 @@ function renderAnalytics(){if(!FLOOR)return;
   const rows=[...ppl].sort((a,b)=>{const k=anSort;if(k==='person'||k==='type'){const av=(a[k]||''),bv=(b[k]||'');return (av<bv?-1:av>bv?1:0)*anDir;}return ((a[k]||0)-(b[k]||0))*anDir;});
   let tbl='<div class=sub style="margin:16px 0 6px"><b>Full team &mdash; detailed metrics.</b> Click a column header to sort.</div>'+
     '<div class=tablewrap><table><tr>'+cols.map(c=>ath(c[0],c[1],c[2])).join('')+'</tr>';
-  rows.forEach(p=>{const ty=p.type==='FT'?'FT':(p.type==='Intern'?'Intern':'—');
+  rows.forEach(p=>{const ty=p.type==='FT'?'FT':(p.type==='Intern'?'Intern':(p.type==='Seasonal'?'Seasonal':'—'));
     tbl+='<tr><td class=name style=text-align:left>'+esc(p.person)+'</td><td style=text-align:left>'+ty+'</td>'+
       '<td>'+fmt(p.active_days)+'</td><td>'+p.hours.toFixed(1)+'</td><td class=sub2>'+p.span_h.toFixed(1)+'</td>'+
       '<td>'+chip(p.util)+'</td><td><b>'+fmt(p.items)+'</b></td><td><b>'+fmt(p.items_per_hr)+'</b></td>'+
@@ -1895,11 +1946,12 @@ function renderAnalytics(){if(!FLOOR)return;
   const grp=(ty)=>{const g=ppl.filter(p=>p.type===ty);if(!g.length)return null;
     const gh=g.reduce((a,p)=>a+p.hours,0),gi=g.reduce((a,p)=>a+p.items,0),gd=g.reduce((a,p)=>a+p.active_days,0);
     return {n:g.length,hours:Math.round(gh),items:gi,uplh:gh>0?Math.round(gi/gh):0,util:Math.round(g.reduce((a,p)=>a+p.util,0)/g.length),ipd:gd>0?Math.round(gi/gd):0};};
-  const ft=grp('FT'),it=grp('Intern');
+  const ft=grp('FT'),se=grp('Seasonal'),it=grp('Intern');
   let cmp='';
-  if(ft&&it){cmp='<div class=sub style="margin:16px 0 6px"><b>Full-timers vs Interns</b></div>'+
+  const cmpRows=[['Full-timers',ft],['Seasonal',se],['Interns',it]].filter(x=>x[1]);
+  if(cmpRows.length>1){cmp='<div class=sub style="margin:16px 0 6px"><b>Full-timers vs Seasonal vs Interns</b></div>'+
     '<table class=plantbl><tr><th style=text-align:left>Group</th><th>People</th><th>Active hrs</th><th>Items</th><th>UPLH</th><th>Items/day</th><th>Avg util</th></tr>'+
-    [['Full-timers',ft],['Interns',it]].map(x=>'<tr><td class=name style=text-align:left>'+x[0]+'</td><td>'+x[1].n+'</td><td>'+x[1].hours+'</td><td>'+fmt(x[1].items)+'</td><td><b>'+x[1].uplh+'</b></td><td>'+x[1].ipd+'</td><td>'+x[1].util+'%</td></tr>').join('')+'</table>';}
+    cmpRows.map(x=>'<tr><td class=name style=text-align:left>'+x[0]+'</td><td>'+x[1].n+'</td><td>'+x[1].hours+'</td><td>'+fmt(x[1].items)+'</td><td><b>'+x[1].uplh+'</b></td><td>'+x[1].ipd+'</td><td>'+x[1].util+'%</td></tr>').join('')+'</table>';}
   el.innerHTML=h+tbl+cmp;
   if(curTab!=='an')return;   // only build charts when the tab is actually visible
   // daily team output + UPLH trend
