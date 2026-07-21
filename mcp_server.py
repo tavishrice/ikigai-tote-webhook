@@ -108,7 +108,8 @@ def _connect():
     """One short-lived connection per call with a hard statement timeout."""
     conn = psycopg.connect(DATABASE_URL, connect_timeout=15, row_factory=dict_row)
     with conn.cursor() as cur:
-        cur.execute("SET statement_timeout = %s", (STMT_TIMEOUT_MS,))
+        # SET does not accept bound parameters; inline the int-validated value.
+        cur.execute(f"SET statement_timeout = {int(STMT_TIMEOUT_MS)}")
     return conn
 
 
