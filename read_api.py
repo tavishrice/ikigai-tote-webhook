@@ -79,8 +79,8 @@ def _sqlstr(names):
 
 def _canon_where():
     """Board shows ONLY real people: resolved employees + known non-employees,
-    minus hidden (EXCLUDED). Junk/unresolved ids never reach any event_canon view.
-    Data Issues still surfaces them (it reads raw `event`)."""
+    minus hidden (EXCLUDED). Junk / unresolved ids never reach any event_canon
+    view. Data Issues still surfaces them (it reads raw `event`)."""
     allow = "e.id IS NOT NULL"
     if NON_EMPLOYEES:
         allow = "(e.id IS NOT NULL OR ev.person IN (" + _sqlstr(NON_EMPLOYEES) + "))"
@@ -184,6 +184,7 @@ def roster():
             unmatched=_unmatched(cur)
             cur.execute("SELECT name FROM employee WHERE is_active ORDER BY name")
             active_names=[r[0] for r in cur.fetchall() if r[0] not in EXCLUDED]
+            # floor crew for the engraving-tablet name buttons (warehouse-tagged, minus hidden)
             engravers=[t["name"] for t in tagged if t["name"] not in EXCLUDED]
         return jsonify(employees=emp, aliases=al, tagged=tagged, unmatched=unmatched,
                        engravers=engravers, active_names=active_names)
@@ -203,8 +204,8 @@ def warehouse():
           count(DISTINCT order_number) FILTER (WHERE stage='pick')                                pk_orders,
           COALESCE(sum(quantity) FILTER (WHERE stage='pack' AND source='shiphero'),0)             packsh_items,
           count(DISTINCT order_number) FILTER (WHERE stage='pack' AND source='shiphero')          packsh_orders,
-          COALESCE(sum(quantity) FILTER (WHERE stage='pack' AND ((source='shopify' AND et_day(ts) < DATE '2026-07-21') OR (source='logger' AND et_day(ts) >= DATE '2026-07-21'))),0)              packshop_items,
-          count(DISTINCT order_number) FILTER (WHERE stage='pack' AND ((source='shopify' AND et_day(ts) < DATE '2026-07-21') OR (source='logger' AND et_day(ts) >= DATE '2026-07-21')))           packshop_orders,
+          COALESCE(sum(quantity) FILTER (WHERE stage='pack' AND source='shopify'),0)              packshop_items,
+          count(DISTINCT order_number) FILTER (WHERE stage='pack' AND source='shopify')           packshop_orders,
           COALESCE(sum(quantity) FILTER (WHERE stage='replenish'),0)                              repl_units,
           COALESCE(sum(quantity) FILTER (WHERE stage='engrave'),0)                                 eng_items,
           count(DISTINCT order_number) FILTER (WHERE stage='engrave')                             eng_orders,
@@ -246,86 +247,67 @@ def warehouse():
         totals=tot, people=people)
 
 ACTIVE_BREAK = 2700  # seconds = 45 min. ONE definition of "active time" app-wide: from a person's first
-                     # scan to their last, with any gap >= 45 min removed as a break — EXCEPT a gap that
-                     # is replenishment, handled below (Floor Time, Watch List, daily UPLH all use it).
-# Replenishment isn't scanned continuously: the physical work (find boxes, cut them open, place inventory on
-# the shelf one by one) happens across a stretch and is then logged in a BULK BURST of scans — and that
-# burst can land just BEFORE the physical stretch or just AFTER it. So a big idle gap counts as active
-# replenishment ONLY when a genuine replenish burst is immediately adjacent to it: the scan burst right
-# before the gap starts, or right after it ends, is replenishment placing >= REPL_MIN_UNITS units. That
-# credits the work whether the burst was logged before or after it, while a gap fenced by picking/packing on
-# BOTH sides stays a break (so a picker's midday lunch is NOT turned into replenishment). One lunch/day in
-# the 11:00–14:00 window is still carved out; a burst under REPL_MIN_UNITS units (a stray box) never counts.
-# TUNABLE: REPL_MIN_UNITS (how big an adjacent burst must be), REPL_PREP_MAX (max credited to any one gap).
-REPL_BURST_WINDOW = 600   # sec: replenish scans within 10 min of each other are ONE burst (worked + logged
-                          # together). A big gap touching such a burst is that burst's physical work.
-REPL_PREP_MAX  = 10800    # sec = 3 h: ceiling on replenishment time credited to any ONE gap (sanity cap)
-REPL_MIN_UNITS = 12       # a burst must place >= this many units for a gap immediately touching it to count
-LUNCH_START    = "11:00"  # ET: lunch is taken somewhere in this window and must not read as replenishment
-LUNCH_END      = "14:00"
-LUNCH_MAX      = 3600      # sec = 60 min: one lunch/day carved out of credited time inside the lunch window
-
-# ---- ONE replenishment-aware "active seconds" definition, reused by /floor, /watch, /daily. ----
-# Produces CTEs ending in active_day(person, d, active_s). Embed as:  "WITH " + ACTIVE_CTE + ", ... ".
-# Takes two positional params up front: the (from, to) ET-day range for its base `aev` events.
-ACTIVE_CTE = """
-aev AS (
-  SELECT person, ts, (ts AT TIME ZONE 'America/New_York') lt,
-         (ts AT TIME ZONE 'America/New_York')::date d, stage, COALESCE(quantity,0) q
-  FROM event_canon
-  WHERE is_floor_labor(stage,subtype) AND et_day(ts) BETWEEN %s AND %s),
-aseq AS (SELECT *, EXTRACT(epoch FROM (ts - lag(ts) OVER w)) gap,
-         lag(stage) OVER w prev_stage, lead(stage) OVER w next_stage,
-         EXTRACT(epoch FROM (lead(ts) OVER w - ts)) next_gap
-         FROM aev WINDOW w AS (PARTITION BY person,d ORDER BY ts)),
-abrs AS (SELECT *,   -- first / last scan of a replenish burst (scans within {bw}s = one burst)
-   CASE WHEN stage='replenish' AND (prev_stage IS DISTINCT FROM 'replenish' OR gap >= {bw}) THEN 1 ELSE 0 END bstart,
-   CASE WHEN stage='replenish' AND (next_stage IS DISTINCT FROM 'replenish' OR next_gap >= {bw} OR next_stage IS NULL) THEN 1 ELSE 0 END blast
-   FROM aseq),
-abid AS (SELECT *, sum(bstart) OVER (PARTITION BY person,d ORDER BY ts) batch FROM abrs),
-abu  AS (SELECT *, sum(CASE WHEN stage='replenish' THEN q ELSE 0 END)
-                       OVER (PARTITION BY person,d,batch) batch_units FROM abid),
-aq   AS (SELECT *, (bstart=1 AND batch_units >= {mu}) qual_first,   -- burst big enough to earn an adjacent gap
-                   (blast=1 AND batch_units >= {mu}) qual_last FROM abu),
-aql  AS (SELECT *, lag(qual_last) OVER (PARTITION BY person,d ORDER BY ts) prev_qual_last FROM aq),
-acred AS (
-  SELECT person, d, lt, gap,
-    CASE WHEN gap IS NULL THEN 0
-         WHEN gap < {ab} THEN gap                                          -- continuous work always counts
-         WHEN qual_first OR COALESCE(prev_qual_last,false)                 -- a qualifying burst is adjacent:
-              THEN LEAST(gap, {pmax})                                      --   before (qual_first) or after (pql)
-         ELSE 0 END AS credit,                                            -- else a >=45-min gap is a real break
-    CASE WHEN gap >= {ab} AND (qual_first OR COALESCE(prev_qual_last,false)) THEN 1 ELSE 0 END prep
-  FROM aql),
-alun AS (
-  SELECT person, d, sum(credit) gross,
-    sum(CASE WHEN prep=1 THEN GREATEST(0, EXTRACT(epoch FROM (
-           LEAST(lt, (d + time '{le}')) - GREATEST(lt - (credit * interval '1 sec'), (d + time '{ls}'))
-         ))) ELSE 0 END) lunch_overlap
-  FROM acred GROUP BY person,d),
-active_day AS (
-  SELECT person, d, GREATEST(0, gross - LEAST({lmax}, lunch_overlap)) active_s
-  FROM alun)
-""".format(bw=REPL_BURST_WINDOW, ab=ACTIVE_BREAK, mu=REPL_MIN_UNITS, pmax=REPL_PREP_MAX,
-           ls=LUNCH_START, le=LUNCH_END, lmax=LUNCH_MAX)
+                     # scan to their last, with any gap >= 45 min removed as a break (Floor Time, Speed,
+                     # engraving hours all use it).
+# Replenishment is logged differently: a picker/replenisher does the physical work FIRST (find boxes, cut
+# them open, place inventory on the shelf) and then, in a short burst, scans the empty boxes at their
+# locations. So the GAP BEFORE a replenish scan is real work, not a break — but it must be capped so that a
+# 2.5h gap before a single box isn't credited as 2.5h of replenishing. We credit min(gap, cap) where the cap
+# scales with the box size (units placed): a full 40-unit box ~= 14 min, a 1-unit tote move ~= 2 min.
+REPL_BASE = 120           # sec: fixed handling per box (walk to it, open it, log it)
+REPL_PER_UNIT = 18        # sec per unit placed on the shelf (40-unit box => 120 + 720 = 840s = 14 min)
+REPL_BURST_WINDOW = 600   # sec: replenish scans within 10 min of each other are ONE batch (worked together,
+                          # then logged in a burst). So the long gap before the batch is credited to the
+                          # WHOLE batch's fair time, not just the first box's.
+REPL_BURST_MAX = 3600     # sec: ceiling on the work credited before any one batch (60 min)
 
 @app.route("/floor")
 def floor_stats():
     """Effectiveness auditor: per person, active hours (45-min-break session spans) and items, by day."""
     frm, to = _range()
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
-        cur.execute("WITH " + ACTIVE_CTE + """,
-        it AS (   -- per person-day: fulfillment vs replenish units, and the first->last span
+        cur.execute("""
+        WITH ev AS (
+          SELECT person, ts, (ts AT TIME ZONE 'America/New_York')::date d, stage, quantity
+          FROM event_canon WHERE is_floor_labor(stage,subtype) AND et_day(ts) BETWEEN %s AND %s),
+        seq AS (
+          SELECT person, d, ts, stage, quantity,
+            EXTRACT(epoch FROM (ts - lag(ts) OVER w)) gap,
+            lag(stage) OVER w prev_stage
+          FROM ev WINDOW w AS (PARTITION BY person,d ORDER BY ts)),
+        brs AS (   -- a replenish scan starts a new BATCH if the previous scan wasn't replenish or was long ago
+          SELECT *, CASE WHEN stage='replenish' AND (prev_stage IS DISTINCT FROM 'replenish' OR gap >= %s)
+                         THEN 1 ELSE 0 END bstart
+          FROM seq),
+        bid AS (SELECT *, sum(bstart) OVER (PARTITION BY person,d ORDER BY ts) batch FROM brs),
+        capd AS (   -- fair work time for a whole batch = sum of per-box time over its replenish scans
+          SELECT *, sum(CASE WHEN stage='replenish' THEN %s + %s*COALESCE(quantity,0) ELSE 0 END)
+                        OVER (PARTITION BY person,d,batch) batch_cap
+          FROM bid),
+        cred AS (   -- active seconds = sum of credited gaps between consecutive scans.
+                    -- Any sub-break gap counts fully (identical to the old session-span model for everyone).
+                    -- The ONLY change: a >= 45-min gap that lands right before the FIRST scan of a replenish
+                    -- batch is the physical box work (find/cut/place, logged in a burst afterward), so instead
+                    -- of discarding it as a break we credit it up to the whole batch's fair time (scaled by the
+                    -- units placed across the batch, capped). A break before pick/pack is still a break, and a
+                    -- long gap before one small box can never be credited as hours.
+          SELECT person, d, sum(CASE
+              WHEN gap IS NULL THEN 0
+              WHEN stage='replenish' AND bstart=1 AND gap >= %s THEN LEAST(gap, LEAST(%s, batch_cap))
+              WHEN gap < %s THEN gap
+              ELSE 0 END) active_s
+          FROM capd GROUP BY person,d),
+        it AS (
           SELECT person, d,
-            COALESCE(sum(q) FILTER (WHERE stage IN ('pick','pack','engrave')),0) ful,
-            COALESCE(sum(q) FILTER (WHERE stage='replenish'),0) repl,
+            COALESCE(sum(quantity) FILTER (WHERE stage IN ('pick','pack','engrave')),0) ful,
+            COALESCE(sum(quantity) FILTER (WHERE stage='replenish'),0) repl,
             min(ts) first_ts, max(ts) last_ts
-          FROM aev GROUP BY person,d)
+          FROM ev GROUP BY person,d)
         SELECT it.person, it.d, EXTRACT(isodow FROM it.d)::int dow,
-               COALESCE(ad.active_s,0), it.ful, it.repl, it.first_ts, it.last_ts,
+               COALESCE(sp.active_s,0), it.ful, it.repl, it.first_ts, it.last_ts,
                EXTRACT(epoch FROM (it.last_ts-it.first_ts)) span_s
-        FROM it LEFT JOIN active_day ad USING (person,d) ORDER BY it.person, it.d""",
-        [frm, to])
+        FROM it LEFT JOIN cred sp USING (person,d) ORDER BY it.person, it.d""",
+        [frm, to, REPL_BURST_WINDOW, REPL_BASE, REPL_PER_UNIT, ACTIVE_BREAK, REPL_BURST_MAX, ACTIVE_BREAK])
         rows = cur.fetchall()
         cur.execute("SELECT id,person,d,hours,note,author FROM floor_note WHERE d BETWEEN %s AND %s "
                     "ORDER BY d, id", [frm, to])
@@ -384,15 +366,11 @@ def engraving():
     """Detailed engraving view, from the daily rollup (per engraver per day)."""
     frm, to = _range()
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
-        cur.execute("""SELECT COALESCE(e.name, cd.person) AS person, cd.et_day,
-                              sum(cd.scans), sum(cd.totes), sum(cd.matched_totes), max(cd.dotw),
-                              sum(cd.lid), sum(cd.ipe), sum(cd.eng_units), sum(cd.orders), sum(cd.hours)
-                       FROM contribution_daily cd
-                       JOIN person_alias a ON a.alias = cd.person
-                       JOIN employee e ON e.id = a.employee_id
-                       WHERE cd.stage='engrave' AND cd.et_day BETWEEN %s AND %s
-                         AND e.name <> ALL(%s)
-                       GROUP BY 1, cd.et_day ORDER BY 1, cd.et_day""", [frm, to, list(EXCLUDED)])
+        cur.execute("""SELECT person, et_day, scans, totes, matched_totes, dotw, lid, ipe,
+                              eng_units, orders, hours
+                       FROM contribution_daily WHERE stage='engrave' AND et_day BETWEEN %s AND %s
+                         AND person IN (SELECT a.alias FROM person_alias a JOIN employee e ON e.id=a.employee_id)
+                       ORDER BY person, et_day""", [frm, to])
         rows = cur.fetchall()
     ppl={}
     for (person,d,scans,totes,matched,dotw,lid,ipe,units,orders,hours) in rows:
@@ -463,85 +441,41 @@ GAP_SHOW = 1800   # seconds = 30 min: gaps this long or longer are surfaced as f
 def person_day():
     """One person, one ET day: their scan schedule broken into work blocks and the gaps between
     them, so a leader can SEE the empty windows and log off-scanner time straight into a gap.
-    Active hours match Floor Time: a big gap before a BULK replenish burst is credited as active
-    replenishment prep (shown as its own block, not idle), minus one lunch; span = first->last scan."""
+    Active hours use the same 45-min-break rule as everywhere else; span = first->last scan."""
     person=(request.args.get("person") or "").strip()
     day=(request.args.get("d") or "").strip()[:10]
     try: dt.date.fromisoformat(day)
     except Exception: return jsonify(ok=False, error="bad date"), 400
     if not person or person in EXCLUDED: return jsonify(ok=False, error="unknown person"), 400
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
-        cur.execute("""SELECT ts, stage, COALESCE(quantity,0) FROM event_canon
+        cur.execute("""SELECT ts FROM event_canon
                        WHERE person=%s AND is_floor_labor(stage,subtype) AND et_day(ts)=%s
                        ORDER BY ts""", [person, day])
-        scans=[(r[0], r[1], int(r[2] or 0)) for r in cur.fetchall()]
+        ts=[r[0] for r in cur.fetchall()]
         cur.execute("SELECT id,hours,note,author FROM floor_note WHERE person=%s AND d=%s ORDER BY id",[person,day])
         notes=[dict(id=r[0],hours=float(r[1] or 0),note=r[2] or "",author=r[3] or "") for r in cur.fetchall()]
-    if not scans:
+    if not ts:
         return jsonify(ok=True, person=person, d=day, scans=0, first="", last="",
                        active_h=0, span_h=0, timeline=[], notes=notes)
-    ts=[s[0] for s in scans]; st=[s[1] for s in scans]; q=[s[2] for s in scans]
-    first,last=ts[0],ts[-1]; n=len(scans)
-    # --- adjacent-either-side rule, IDENTICAL to ACTIVE_CTE so the drill-down matches Floor Time ---
-    # A >=45-min gap counts as replenishment ONLY if a qualifying replenish burst (>= REPL_MIN_UNITS units)
-    # is immediately adjacent to it — the burst right before the gap, or right after it — minus one lunch.
-    bstart=[0]*n; blast=[0]*n; batch=[0]*n; run=0
-    for i in range(n):
-        gap=None if i==0 else (ts[i]-ts[i-1]).total_seconds()
-        prv=None if i==0 else st[i-1]
-        nxt=st[i+1] if i+1<n else None
-        ngap=(ts[i+1]-ts[i]).total_seconds() if i+1<n else None
-        bstart[i]=1 if (st[i]=='replenish' and (prv!='replenish' or (gap is not None and gap>=REPL_BURST_WINDOW))) else 0
-        blast[i]=1 if (st[i]=='replenish' and (nxt!='replenish' or (ngap is not None and ngap>=REPL_BURST_WINDOW) or nxt is None)) else 0
-        run+=bstart[i]; batch[i]=run
-    bunits={}
-    for i in range(n):
-        if st[i]=='replenish': bunits[batch[i]]=bunits.get(batch[i],0)+q[i]
-    qual_last=[(blast[i]==1 and bunits.get(batch[i],0)>=REPL_MIN_UNITS) for i in range(n)]
-    lh,lm=[int(x) for x in LUNCH_START.split(":")]; eh,em=[int(x) for x in LUNCH_END.split(":")]
-    dET=first.astimezone(_ET)
-    lstart=dET.replace(hour=lh,minute=lm,second=0,microsecond=0)
-    lend =dET.replace(hour=eh,minute=em,second=0,microsecond=0)
-    gross=0.0; lunch_overlap=0.0; prep=[False]*n; lov=[0.0]*n
-    for i in range(1,n):
-        gap=(ts[i]-ts[i-1]).total_seconds(); u=bunits.get(batch[i],0)
-        qf=(bstart[i]==1 and u>=REPL_MIN_UNITS)   # qualifying burst right AFTER the gap
-        pql=qual_last[i-1]                        # qualifying burst right BEFORE the gap
-        if gap<ACTIVE_BREAK: cr=gap
-        elif qf or pql: cr=min(gap,REPL_PREP_MAX)
-        else: cr=0.0
-        gross+=cr
-        if gap>=ACTIVE_BREAK and (qf or pql):
-            prep[i]=True
-            tET=ts[i].astimezone(_ET); w0=tET-dt.timedelta(seconds=cr)
-            lov[i]=max(0.0,(min(tET,lend)-max(w0,lstart)).total_seconds()); lunch_overlap+=lov[i]
-    lunch_deduct=min(LUNCH_MAX,lunch_overlap); active_s=max(0.0,gross-lunch_deduct)
-    span_s=(last-first).total_seconds()
-    # the prep window that carries the most lunch overlap gets the "-Xm lunch" label
-    lunch_idx=None
-    if lunch_deduct>0:
-        cand=[(lov[i],i) for i in range(n) if prep[i] and lov[i]>0]
-        if cand: lunch_idx=max(cand)[1]
-    # timeline: split into shown blocks at GAP_SHOW; a credited replenishment gap renders as active prep
-    tl=[]; s_start=ts[0]; prev=ts[0]
-    for i in range(1,n):
-        cur_ts=scans[i][0]; g=(cur_ts-prev).total_seconds()
+    first,last=ts[0],ts[-1]
+    blocks=[]; gaps=[]; s_start=ts[0]; prev=ts[0]
+    for cur_ts in ts[1:]:
+        g=(cur_ts-prev).total_seconds()
         if g>=GAP_SHOW:
-            tl.append(dict(kind="work", start=_hm(s_start), end=_hm(prev), start_l=_ampm(s_start),
-                           end_l=_ampm(prev), mins=round((prev-s_start).total_seconds()/60)))
-            if prep[i]:
-                ent=dict(kind="prep", start=_hm(prev), end=_hm(cur_ts), start_l=_ampm(prev),
-                         end_l=_ampm(cur_ts), mins=round(g/60))
-                if i==lunch_idx: ent["lunch_min"]=round(lunch_deduct/60)
-                tl.append(ent)
-            else:
-                tl.append(dict(kind="gap", start=_hm(prev), end=_hm(cur_ts), start_l=_ampm(prev),
-                               end_l=_ampm(cur_ts), mins=round(g/60), brk=(g>=ACTIVE_BREAK)))
-            s_start=cur_ts
+            blocks.append((s_start,prev)); gaps.append((prev,cur_ts,g,g>=ACTIVE_BREAK)); s_start=cur_ts
         prev=cur_ts
-    tl.append(dict(kind="work", start=_hm(s_start), end=_hm(prev), start_l=_ampm(s_start),
-                   end_l=_ampm(prev), mins=round((prev-s_start).total_seconds()/60)))
-    return jsonify(ok=True, person=person, d=day, scans=n,
+    blocks.append((s_start,prev))
+    span_s=(last-first).total_seconds()
+    active_s=span_s-sum(g for (_,_,g,brk) in gaps if brk)   # remove only 45-min+ breaks (matches /floor)
+    tl=[]
+    for i,(s,e) in enumerate(blocks):
+        tl.append(dict(kind="work", start=_hm(s), end=_hm(e), start_l=_ampm(s), end_l=_ampm(e),
+                       mins=round((e-s).total_seconds()/60)))
+        if i < len(gaps):
+            gs,ge,g,brk=gaps[i]
+            tl.append(dict(kind="gap", start=_hm(gs), end=_hm(ge), start_l=_ampm(gs), end_l=_ampm(ge),
+                           mins=round(g/60), brk=brk))
+    return jsonify(ok=True, person=person, d=day, scans=len(ts),
                    first=_ampm(first), last=_ampm(last),
                    active_h=round(active_s/3600,2), span_h=round(span_s/3600,2),
                    timeline=tl, notes=notes)
@@ -736,23 +670,24 @@ def watch():
         exp_days=5
     exp_hours=WATCH["target_day_hr"]*exp_days                       # 10h per weekday
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
-        cur.execute("WITH " + ACTIVE_CTE + """,
-        wev AS (   -- span + output source (active seconds come from active_day, replenishment-aware)
-          SELECT person, ts, quantity, stage, (ts AT TIME ZONE 'America/New_York')::date d
+        cur.execute("""
+        WITH ev AS (
+          SELECT person, ts, quantity, stage,
+            EXTRACT(epoch FROM (ts - lag(ts) OVER (PARTITION BY person,
+                  (ts AT TIME ZONE 'America/New_York')::date ORDER BY ts))) gap
           FROM event_canon
           WHERE ((source='shiphero' AND stage IN ('pick','pack','replenish'))
                  OR (source='logger' AND stage='engrave'))
             AND et_day(ts) BETWEEN %s AND %s),
         perday AS (
-          SELECT w.person, w.d,
-            EXTRACT(epoch FROM (max(w.ts)-min(w.ts))) span_sec,
-            COALESCE(max(a.active_s),0) active_sec,
-            sum(CASE WHEN w.stage IN ('pick','pack','engrave') THEN w.quantity ELSE 0 END) outp
-          FROM wev w LEFT JOIN active_day a USING (person,d)
-          GROUP BY w.person, w.d)
+          SELECT person, (ts AT TIME ZONE 'America/New_York')::date d,
+            EXTRACT(epoch FROM (max(ts)-min(ts))) span_sec,
+            sum(CASE WHEN gap>0 AND gap<=%s THEN gap ELSE 0 END) active_sec,
+            sum(CASE WHEN stage IN ('pick','pack','engrave') THEN quantity ELSE 0 END) outp
+          FROM ev GROUP BY person,(ts AT TIME ZONE 'America/New_York')::date)
         SELECT person, count(*) days, sum(span_sec) span_sec, sum(active_sec) active_sec,
           sum(outp) output, percentile_cont(0.5) WITHIN GROUP (ORDER BY outp) med_day, max(outp) best_day
-        FROM perday GROUP BY person""", [frm, to, frm, to])
+        FROM perday GROUP BY person""", [frm, to, WATCH_IDLE])
         rows = cur.fetchall()
     ppl = []
     for (person,days,span,active,output,med,best) in rows:
@@ -851,15 +786,17 @@ def daily():
     """Per-DAY team report for the window: one row per active working day (empty days —
     weekends, holidays — are dropped), so you can scan day-by-day performance. Orders
     shipped, fulfillment (pick/pack/engrave, MagNano-corrected), restock, people on the
-    floor, active person-hours (45-min-break rule, bulk-replenish prep credited) and the day's UPLH."""
+    floor, active person-hours (45-min-break rule) and the day's UPLH."""
     frm, to = _range()
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
-        cur.execute("WITH " + ACTIVE_CTE + """,
-        ev AS (
+        cur.execute("""
+        WITH ev AS (
           SELECT person, ts, et_day(ts) d, stage, subtype, quantity, order_number
           FROM event_canon WHERE et_day(ts) BETWEEN %s AND %s AND person <> ALL(%s)),
-        act AS (   -- total active person-seconds/day, replenishment-aware (bulk-prep credited, lunch out)
-          SELECT d, sum(active_s) active_s FROM active_day WHERE person <> ALL(%s) GROUP BY d),
+        act AS (   -- total active person-seconds/day = consecutive floor-labor gaps under the 45-min break
+          SELECT d, sum(CASE WHEN gap>0 AND gap<%s THEN gap ELSE 0 END) active_s
+          FROM (SELECT d, EXTRACT(epoch FROM (ts - lag(ts) OVER (PARTITION BY person,d ORDER BY ts))) gap
+                FROM ev WHERE is_floor_labor(stage,subtype)) g GROUP BY d),
         shp AS (SELECT d, count(DISTINCT order_number) shipped
                 FROM ev WHERE stage='pack' AND order_number IS NOT NULL GROUP BY d)
         SELECT e.d, EXTRACT(isodow FROM e.d)::int dow,
@@ -870,7 +807,7 @@ def daily():
           COALESCE(sum(e.quantity) FILTER (WHERE e.stage='replenish'),0)             restock,
           COALESCE(max(a.active_s),0) active_s, COALESCE(max(s.shipped),0) shipped
         FROM ev e LEFT JOIN act a USING(d) LEFT JOIN shp s USING(d)
-        GROUP BY e.d ORDER BY e.d""", [frm, to, frm, to, list(EXCLUDED), list(EXCLUDED)])
+        GROUP BY e.d ORDER BY e.d""", [frm, to, list(EXCLUDED), ACTIVE_BREAK])
         rows = cur.fetchall()
     days = []
     for (d, dow, people, pick, pack, eng, restock, active_s, shipped) in rows:
@@ -1134,8 +1071,6 @@ td.sub2{color:var(--muted)}
 .tgap:hover{background:#ffedd5;border-color:#fb923c}
 .tgap.brk{background:#fef2f2;border-color:#fecaca;color:#991b1b}.tgap.brk:hover{background:#fee2e2}
 .tgap b{font-weight:700}.tgap .m{font-size:10px;opacity:.85}.tgap .fill{font-size:9.5px;text-transform:uppercase;letter-spacing:.03em;font-weight:700;opacity:.7}
-.tprep{display:inline-flex;flex-direction:column;background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af;border-radius:8px;padding:4px 10px;font-size:11.5px;line-height:1.3;cursor:default}
-.tprep b{font-weight:700}.tprep .m{color:#2563eb;font-size:10px}.tprep .lu{color:#92400e;font-weight:600}
 .tarrow{color:var(--muted);font-size:11px}
 .grp th{border-bottom:none;padding:0 8px 3px}
 .gh{text-align:center;font-size:10px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;padding:4px 6px;border-radius:6px}
@@ -1157,7 +1092,78 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 .ured{color:var(--red);font-weight:700}.uamb{color:var(--amber);font-weight:700}.ugrn{color:var(--green);font-weight:700}
 @media(max-width:1100px){.cards{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:900px){.spgrid{grid-template-columns:1fr}.wrap{padding:20px 16px 80px}}
-</style></head><body><div class=wrap>
+/* ===== TV / clean mode + gear drawer (presentation layer; renderers unchanged) ===== */
+#gearbtn{position:fixed;top:14px;right:16px;z-index:50;width:42px;height:42px;border-radius:11px;border:1px solid var(--line);background:var(--surface);color:var(--ink-2);font-size:20px;cursor:pointer;box-shadow:var(--sh);display:none;align-items:center;justify-content:center}
+#gearbtn:hover{color:var(--ink)}
+body.clean #gearbtn{display:inline-flex}
+#scrim{position:fixed;inset:0;background:rgba(15,23,42,.42);opacity:0;pointer-events:none;transition:opacity .2s;z-index:60}
+#scrim.open{opacity:1;pointer-events:auto}
+#drawer{position:fixed;top:0;right:0;height:100%;width:334px;background:var(--surface);border-left:1px solid var(--line);transform:translateX(100%);transition:transform .22s ease;z-index:70;padding:20px;overflow-y:auto;box-shadow:-18px 0 40px rgba(15,23,42,.18)}
+#drawer.open{transform:translateX(0)}
+#drawer h3{margin:0 0 3px;font-size:16px}
+#drawer .dh{color:var(--muted);font-size:12px;margin-bottom:6px;line-height:1.5}
+#drawer .dsec{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:700;margin:18px 0 8px}
+#drawer .navlist{display:flex;flex-direction:column;gap:2px}
+#drawer .navlist button{text-align:left;border:0;background:transparent;color:var(--ink-2);font:inherit;font-size:13.5px;font-weight:600;padding:8px 10px;border-radius:8px;cursor:pointer}
+#drawer .navlist button:hover{background:var(--accent-weak);color:var(--accent)}
+#drawer .navlist button.cur{background:var(--accent);color:#fff}
+#drawer .dclose{position:absolute;top:14px;right:16px;border:0;background:transparent;font-size:23px;color:var(--muted);cursor:pointer;line-height:1}
+#drawerctl .ctl{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 12px;align-items:center}
+#drawerctl .ctl .spacer,#drawerctl .lbl{width:100%;flex-basis:100%}
+#drawerctl .lbl{margin-top:4px}
+/* clean mode: strip chrome + compact so the dashboard fits one screen */
+body.clean .tabs,body.clean #summary,body.clean .foot,body.clean #statsOrders{display:none!important}
+body.clean>.wrap>.sub{display:none}
+body.clean #dash>.note{display:none}
+body.clean .card>.sub{display:none}
+body.clean{overflow:hidden}
+body.clean .wrap{max-width:none;padding:12px 22px 14px;height:100vh;overflow:hidden;display:flex;flex-direction:column}
+body.clean .apphead{margin-bottom:8px}
+body.clean .shipped{margin:0 0 10px;padding:11px 18px}
+body.clean .cards{grid-template-columns:repeat(6,1fr);gap:10px;margin:0 0 10px}
+body.clean .stat{padding:9px 12px}
+body.clean .stat .v{font-size:20px;margin-top:2px}
+body.clean .stat .k{font-size:10px}
+body.clean #dash{flex:1;display:flex;flex-direction:column;min-height:0;gap:10px}
+body.clean #dash>.card{margin:0!important}
+body.clean #dash .card:has(.chartwrap){flex:1.25;display:flex;flex-direction:column;min-height:0;padding-top:12px}
+body.clean #dash .chartwrap{flex:1;height:auto!important;min-height:0;margin-top:4px}
+body.clean #dash .card:has(#detail){flex:1;min-height:0;display:flex;flex-direction:column;padding-top:12px}
+body.clean #dash .card:has(#detail) #detail{flex:1;min-height:0;overflow:auto}
+body.clean #dash>.card>h2{font-size:13.5px}
+/* dark (TV) — flips the surfaces; chart text is re-themed in drawChart() */
+body.dark{--bg:#0d0d0d;--surface:#1a1a19;--line:#2c2c2a;--line-2:#242422;--ink:#f5f5f0;--ink-2:#c3c2b7;--muted:#8a887f;--accent-weak:#1e2a3f}
+body.dark .shipped{background:linear-gradient(180deg,#15211a,#1a1a19)}
+body.dark tr:hover td{background:#232320}
+body.dark td.gct,body.dark th.gct{background:#20201e}
+body.dark td.gcf,body.dark th.gcf{background:#172233}
+body.dark td.gcr,body.dark th.gcr{background:#221b33}
+body.dark tr:hover td.gct{background:#26261f}body.dark tr:hover td.gcf{background:#1d2942}body.dark tr:hover td.gcr{background:#291f40}
+body.dark tr.tot td{background:#161615}
+body.dark tr.tot td.gct{background:#20201e}body.dark tr.tot td.gcf{background:#172233}body.dark tr.tot td.gcr{background:#221b33}
+body.dark .tablewrap td:first-child,body.dark .tablewrap th:first-child{background:var(--surface)}
+body.dark .tablewrap tr:hover td:first-child{background:#232320}
+body.dark .tablewrap tr.tot td:first-child{background:#161615}
+body.dark .seg.gray{background:#2c2c2a}body.dark .seg.gray button{color:var(--ink-2)}
+body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{background:#2a1f40;color:#b9a4f0}
+</style></head><body>
+<button id=gearbtn onclick="openDrawer()" title="Settings &amp; panels">&#9881;</button>
+<div id=scrim onclick="closeDrawer()"></div>
+<aside id=drawer>
+  <button class=dclose onclick="closeDrawer()" title="Close">&times;</button>
+  <h3>Board settings</h3>
+  <div class=dh>Filters and the other views live here, so the board itself stays clean for the TV.</div>
+  <div class=dsec>Go to panel</div>
+  <div class=navlist id=drawernav></div>
+  <div class=dsec>Filters &amp; date</div>
+  <div id=drawerctl></div>
+  <div class=dsec>Display</div>
+  <div class=navlist>
+    <button onclick="toggleDark()" id=darktoggle>Switch to dark (TV)</button>
+    <button onclick="toggleTV()" id=tvtoggle>Exit TV mode (full controls)</button>
+  </div>
+</aside>
+<div class=wrap>
 <div class=apphead><h1>Warehouse Picking &amp; Packing</h1><span class=dot></span><span class=live>Live</span></div>
 <div class=sub>Live contribution from ShipHero <b>+ direct-in-Shopify fulfillments + engraving</b>. <b>Fulfillment</b> (pick + pack + engrave) and <b>Restock</b> are two separate tracks.</div>
 <div class=tabs>
@@ -1174,10 +1180,10 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
   <div class=tab data-tab=dataqc onclick="tab('dataqc')">Data Issues</div>
 </div>
 <div class=ctl>
-  <button class=pill data-preset=today onclick="preset('today')">Today</button>
+  <button class="pill on" data-preset=today onclick="preset('today')">Today</button>
   <button class=pill data-preset=yest onclick="preset('yest')">Yesterday</button>
   <button class=pill data-preset=week onclick="preset('week')">This week</button>
-  <button class="pill on" data-preset=7 onclick="preset('7')">Last 7 days</button>
+  <button class=pill data-preset=7 onclick="preset('7')">Last 7 days</button>
   <button class=pill data-preset=30 onclick="preset('30')">Last 30 days</button>
   <input type=date id=from onchange="dateEdit()"> <span style=color:#9ca3af>to</span> <input type=date id=to onchange="dateEdit()">
   <button class=pill onclick="load()">Apply</button><span id=status></span>
@@ -1599,6 +1605,8 @@ function render(){if(!DATA)return;
 }
 function card(k,s,cls,val){return '<div class="card stat"><div class=k>'+k+' <span class="s '+cls+'">'+s+'</span></div><div class=v>'+fmt(val)+'</div></div>';}
 function drawChart(ppl,v){
+  const DK=document.body.classList.contains('dark');
+  const C_AX=DK?'#c3c2b7':'#64748b', C_GRID=DK?'#2c2c2a':'#eef1f5', C_TTL=DK?'#f5f5f0':'#0f172a', C_LBL=DK?'#e2e2dc':'#334155';
   const ord=segval('unit')==='orders';            // chart follows the Items/Orders toggle
   const val=(p,c)=>{
     if(ord){ if(c==='pick')return v.pick?p.orders_picked_sh:0;
@@ -1629,18 +1637,18 @@ function drawChart(ppl,v){
       let sum=0,topY=1e9,x=null;
       dis.forEach(di=>{const vv=ch.data.datasets[di].data[i]||0,bar=ch.getDatasetMeta(di).data[i];
         if(vv>0&&bar){sum+=vv;if(bar.y<topY)topY=bar.y;x=bar.x;}});
-      if(sum>0&&x!=null){ctx.fillStyle='#334155';ctx.fillText(sum.toLocaleString(),x,topY-3);}});});
+      if(sum>0&&x!=null){ctx.fillStyle=C_LBL;ctx.fillText(sum.toLocaleString(),x,topY-3);}});});
     ctx.restore();}};
   if(chart)chart.destroy();
   chart=new Chart(document.getElementById('chart'),{type:'bar',data:{labels,datasets:ds},
     options:{responsive:true,maintainAspectRatio:false,layout:{padding:{top:24}},
-      scales:{x:{stacked:true,grid:{display:false},ticks:{autoSkip:false,maxRotation:40,font:{size:11}}},
-              y:{stacked:true,beginAtZero:true,grid:{color:'#eef1f5'},
-                 title:{display:true,text:(ord?'Orders':'Items')+' fulfilled',color:'#64748b',font:{size:11,weight:'600'}}}},
+      scales:{x:{stacked:true,grid:{display:false},ticks:{autoSkip:false,maxRotation:40,font:{size:11},color:C_AX}},
+              y:{stacked:true,beginAtZero:true,grid:{color:C_GRID},ticks:{color:C_AX},
+                 title:{display:true,text:(ord?'Orders':'Items')+' fulfilled',color:C_AX,font:{size:11,weight:'600'}}}},
       plugins:{
         title:{display:true,text:'Fulfillment '+ulbl+' per person — tallest first'+((v.repl&&!ord)?'  (Restocked shown as a separate bar)':''),
-               color:'#0f172a',font:{size:13,weight:'600'},padding:{bottom:12}},
-        legend:{position:'bottom'},
+               color:C_TTL,font:{size:13,weight:'600'},padding:{bottom:12}},
+        legend:{position:'bottom',labels:{color:C_AX}},
         tooltip:{callbacks:{footer:(items)=>{let f=0;items.forEach(i=>{if(i.dataset.stack==='ful')f+=i.parsed.y;});
           return f?'Fulfillment '+ulbl+': '+f.toLocaleString():'';}}}}},
     plugins:[stackTotals]});
@@ -1821,7 +1829,6 @@ async function loadPersonDay(){const person=curPerson(),date=document.getElement
     j.timeline.forEach((t,i)=>{
       if(i)h+='<span class=tarrow>&rsaquo;</span>';
       if(t.kind==='work')h+='<span class=twork><b>'+t.start_l+'&ndash;'+t.end_l+'</b><span class=m>worked '+fmtDur(t.mins)+'</span></span>';
-      else if(t.kind==='prep')h+='<span class=tprep title="Bulk replenishment logged in a burst &mdash; this window is the physical box work, counted as active."><b>'+t.start_l+'&ndash;'+t.end_l+'</b><span class=m>replenishment prep '+fmtDur(t.mins)+(t.lunch_min?' <span class=lu>&minus;'+fmtDur(t.lunch_min)+' lunch</span>':'')+'</span></span>';
       else h+='<span class="tgap'+(t.brk?' brk':'')+'" onclick="gapFill(\''+t.start+'\',\''+t.end+'\')"><b>'+t.start_l+'&ndash;'+t.end_l+'</b><span class=m>'+(t.brk?'break':'gap')+' '+fmtDur(t.mins)+'</span><span class=fill>&#43; log</span></span>';});
     h+='</div>';box.innerHTML=h;
   }catch(e){box.innerHTML='<div class=schead>could not load schedule</div>';}}
@@ -2272,8 +2279,32 @@ function renderWatch(){
   if(insuff.length)h+='<div class=note style=margin-top:14px><b>Not enough data to assess:</b> '+insuff.map(p=>p.person+' <span class=ins>('+p.days+' day'+(p.days===1?'':'s')+')</span>').join(', ')+'</div>';
   document.getElementById('watch_body').innerHTML=h;
 }
-document.getElementById('from').value=etAgo(6);document.getElementById('to').value=etToday();
-load();initAuto();
+// ===== Board settings drawer: hides filters + panel nav so the home stays TV-clean =====
+function openDrawer(){document.getElementById('drawer').classList.add('open');document.getElementById('scrim').classList.add('open');}
+function closeDrawer(){document.getElementById('drawer').classList.remove('open');document.getElementById('scrim').classList.remove('open');}
+var _ctlSel=['.ctl','#ctl1','#ctl2'];
+function _ctlEls(){return _ctlSel.map(function(s){return document.querySelector(s);}).filter(Boolean);}
+function moveControlsToDrawer(){var host=document.getElementById('drawerctl');_ctlEls().forEach(function(el){if(el.parentNode!==host)host.appendChild(el);});}
+function restoreControls(){var wrap=document.querySelector('.wrap'),anchor=document.getElementById('summary');_ctlEls().forEach(function(el){wrap.insertBefore(el,anchor);});}
+function buildDrawerNav(){var nav=document.getElementById('drawernav');if(!nav||nav.childElementCount)return;
+  document.querySelectorAll('.tabs .tab').forEach(function(tb){var b=document.createElement('button');b.textContent=tb.textContent;b.dataset.tab=tb.dataset.tab;if(tb.classList.contains('on'))b.classList.add('cur');
+    b.onclick=function(){tab(tb.dataset.tab);document.querySelectorAll('#drawernav button').forEach(function(x){x.classList.remove('cur');});b.classList.add('cur');closeDrawer();};nav.appendChild(b);});}
+function toggleDark(){document.body.classList.toggle('dark');var on=document.body.classList.contains('dark');
+  var b=document.getElementById('darktoggle');if(b)b.textContent=on?'Switch to light':'Switch to dark (TV)';
+  try{localStorage.setItem('wh_dark',on?'1':'0');}catch(e){} if(DATA)render();}
+function toggleTV(){var on=!document.body.classList.contains('clean');document.body.classList.toggle('clean',on);
+  if(on)moveControlsToDrawer();else restoreControls();
+  var b=document.getElementById('tvtoggle');if(b)b.textContent=on?'Exit TV mode (full controls)':'Enter TV mode (clean board)';
+  try{localStorage.setItem('wh_tv',on?'1':'0');}catch(e){} setTimeout(function(){if(chart)chart.resize();},60);}
+function initView(){buildDrawerNav();
+  var tv='1',dk='0';try{var a=localStorage.getItem('wh_tv');if(a!==null)tv=a;var d=localStorage.getItem('wh_dark');if(d!==null)dk=d;}catch(e){}
+  if(dk==='1')document.body.classList.add('dark');
+  if(tv==='1'){document.body.classList.add('clean');moveControlsToDrawer();}
+  var tb=document.getElementById('tvtoggle');if(tb)tb.textContent=document.body.classList.contains('clean')?'Exit TV mode (full controls)':'Enter TV mode (clean board)';
+  var db=document.getElementById('darktoggle');if(db)db.textContent=document.body.classList.contains('dark')?'Switch to light':'Switch to dark (TV)';
+  setTimeout(function(){if(chart)chart.resize();},80);}
+document.getElementById('from').value=etToday();document.getElementById('to').value=etToday();
+load();initAuto();initView();
 </script></body></html>"""
 
 if __name__ == "__main__":
