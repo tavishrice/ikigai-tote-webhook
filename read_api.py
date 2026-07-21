@@ -957,6 +957,7 @@ td.name{font-weight:600;color:var(--ink)}
 .tablewrap::-webkit-scrollbar-thumb{background:#d7dbe2;border-radius:8px}
 .tablewrap::-webkit-scrollbar-track{background:transparent}
 .badge{display:inline-block;padding:2px 9px;border-radius:20px;font-size:10.5px;font-weight:600}
+.champ{display:inline-block;font-size:9px;font-weight:800;letter-spacing:.02em;padding:2px 7px;border-radius:20px;margin-left:5px;color:#fff;vertical-align:middle;white-space:nowrap;line-height:1.5}
 .badge.ft{background:var(--accent-weak);color:var(--accent)}.badge.in{background:#f3f0ff;color:var(--violet)}.badge.sea{background:#fff7ed;color:#c2410c}
 .o{color:var(--amber)}.p{color:var(--violet);font-weight:600}.eng{color:var(--teal);font-weight:600}
 tr.tot td{font-weight:700;color:var(--ink);border-top:1.5px solid var(--line);background:#fcfcfd}
@@ -1184,6 +1185,11 @@ body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{backgro
   <div class=navlist id=drawernav></div>
   <div class=dsec>Filters &amp; date</div>
   <div id=drawerctl></div>
+  <div class=dsec>Chart</div>
+  <div class=navlist>
+    <button onclick="toggleRotate()" id=rottoggle>Chart: Static</button>
+  </div>
+  <div class=dh style="margin:6px 0 0">Rotating cycles the chart through Fulfillment &rarr; Picking &rarr; Packing &rarr; Engraving &rarr; Restocking every 60s.</div>
   <div class=dsec>Display</div>
   <div class=navlist>
     <button onclick="toggleDark()" id=darktoggle>Switch to dark (TV)</button>
@@ -1387,6 +1393,7 @@ body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{backgro
 const C={pick:'#2563eb',pack:'#16a34a',fulfill:'#d97706',repl:'#7c3aed',engrave:'#0d9488'};
 if(window.Chart){Chart.defaults.font.family="'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif";Chart.defaults.font.size=12;Chart.defaults.color='#475569';Chart.defaults.plugins.legend.labels.usePointStyle=true;Chart.defaults.plugins.legend.labels.boxWidth=8;Chart.defaults.plugins.legend.labels.boxHeight=8;Chart.defaults.plugins.legend.labels.padding=16;}
 let DATA=null, sortKey='items_total', sortDir=-1, chart=null, anTrend=null, anRank=null, anMix=null, anSort='items', anDir=-1;
+let rotTimer=null, rotIdx=0; const ROT_STAGES=['all','pick','pack','engrave','repl'];   // rotating-leaderboard cycle
 function etDstr(d){return d.toLocaleDateString('en-CA',{timeZone:'America/New_York'});}   // YYYY-MM-DD in real ET
 function etToday(){return etDstr(new Date());}
 function etAgo(n){return etDstr(new Date(Date.now()-n*86400000));}
@@ -1597,12 +1604,13 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){retur
 function ampm(iso){if(!iso)return '';return new Date(iso).toLocaleTimeString([], {hour:'numeric',minute:'2-digit',timeZone:'America/New_York'})+' ET';}
 function teamFilter(p){const t=segval('team');return t==='all'||p.type===t;}
 // which fulfillment components are visible for the current Stage/Source toggles
-function vis(){const stage=segval('stage'),src=segval('source');return{
+function visFor(stage,src){return{
   pick:  (stage==='all'||stage==='pick')    && src!=='shopify',
   packsh:(stage==='all'||stage==='pack')    && src!=='shopify',
   packshop:(stage==='all'||stage==='pack')  && src!=='shiphero',
   eng:   (stage==='all'||stage==='engrave') && src!=='shopify',
   repl:  (stage==='all'||stage==='repl')    && src!=='shopify'};}
+function vis(){return visFor(segval('stage'),segval('source'));}
 // visible fulfillment ITEMS total for a person (pick+pack+engrave) — this is the fulfillment bar height
 function fulItems(p,v){return (v.pick?p.items_picked_sh:0)+(v.packsh?p.items_packed_sh:0)+(v.packshop?p.items_packed_shop:0)+(v.eng?p.engraved_items:0);}
 function fulOrders(p,v){return (v.pick?p.orders_picked_sh:0)+(v.packsh?p.orders_packed_sh:0)+(v.packshop?p.orders_packed_shop:0)+(v.eng?(p.engraved_orders||0):0);}
@@ -1633,7 +1641,7 @@ function render(){if(!DATA)return;
     card('Orders packed','Shopify','s-shop',v.packshop?T.packshop_o:0),
     card('Order-lines','pick+pack+engrave, not distinct','s-sel',ordersSel)].join('');
   si.classList.toggle('hide',!showItems);so.classList.toggle('hide',!showOrders);
-  drawChart(ppl,v);
+  if(rotTimer){var _rs=ROT_STAGES[rotIdx];drawChart(ppl,visFor(_rs,segval('source')),_rs);}else{drawChart(ppl,v);}
   drawDetail(ppl,unit,v);
   fillTV(ppl,T,sh);
   if(FLOOR){renderFloor();renderAnalytics();}
@@ -1662,9 +1670,10 @@ function fillTV(ppl,T,sh){
     '<div class=kpi><div class=acc style="background:var(--teal)"></div><div class=kl>People working</div><div class=kv>'+working+'</div><div class=kn>on the floor today</div></div>';
 }
 function card(k,s,cls,val){return '<div class="card stat"><div class=k>'+k+' <span class="s '+cls+'">'+s+'</span></div><div class=v>'+fmt(val)+'</div></div>';}
-function drawChart(ppl,v){
+function drawChart(ppl,v,forceStage){
   const DK=document.body.classList.contains('dark');
   const CLEAN=document.body.classList.contains('clean');   // TV mode → bigger, horizontal person names
+  const stageSel=forceStage||segval('stage');   // forceStage lets the rotating leaderboard drive the chart
   const C_AX=DK?'#c3c2b7':'#64748b', C_GRID=DK?'#2c2c2a':'#eef1f5', C_TTL=DK?'#f5f5f0':'#0f172a', C_LBL=DK?'#e2e2dc':'#334155';
   const NMSZ=CLEAN?13.5:11, NMWT=CLEAN?'600':'400', NMROT=CLEAN?0:40, LBLSZ=CLEAN?12.5:11;
   const ord=segval('unit')==='orders';            // chart follows the Items/Orders toggle
@@ -1679,9 +1688,16 @@ function drawChart(ppl,v){
     if(c==='eng')return v.eng?p.engraved_items:0;
     if(c==='repl')return v.repl?p.replenished:0; return 0; };
   const ftot=p=>val(p,'pick')+val(p,'packsh')+val(p,'packshop')+val(p,'eng');
-  const arr=[...ppl].sort((a,b)=>ftot(b)-ftot(a));  // most -> least, left -> right
+  const sortVal=p=>{                                   // rank by the active action type → a real leaderboard
+    if(stageSel==='pick')return val(p,'pick');
+    if(stageSel==='pack')return val(p,'packsh')+val(p,'packshop');
+    if(stageSel==='engrave')return val(p,'eng');
+    if(stageSel==='repl')return v.repl?p.replenished:0;
+    return ftot(p); };
+  const arr=[...ppl].sort((a,b)=>sortVal(b)-sortVal(a));  // most -> least, left -> right
   const labels=arr.map(p=>p.person);
   const ulbl=ord?'orders':'items';
+  const metricName={all:'Fulfillment',pick:'Picking',pack:'Packing',engrave:'Engraving',repl:'Restocking'}[stageSel]||'Fulfillment';
   const ds=[
     {label:'Picked · ShipHero',stack:'ful',backgroundColor:C.pick,data:arr.map(p=>val(p,'pick'))},
     {label:'Packed · ShipHero',stack:'ful',backgroundColor:C.pack,data:arr.map(p=>val(p,'packsh'))},
@@ -1706,12 +1722,24 @@ function drawChart(ppl,v){
               y:{stacked:true,beginAtZero:true,grid:{color:C_GRID},ticks:{color:C_AX},
                  title:{display:true,text:(ord?'Orders':'Items')+' fulfilled',color:C_AX,font:{size:11,weight:'600'}}}},
       plugins:{
-        title:{display:true,text:'Fulfillment '+ulbl+' per person — tallest first'+((v.repl&&!ord)?'  (Restocked shown as a separate bar)':''),
+        title:{display:true,text:metricName+' '+ulbl+' per person — tallest first'+((stageSel==='all'&&v.repl&&!ord)?'  (Restocked shown as a separate bar)':''),
                color:C_TTL,font:{size:13,weight:'600'},padding:{bottom:12}},
         legend:{position:'bottom',labels:{color:C_AX}},
         tooltip:{callbacks:{footer:(items)=>{let f=0;items.forEach(i=>{if(i.dataset.stack==='ful')f+=i.parsed.y;});
           return f?'Fulfillment '+ulbl+': '+f.toLocaleString():'';}}}}},
     plugins:[stackTotals]});
+}
+// ---- Champion trophies: five titles, assigned to the leader of each action type (a person can hold several) ----
+const CHAMP_DEFS=[['overall','Overall','#c8901a'],['pick','Pick','var(--accent)'],['pack','Pack','var(--green)'],['eng','Engrave','var(--teal)'],['repl','Restock','var(--violet)']];
+function teamChampions(ppl){
+  const m={overall:p=>(p.items_picked_sh||0)+(p.items_packed_sh||0)+(p.items_packed_shop||0)+(p.engraved_items||0)+(p.replenished||0),
+    pick:p=>p.items_picked_sh||0, pack:p=>(p.items_packed_sh||0)+(p.items_packed_shop||0),
+    eng:p=>p.engraved_items||0, repl:p=>p.replenished||0};
+  const win={}; Object.keys(m).forEach(k=>{let b=null,bv=0;ppl.forEach(p=>{const val=m[k](p);if(val>bv){bv=val;b=p.person;}});if(bv>0)win[k]=b;});
+  return win;
+}
+function champChips(name,win){
+  return CHAMP_DEFS.filter(d=>win[d[0]]===name).map(d=>'<span class=champ style="background:'+d[2]+'" title="'+d[1]+' Champion">&#127942; '+d[1]+'</span>').join('');
 }
 function drawDetail(ppl,unit,v){
   // Three visually separated groups: ON THE CLOCK (days + hours, merged from /floor so you can tell
@@ -1722,6 +1750,7 @@ function drawDetail(ppl,unit,v){
   const teamRestock=ppl.reduce((a,p)=>a+(v.repl?p.replenished:0),0)||1;
   const fmap={}; if(FLOOR&&FLOOR.people)FLOOR.people.forEach(p=>fmap[p.person]=p);
   const wd=(FLOOR&&FLOOR.work_days)||0;
+  const CH=teamChampions(ppl);   // champions computed on full per-person data, independent of the stage filter
   const arr=ppl.map(p=>{const fl=fmap[p.person]||{};return {person:p.person, type:p.type,
     items:fulItems(p,v), orders:fulOrders(p,v), restock:(v.repl?p.replenished:0),
     _pick:(v.pick?p.items_picked_sh:0),
@@ -1764,7 +1793,7 @@ function drawDetail(ppl,unit,v){
   const T={items:0,orders:0,restock:0,_pick:0,_pack:0,_eng:0,worked:0,span:0};
   arr.forEach(p=>{
     const dstr=p.active_days?(p.active_days+(wd?' / '+wd:'')):'&mdash;';
-    h+='<tr><td class=name>'+esc(p.person)+'</td><td>'+badge(p.type)+'</td>'+
+    h+='<tr><td class=name>'+esc(p.person)+champChips(p.person,CH)+'</td><td>'+badge(p.type)+'</td>'+
       '<td class=gct>'+dstr+'</td>'+
       '<td class=gct><b>'+(p.span_h?p.span_h.toFixed(1):'&mdash;')+'</b></td>'+
       '<td class="gct sub2">'+(p.worked_h?p.worked_h.toFixed(1):'&mdash;')+'</td>'+
@@ -2352,6 +2381,14 @@ function buildDrawerNav(){var nav=document.getElementById('drawernav');if(!nav||
 function toggleDark(){document.body.classList.toggle('dark');var on=document.body.classList.contains('dark');
   var b=document.getElementById('darktoggle');if(b)b.textContent=on?'Switch to light':'Switch to dark (TV)';
   try{localStorage.setItem('wh_dark',on?'1':'0');}catch(e){} if(DATA)render();}
+// Rotating leaderboard: cycle the chart through all 5 action types every 60s (chart only — table/KPIs stay put)
+function drawRotFrame(){if(!DATA)return;var s=ROT_STAGES[rotIdx];drawChart(DATA.people.filter(teamFilter),visFor(s,segval('source')),s);}
+function setRotate(on){try{localStorage.setItem('wh_rot',on?'1':'0');}catch(e){}
+  if(rotTimer){clearInterval(rotTimer);rotTimer=null;}
+  var b=document.getElementById('rottoggle');if(b)b.textContent=on?'Chart: Rotating — every 60s':'Chart: Static';
+  if(on){rotIdx=0;if(DATA)drawRotFrame();rotTimer=setInterval(function(){rotIdx=(rotIdx+1)%ROT_STAGES.length;if(DATA)drawRotFrame();},60000);}
+  else if(DATA){render();}}
+function toggleRotate(){setRotate(!rotTimer);}
 function toggleTV(){var on=!document.body.classList.contains('clean');document.body.classList.toggle('clean',on);
   if(on)moveControlsToDrawer();else restoreControls();
   var b=document.getElementById('tvtoggle');if(b)b.textContent=on?'Exit TV mode (full controls)':'Enter TV mode (clean board)';
@@ -2362,6 +2399,8 @@ function initView(){buildDrawerNav();document.body.dataset.tab='dash';
   if(tv==='1'){document.body.classList.add('clean');moveControlsToDrawer();}
   var tb=document.getElementById('tvtoggle');if(tb)tb.textContent=document.body.classList.contains('clean')?'Exit TV mode (full controls)':'Enter TV mode (clean board)';
   var db=document.getElementById('darktoggle');if(db)db.textContent=document.body.classList.contains('dark')?'Switch to light':'Switch to dark (TV)';
+  var rot='0';try{var rr=localStorage.getItem('wh_rot');if(rr!==null)rot=rr;}catch(e){}
+  if(rot==='1')setRotate(true);
   setTimeout(function(){if(chart)chart.resize();},80);}
 document.getElementById('from').value=etToday();document.getElementById('to').value=etToday();
 load();initAuto();initView();
