@@ -221,25 +221,23 @@ def warehouse():
         totals=tot, people=people)
 
 ACTIVE_BREAK = 2700  # seconds = 45 min. ONE definition of "active time" app-wide: from a person's first
-                     # scan to their last, with any gap >= 45 min removed as a break — EXCEPT bulk
-                     # replenishment prep, handled below (Floor Time, Watch List, daily UPLH all use it).
-# Replenishment is logged differently from picking/packing: a replenisher does the physical work FIRST
-# (find boxes, cut them open, place inventory on the shelf, one by one) and then, in a short BULK BURST,
-# scans the empty boxes at their locations. So the long GAP BEFORE a bulk replenish burst is real prep
-# work, not idle. We credit the WHOLE gap as active replenishment prep (bounded by REPL_PREP_MAX as a
-# sanity backstop), EXCEPT one lunch break/day that falls inside the 11:00–14:00 window. Two guards keep
-# this honest: (1) the gap is only credited when the following burst is a GENUINE bulk batch — it places
-# at least REPL_MIN_UNITS units — so a single stray box scanned after a real break can never claim hours
-# (it falls back to a tiny units-scaled estimate); (2) a gap before a pick/pack burst is still a break.
-REPL_BURST_WINDOW = 600   # sec: replenish scans within 10 min of each other are ONE batch (worked together,
-                          # then logged in a burst). The long gap before the batch is the prep for it.
-REPL_PREP_MAX  = 10800    # sec = 3 h: "within reason" ceiling on prep credited before any one bulk batch
-REPL_MIN_UNITS = 12       # a batch must place >= this many units to earn full-gap prep credit
-REPL_BASE      = 120      # sec/box: fallback handling for a sub-threshold (tiny) replenish batch
-REPL_PER_UNIT  = 18       # sec/unit: fallback estimate for a sub-threshold batch (stray-box guard)
+                     # scan to their last, with any gap >= 45 min removed as a break — EXCEPT on days with
+                     # real replenishment, handled below (Floor Time, Watch List, daily UPLH all use it).
+# Replenishment doesn't scan continuously: the physical work (find boxes, cut them open, place inventory on
+# the shelf one by one) happens across a stretch, and the scan MARKS land wherever the person circles back
+# to log them — often AFTER intervening packing, sometimes before the work. So the mark's exact position is
+# an unreliable guide to when the labor happened; the reliable signal is that on a day with real
+# replenishment, the person's big idle gaps ARE that replenishment. So: on any person-day whose total
+# replenishment is >= REPL_MIN_UNITS, a gap >= 45 min counts as active replenishment time (capped at
+# REPL_PREP_MAX per gap), EXCEPT one lunch/day inside the 11:00–14:00 window. Guards keeping it honest:
+# a day with little/no replenishment (< REPL_MIN_UNITS units) keeps the old rule — big gaps are breaks —
+# so a pure picker's lunch and a stray single box never turn idle time into credited hours. TUNABLE: raise
+# REPL_MIN_UNITS to require a heavier replenishment day, or lower REPL_PREP_MAX to cap any one gap tighter.
+REPL_PREP_MAX  = 10800    # sec = 3 h: ceiling on replenishment time credited to any ONE gap (sanity cap)
+REPL_MIN_UNITS = 12       # a person must replenish >= this many units THAT DAY for their gaps to count
 LUNCH_START    = "11:00"  # ET: lunch is taken somewhere in this window and must not read as replenishment
 LUNCH_END      = "14:00"
-LUNCH_MAX      = 3600      # sec = 60 min: one lunch/day carved out of prep time inside the lunch window
+LUNCH_MAX      = 3600      # sec = 60 min: one lunch/day carved out of credited time inside the lunch window
 
 # ---- ONE replenishment-aware "active seconds" definition, reused by /floor, /watch, /daily. ----
 # Produces CTEs ending in active_day(person, d, active_s). Embed as:  "WITH " + ACTIVE_CTE + ", ... ".
@@ -250,35 +248,29 @@ aev AS (
          (ts AT TIME ZONE 'America/New_York')::date d, stage, COALESCE(quantity,0) q
   FROM event_canon
   WHERE is_floor_labor(stage,subtype) AND et_day(ts) BETWEEN %s AND %s),
-aseq AS (SELECT *, EXTRACT(epoch FROM (ts - lag(ts) OVER w)) gap, lag(stage) OVER w prev_stage
-         FROM aev WINDOW w AS (PARTITION BY person,d ORDER BY ts)),
-abrs AS (SELECT *, CASE WHEN stage='replenish' AND (prev_stage IS DISTINCT FROM 'replenish' OR gap >= {bw})
-                        THEN 1 ELSE 0 END bstart FROM aseq),
-abid AS (SELECT *, sum(bstart) OVER (PARTITION BY person,d ORDER BY ts) batch FROM abrs),
-abu  AS (SELECT *, sum(CASE WHEN stage='replenish' THEN q ELSE 0 END)
-                       OVER (PARTITION BY person,d,batch) batch_units FROM abid),
+aday AS (SELECT *, sum(CASE WHEN stage='replenish' THEN q ELSE 0 END)
+                       OVER (PARTITION BY person,d) day_repl FROM aev),
+aseq AS (SELECT *, EXTRACT(epoch FROM (ts - lag(ts) OVER w)) gap
+         FROM aday WINDOW w AS (PARTITION BY person,d ORDER BY ts)),
 acred AS (
-  SELECT person, d, lt, gap, stage, bstart, batch_units,
+  SELECT person, d, lt, gap, day_repl,
     CASE WHEN gap IS NULL THEN 0
-         WHEN gap < {ab} THEN gap
-         WHEN stage='replenish' AND bstart=1 THEN
-              CASE WHEN batch_units >= {mu} THEN LEAST(gap, {pmax})
-                   ELSE LEAST(gap, {base} + {per}*batch_units) END
-         ELSE 0 END AS credit,
-    CASE WHEN gap >= {ab} AND stage='replenish' AND bstart=1 AND batch_units >= {mu}
-         THEN 1 ELSE 0 END bulk_prep
-  FROM abu),
+         WHEN gap < {ab} THEN gap                       -- continuous work always counts
+         WHEN day_repl >= {mu} THEN LEAST(gap, {pmax})  -- replenishment day: idle gaps ARE the replenishment
+         ELSE 0 END AS credit,                          -- otherwise a >=45-min gap is a real break
+    CASE WHEN gap >= {ab} AND day_repl >= {mu} THEN 1 ELSE 0 END prep
+  FROM aseq),
 alun AS (
   SELECT person, d, sum(credit) gross,
-    sum(CASE WHEN bulk_prep=1 THEN GREATEST(0, EXTRACT(epoch FROM (
+    sum(CASE WHEN prep=1 THEN GREATEST(0, EXTRACT(epoch FROM (
            LEAST(lt, (d + time '{le}')) - GREATEST(lt - (credit * interval '1 sec'), (d + time '{ls}'))
          ))) ELSE 0 END) lunch_overlap
   FROM acred GROUP BY person,d),
 active_day AS (
   SELECT person, d, GREATEST(0, gross - LEAST({lmax}, lunch_overlap)) active_s
   FROM alun)
-""".format(bw=REPL_BURST_WINDOW, ab=ACTIVE_BREAK, mu=REPL_MIN_UNITS, pmax=REPL_PREP_MAX,
-           base=REPL_BASE, per=REPL_PER_UNIT, ls=LUNCH_START, le=LUNCH_END, lmax=LUNCH_MAX)
+""".format(ab=ACTIVE_BREAK, mu=REPL_MIN_UNITS, pmax=REPL_PREP_MAX,
+           ls=LUNCH_START, le=LUNCH_END, lmax=LUNCH_MAX)
 
 @app.route("/floor")
 def floor_stats():
@@ -447,31 +439,23 @@ def person_day():
         return jsonify(ok=True, person=person, d=day, scans=0, first="", last="",
                        active_h=0, span_h=0, timeline=[], notes=notes)
     ts=[s[0] for s in scans]; first,last=ts[0],ts[-1]; n=len(scans)
-    # --- replenish batches + batch_units, IDENTICAL to ACTIVE_CTE so the drill-down matches Floor Time ---
-    bstart=[0]*n; batch=[0]*n; run=0
-    for i in range(n):
-        st=scans[i][1]
-        gap=None if i==0 else (scans[i][0]-scans[i-1][0]).total_seconds()
-        prev_st=None if i==0 else scans[i-1][1]
-        bs=1 if (st=='replenish' and (prev_st!='replenish' or (gap is not None and gap>=REPL_BURST_WINDOW))) else 0
-        run+=bs; bstart[i]=bs; batch[i]=run
-    bunits={}
-    for i in range(n):
-        if scans[i][1]=='replenish': bunits[batch[i]]=bunits.get(batch[i],0)+scans[i][2]
+    # --- day-level rule, IDENTICAL to ACTIVE_CTE so the drill-down matches Floor Time ---
+    # On a day with real replenishment (>= REPL_MIN_UNITS units), a >=45-min idle gap IS replenishment
+    # work (its scan marks land wherever the person circled back), minus one lunch. Otherwise it's a break.
+    day_repl=sum(s[2] for s in scans if s[1]=='replenish')
+    repl_day = day_repl >= REPL_MIN_UNITS
     lh,lm=[int(x) for x in LUNCH_START.split(":")]; eh,em=[int(x) for x in LUNCH_END.split(":")]
     dET=first.astimezone(_ET)
     lstart=dET.replace(hour=lh,minute=lm,second=0,microsecond=0)
     lend =dET.replace(hour=eh,minute=em,second=0,microsecond=0)
-    # per-transition: credited active seconds, bulk-prep flag, lunch overlap (matches ACTIVE_CTE exactly)
     gross=0.0; lunch_overlap=0.0; prep=[False]*n; lov=[0.0]*n
     for i in range(1,n):
-        st=scans[i][1]; gap=(scans[i][0]-scans[i-1][0]).total_seconds(); u=bunits.get(batch[i],0)
+        gap=(scans[i][0]-scans[i-1][0]).total_seconds()
         if gap<ACTIVE_BREAK: cr=gap
-        elif st=='replenish' and bstart[i]==1:
-            cr=min(gap,REPL_PREP_MAX) if u>=REPL_MIN_UNITS else min(gap,REPL_BASE+REPL_PER_UNIT*u)
+        elif repl_day: cr=min(gap,REPL_PREP_MAX)
         else: cr=0.0
         gross+=cr
-        if gap>=ACTIVE_BREAK and st=='replenish' and bstart[i]==1 and u>=REPL_MIN_UNITS:
+        if gap>=ACTIVE_BREAK and repl_day:
             prep[i]=True
             tET=scans[i][0].astimezone(_ET); w0=tET-dt.timedelta(seconds=cr)
             lov[i]=max(0.0,(min(tET,lend)-max(w0,lstart)).total_seconds()); lunch_overlap+=lov[i]
@@ -482,7 +466,7 @@ def person_day():
     if lunch_deduct>0:
         cand=[(lov[i],i) for i in range(n) if prep[i] and lov[i]>0]
         if cand: lunch_idx=max(cand)[1]
-    # timeline: split into shown blocks at GAP_SHOW; a bulk-replenish-prep gap renders as active prep
+    # timeline: split into shown blocks at GAP_SHOW; a credited replenishment gap renders as active prep
     tl=[]; s_start=ts[0]; prev=ts[0]
     for i in range(1,n):
         cur_ts=scans[i][0]; g=(cur_ts-prev).total_seconds()
@@ -501,16 +485,6 @@ def person_day():
         prev=cur_ts
     tl.append(dict(kind="work", start=_hm(s_start), end=_hm(prev), start_l=_ampm(s_start),
                    end_l=_ampm(prev), mins=round((prev-s_start).total_seconds()/60)))
-    if request.args.get("diag"):   # TEMP read-only diagnostic: per-scan credit decisions
-        diag=[]
-        for i in range(n):
-            g=None if i==0 else round((scans[i][0]-scans[i-1][0]).total_seconds()/60,1)
-            diag.append(dict(i=i, t=_ampm(scans[i][0]), stage=scans[i][1], q=scans[i][2],
-                             gap_min=g, prev=(scans[i-1][1] if i else None),
-                             bstart=bstart[i], batch=batch[i],
-                             batch_units=bunits.get(batch[i],0), prep=prep[i]))
-        return jsonify(ok=True, person=person, d=day, scans=n,
-                       active_h=round(active_s/3600,2), span_h=round(span_s/3600,2), diag=diag)
     return jsonify(ok=True, person=person, d=day, scans=n,
                    first=_ampm(first), last=_ampm(last),
                    active_h=round(active_s/3600,2), span_h=round(span_s/3600,2),
