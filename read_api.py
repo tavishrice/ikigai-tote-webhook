@@ -1117,35 +1117,46 @@ body.clean>.wrap>.sub{display:none}
 body.clean #dash>.note{display:none}
 body.clean .card>.sub{display:none}
 body.clean{overflow:hidden}
-body.clean .wrap{max-width:none;padding:12px 22px 14px;height:100vh;overflow:hidden;display:flex;flex-direction:column}
-body.clean .apphead{margin-bottom:8px}
+body.clean .wrap{max-width:none;padding:7px 18px 8px;height:100vh;overflow:hidden;display:flex;flex-direction:column}
 /* clean mode replaces the app's banner + 6 by-type cards with the approved 4-tile hero strip */
 body.clean .apphead,body.clean .shipped,body.clean .cards{display:none!important}
-body.clean #tvhead{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:10px}
-body.clean #tvkpis{display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr;gap:12px;margin-bottom:10px}
+/* header: title + live on one line; date + "today" on one line */
+body.clean #tvhead{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:6px}
+body.clean #tvkpis{display:grid;grid-template-columns:1.7fr 1fr 1fr 1fr;gap:10px;margin-bottom:8px}
 #tvhead,#tvkpis{display:none}
-.tvbrand .tvtitle{font-size:19px;font-weight:700;letter-spacing:-.01em}
-.tvbrand .tvlive{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-top:3px}
-.tvdatewrap{text-align:center;flex:1}
-.tvdate{font-size:26px;font-weight:700;letter-spacing:-.02em;line-height:1}
-.tvdsub{color:var(--muted);font-size:12.5px;margin-top:3px}
-.tvref{color:var(--muted);font-size:11.5px;text-align:right;min-width:130px;padding-right:46px}
-.kpi{background:var(--surface);border:1px solid var(--line);border-radius:13px;padding:11px 16px;position:relative;overflow:hidden;box-shadow:var(--sh)}
+.tvbrand{display:flex;align-items:baseline;gap:10px}
+.tvbrand .tvtitle{font-size:18px;font-weight:700;letter-spacing:-.01em;white-space:nowrap}
+.tvbrand .tvlive{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.05em}
+.tvdatewrap{flex:1;display:flex;align-items:baseline;justify-content:center;gap:9px}
+.tvdate{font-size:22px;font-weight:700;letter-spacing:-.02em;line-height:1}
+.tvdsub{color:var(--muted);font-size:12.5px}
+.tvref{color:var(--muted);font-size:11px;text-align:right;min-width:110px;padding-right:46px;white-space:nowrap}
+.kpi{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:8px 14px;position:relative;overflow:hidden;box-shadow:var(--sh)}
 .kpi .acc{position:absolute;left:0;top:0;bottom:0;width:4px}
-.kpi .kl{color:var(--muted);font-size:10.5px;letter-spacing:.05em;text-transform:uppercase}
-.kpi .kv{font-weight:700;letter-spacing:-.02em;line-height:1;margin-top:5px;font-size:30px}
-.kpi.hero .kv{font-size:44px}
-.kpi .kn{margin-top:6px;color:var(--ink-2);font-size:12px;display:flex;gap:12px;flex-wrap:wrap}
+.kpi .kl{color:var(--muted);font-size:10px;letter-spacing:.05em;text-transform:uppercase;white-space:nowrap}
+.kpi .kv{font-weight:700;letter-spacing:-.02em;line-height:1;font-size:26px}
+.kpi.hero .kv{font-size:36px;margin-top:3px}
+.kpi .kn{color:var(--ink-2);font-size:11px;display:flex;gap:12px;flex-wrap:wrap;margin-top:3px}
 .kpi .kn .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle}
-body.clean #dash{flex:1;display:flex;flex-direction:column;min-height:0;gap:10px}
-body.clean #dash>.card{margin:0!important}
-body.clean #dash .card:has(.chartwrap){flex:1;display:flex;flex-direction:column;min-height:0;padding-top:10px}
-body.clean #dash .chartwrap{flex:1;height:auto!important;min-height:0;margin-top:2px}
-body.clean #dash .card:has(#detail){flex:1.5;min-height:0;display:flex;flex-direction:column;padding-top:10px}
+/* hero tile: big number and the ShipHero/Shopify split share one line */
+.kpi.hero .herorow{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;margin-top:3px}
+.kpi.hero .herosplit{font-size:12.5px;color:var(--ink-2);display:flex;gap:16px}
+.kpi.hero .herosplit .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle}
+/* non-hero tiles: label + value on ONE line, caption under — fewer visual lines */
+body.clean .kpi:not(.hero){display:grid;grid-template-columns:1fr auto;column-gap:10px;align-items:baseline}
+body.clean .kpi:not(.hero) .kl{grid-column:1;align-self:center}
+body.clean .kpi:not(.hero) .kv{grid-column:2;font-size:24px}
+body.clean .kpi:not(.hero) .kn{grid-column:1/3;margin-top:1px}
+body.clean #dash{flex:1;display:flex;flex-direction:column;min-height:0;gap:8px}
+body.clean #dash>.card{margin:0!important;padding:8px 16px}
+body.clean #dash .card:has(.chartwrap){flex:1 1 auto;min-height:240px;display:flex;flex-direction:column}
+body.clean #dash .card:has(.chartwrap)>h2{display:none}   /* the chart's own title carries it — frees a line */
+body.clean #dash .chartwrap{flex:1;height:auto!important;min-height:0;margin-top:0}
+body.clean #dash .card:has(#detail){flex:0 1 auto;max-height:47vh;min-height:0;display:flex;flex-direction:column}
 body.clean #dash .card:has(#detail) #detail{flex:1;min-height:0;overflow:auto}
-body.clean #dash .card:has(#detail) td{padding:5px 10px}
-body.clean #dash .card:has(#detail) th{padding:4px 10px}
-body.clean #dash>.card>h2{font-size:13px;margin-bottom:2px}
+body.clean #dash .card:has(#detail) td{padding:4px 10px}
+body.clean #dash .card:has(#detail) th{padding:3px 10px}
+body.clean #dash>.card>h2{font-size:12.5px;margin-bottom:2px}
 /* dark (TV) — flips the surfaces; chart text is re-themed in drawChart() */
 body.dark{--bg:#0d0d0d;--surface:#1a1a19;--line:#2c2c2a;--line-2:#242422;--ink:#f5f5f0;--ink-2:#c3c2b7;--muted:#8a887f;--accent-weak:#1e2a3f}
 body.dark .shipped{background:linear-gradient(180deg,#15211a,#1a1a19)}
@@ -1640,8 +1651,9 @@ function fillTV(ppl,T,sh){
   var ful=T.pk_i+T.packsh_i+T.packshop_i+T.eng_i;
   var working=ppl.filter(function(p){return p.type;}).length;   // matched staff on the floor (excludes unmatched scanner IDs)
   host.innerHTML=
-    '<div class="kpi hero"><div class=acc style="background:var(--green)"></div><div class=kl>Orders shipped out the door</div><div class=kv>'+fmt(sh.total)+'</div>'+
-      '<div class=kn><span><span class=sw style="background:var(--accent)"></span>'+fmt(sh.shiphero)+' ShipHero</span><span><span class=sw style="background:var(--amber)"></span>'+fmt(sh.shopify_only)+' Shopify</span></div></div>'+
+    '<div class="kpi hero"><div class=acc style="background:var(--green)"></div><div class=kl>Orders shipped out the door</div>'+
+      '<div class=herorow><div class=kv>'+fmt(sh.total)+'</div>'+
+        '<div class=herosplit><span><span class=sw style="background:var(--accent)"></span>'+fmt(sh.shiphero)+' ShipHero</span><span><span class=sw style="background:var(--amber)"></span>'+fmt(sh.shopify_only)+' Shopify</span></div></div></div>'+
     '<div class=kpi><div class=acc style="background:var(--accent)"></div><div class=kl>Items fulfilled</div><div class=kv>'+fmt(ful)+'</div><div class=kn>pick + pack + engrave</div></div>'+
     '<div class=kpi><div class=acc style="background:var(--violet)"></div><div class=kl>Items restocked</div><div class=kv>'+fmt(T.repl)+'</div><div class=kn>replenishment &middot; separate track</div></div>'+
     '<div class=kpi><div class=acc style="background:var(--teal)"></div><div class=kl>People working</div><div class=kv>'+working+'</div><div class=kn>on the floor today</div></div>';
@@ -1649,7 +1661,9 @@ function fillTV(ppl,T,sh){
 function card(k,s,cls,val){return '<div class="card stat"><div class=k>'+k+' <span class="s '+cls+'">'+s+'</span></div><div class=v>'+fmt(val)+'</div></div>';}
 function drawChart(ppl,v){
   const DK=document.body.classList.contains('dark');
+  const CLEAN=document.body.classList.contains('clean');   // TV mode → bigger, horizontal person names
   const C_AX=DK?'#c3c2b7':'#64748b', C_GRID=DK?'#2c2c2a':'#eef1f5', C_TTL=DK?'#f5f5f0':'#0f172a', C_LBL=DK?'#e2e2dc':'#334155';
+  const NMSZ=CLEAN?13.5:11, NMWT=CLEAN?'600':'400', NMROT=CLEAN?0:40, LBLSZ=CLEAN?12.5:11;
   const ord=segval('unit')==='orders';            // chart follows the Items/Orders toggle
   const val=(p,c)=>{
     if(ord){ if(c==='pick')return v.pick?p.orders_picked_sh:0;
@@ -1675,7 +1689,7 @@ function drawChart(ppl,v){
   const stackTotals={id:'stackTotals',afterDatasetsDraw(ch){
     const ctx=ch.ctx, groups={};
     ch.data.datasets.forEach((d,di)=>{(groups[d.stack]=groups[d.stack]||[]).push(di);});
-    ctx.save();ctx.font='700 11px Inter';ctx.textAlign='center';ctx.textBaseline='bottom';
+    ctx.save();ctx.font='700 '+LBLSZ+'px Inter';ctx.textAlign='center';ctx.textBaseline='bottom';
     ch.data.labels.forEach((_,i)=>{Object.values(groups).forEach(dis=>{
       let sum=0,topY=1e9,x=null;
       dis.forEach(di=>{const vv=ch.data.datasets[di].data[i]||0,bar=ch.getDatasetMeta(di).data[i];
@@ -1685,7 +1699,7 @@ function drawChart(ppl,v){
   if(chart)chart.destroy();
   chart=new Chart(document.getElementById('chart'),{type:'bar',data:{labels,datasets:ds},
     options:{responsive:true,maintainAspectRatio:false,layout:{padding:{top:24}},
-      scales:{x:{stacked:true,grid:{display:false},ticks:{autoSkip:false,maxRotation:40,font:{size:11},color:C_AX}},
+      scales:{x:{stacked:true,grid:{display:false},ticks:{autoSkip:false,maxRotation:NMROT,minRotation:0,font:{size:NMSZ,weight:NMWT},color:C_AX}},
               y:{stacked:true,beginAtZero:true,grid:{color:C_GRID},ticks:{color:C_AX},
                  title:{display:true,text:(ord?'Orders':'Items')+' fulfilled',color:C_AX,font:{size:11,weight:'600'}}}},
       plugins:{
