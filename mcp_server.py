@@ -52,6 +52,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
@@ -115,7 +116,16 @@ def _connect():
 # MCP server + tools
 # --------------------------------------------------------------------------- #
 
-mcp = FastMCP("ikigai-contribution-db", stateless_http=True)
+# Auth is enforced by our own bearer-token middleware below, so the SDK's
+# localhost-only DNS-rebinding protection (which would 421 the Render host) is
+# turned off here — the token, not a host allowlist, is what guards this server.
+mcp = FastMCP(
+    "ikigai-contribution-db",
+    stateless_http=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
+    ),
+)
 
 
 @mcp.tool()
