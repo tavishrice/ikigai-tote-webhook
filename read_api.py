@@ -1095,7 +1095,7 @@ tr.tot td.gct{background:#eef1f6}tr.tot td.gcf{background:#e6eeff}tr.tot td.gcr{
 /* ===== TV / clean mode + gear drawer (presentation layer; renderers unchanged) ===== */
 #gearbtn{position:fixed;top:14px;right:16px;z-index:50;width:42px;height:42px;border-radius:11px;border:1px solid var(--line);background:var(--surface);color:var(--ink-2);font-size:20px;cursor:pointer;box-shadow:var(--sh);display:none;align-items:center;justify-content:center}
 #gearbtn:hover{color:var(--ink)}
-body.clean #gearbtn{display:inline-flex}
+body.clean[data-tab=dash] #gearbtn{display:inline-flex}
 #scrim{position:fixed;inset:0;background:rgba(15,23,42,.42);opacity:0;pointer-events:none;transition:opacity .2s;z-index:60}
 #scrim.open{opacity:1;pointer-events:auto}
 #drawer{position:fixed;top:0;right:0;height:100%;width:334px;background:var(--surface);border-left:1px solid var(--line);transform:translateX(100%);transition:transform .22s ease;z-index:70;padding:20px;overflow-y:auto;box-shadow:-18px 0 40px rgba(15,23,42,.18)}
@@ -1112,14 +1112,14 @@ body.clean #gearbtn{display:inline-flex}
 #drawerctl .ctl .spacer,#drawerctl .lbl{width:100%;flex-basis:100%}
 #drawerctl .lbl{margin-top:4px}
 /* clean mode: strip chrome + compact so the dashboard fits one screen */
-body.clean .tabs,body.clean #summary,body.clean .foot,body.clean #statsOrders{display:none!important}
-body.clean>.wrap>.sub{display:none}
+body.clean[data-tab=dash] .tabs,body.clean[data-tab=dash] #summary,body.clean[data-tab=dash] .foot,body.clean[data-tab=dash] #statsOrders{display:none!important}
+body.clean[data-tab=dash]>.wrap>.sub{display:none}
 body.clean #dash>.note{display:none}
-body.clean .card>.sub{display:none}
-body.clean{overflow:hidden}
-body.clean .wrap{max-width:none;padding:7px 18px 8px;height:100vh;overflow:hidden;display:flex;flex-direction:column}
+body.clean #dash>.card>.sub{display:none}   /* only the dashboard's own card descriptions — never other panels' */
+body.clean[data-tab=dash]{overflow:hidden}
+body.clean[data-tab=dash] .wrap{max-width:none;padding:7px 18px 8px;height:100vh;overflow:hidden;display:flex;flex-direction:column}
 /* clean mode replaces the app's banner + 6 by-type cards with the approved 4-tile hero strip */
-body.clean .apphead,body.clean .shipped,body.clean .cards{display:none!important}
+body.clean[data-tab=dash] .apphead,body.clean[data-tab=dash] .shipped,body.clean[data-tab=dash] .cards{display:none!important}
 /* header: title + live on one line; date + "today" on one line */
 body.clean #tvhead{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:6px}
 body.clean #tvkpis{display:grid;grid-template-columns:1.7fr 1fr 1fr 1fr;gap:10px;margin-bottom:8px}
@@ -1133,21 +1133,22 @@ body.clean #tvkpis{display:grid;grid-template-columns:1.7fr 1fr 1fr 1fr;gap:10px
 .tvref{color:var(--muted);font-size:11px;text-align:right;min-width:110px;padding-right:46px;white-space:nowrap}
 .kpi{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:8px 14px;position:relative;overflow:hidden;box-shadow:var(--sh)}
 .kpi .acc{position:absolute;left:0;top:0;bottom:0;width:4px}
-.kpi .kl{color:var(--muted);font-size:10px;letter-spacing:.05em;text-transform:uppercase;white-space:nowrap}
-.kpi .kv{font-weight:700;letter-spacing:-.02em;line-height:1;font-size:26px}
-.kpi.hero .kv{font-size:36px;margin-top:3px}
-.kpi .kn{color:var(--ink-2);font-size:11px;display:flex;gap:12px;flex-wrap:wrap;margin-top:3px}
+.kpi .kl{color:var(--muted);font-size:11.5px;letter-spacing:.04em;text-transform:uppercase;white-space:nowrap;font-weight:600}
+.kpi .kv{font-weight:800;letter-spacing:-.02em;line-height:1;font-size:30px}
+.kpi.hero .kv{font-size:42px;margin-top:2px}
+.kpi .kn{color:var(--ink-2);font-size:12.5px;display:flex;gap:14px;flex-wrap:wrap;margin-top:3px}
 .kpi .kn .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle}
 /* hero tile: big number and the ShipHero/Shopify split share one line */
 .kpi.hero .herorow{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;margin-top:3px}
 .kpi.hero .herosplit{font-size:12.5px;color:var(--ink-2);display:flex;gap:16px}
 .kpi.hero .herosplit .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle}
 /* non-hero tiles: label + value on ONE line, caption under — fewer visual lines */
-body.clean .kpi:not(.hero){display:grid;grid-template-columns:1fr auto;column-gap:10px;align-items:baseline}
+body.clean .kpi:not(.hero){display:grid;grid-template-columns:1fr auto;column-gap:12px;align-items:baseline;align-content:center}
 body.clean .kpi:not(.hero) .kl{grid-column:1;align-self:center}
-body.clean .kpi:not(.hero) .kv{grid-column:2;font-size:24px}
-body.clean .kpi:not(.hero) .kn{grid-column:1/3;margin-top:1px}
-body.clean #dash{flex:1;display:flex;flex-direction:column;min-height:0;gap:8px}
+body.clean .kpi:not(.hero) .kv{grid-column:2;font-size:34px}
+body.clean .kpi:not(.hero) .kn{grid-column:1/3;margin-top:2px}
+body.clean #tvkpis .kpi:last-child{padding-right:48px}   /* keep the value clear of the fixed gear button */
+body.clean #dash:not(.hide){flex:1;display:flex;flex-direction:column;min-height:0;gap:8px}   /* :not(.hide) so switching tabs still hides the dashboard */
 body.clean #dash>.card{margin:0!important;padding:8px 16px}
 body.clean #dash .card:has(.chartwrap){flex:1 1 auto;min-height:240px;display:flex;flex-direction:column}
 body.clean #dash .card:has(.chartwrap)>h2{display:none}   /* the chart's own title carries it — frees a line */
@@ -1190,12 +1191,6 @@ body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{backgro
   </div>
 </aside>
 <div class=wrap>
-<div id=tvhead>
-  <div class=tvbrand><div class=tvtitle>Warehouse Contribution</div><div class=tvlive><span class=dot></span>Live &middot; ShipHero &middot; Shopify &middot; Engraving</div></div>
-  <div class=tvdatewrap><div class=tvdate id=tvdate></div><div class=tvdsub id=tvdsub></div></div>
-  <div class=tvref><span id=tvrefstamp></span></div>
-</div>
-<div id=tvkpis></div>
 <div class=apphead><h1>Warehouse Picking &amp; Packing</h1><span class=dot></span><span class=live>Live</span></div>
 <div class=sub>Live contribution from ShipHero <b>+ direct-in-Shopify fulfillments + engraving</b>. <b>Fulfillment</b> (pick + pack + engrave) and <b>Restock</b> are two separate tracks.</div>
 <div class=tabs>
@@ -1240,6 +1235,12 @@ body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{backgro
 <div class=note id=summary></div>
 
 <div id=dash>
+  <div id=tvhead>
+    <div class=tvbrand><div class=tvtitle>Warehouse Contribution</div><div class=tvlive><span class=dot></span>Live &middot; ShipHero &middot; Shopify &middot; Engraving</div></div>
+    <div class=tvdatewrap><div class=tvdate id=tvdate></div><div class=tvdsub id=tvdsub></div></div>
+    <div class=tvref><span id=tvrefstamp></span></div>
+  </div>
+  <div id=tvkpis></div>
   <div class="card shipped" id=shipped></div>
   <div class=cards id=statsItems></div>
   <div class=cards id=statsOrders style=margin-top:14px></div>
@@ -1393,7 +1394,7 @@ function segval(id){return document.querySelector('#'+id+' button.on').dataset.v
 function seg(id,v){document.querySelectorAll('#'+id+' button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));render();}
 document.querySelectorAll('.seg').forEach(s=>s.addEventListener('click',e=>{if(e.target.dataset.v){seg(s.id,e.target.dataset.v);}}));
 let curTab='dash';
-function tab(t){curTab=t;['dash','dataqc','out','floor','log','plan','trend','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
+function tab(t){curTab=t;document.body.dataset.tab=t;['dash','dataqc','out','floor','log','plan','trend','engt','an','speed','watch'].forEach(x=>{document.getElementById(x).classList.toggle('hide',x!==t);});
   document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('on',el.dataset.tab===t));
   // Only show the controls a tab actually uses (Unit/Stage/Source + exports = Dashboard only;
   // Team/Detail = Dashboard/Floor/Engraving/Analytics), so no toggle is ever an inert no-op.
@@ -1401,7 +1402,9 @@ function tab(t){curTab=t;['dash','dataqc','out','floor','log','plan','trend','en
   var c1=document.getElementById('ctl1');if(c1)c1.style.display=showU?'':'none';
   var c2=document.getElementById('ctl2');if(c2)c2.style.display=showTV?'':'none';
   var sm=document.getElementById('summary');if(sm)sm.style.display=showU?'':'none';
-  if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();if(t==='plan')loadPlanner();if(t==='log')loadLog();if(t==='trend')loadTrend();if(t==='out')loadOutstanding();if(t==='dataqc')loadDataqc();}
+  if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();if(t==='plan')loadPlanner();if(t==='log')loadLog();if(t==='trend')loadTrend();if(t==='out')loadOutstanding();if(t==='dataqc')loadDataqc();
+  // TV/clean chrome is Dashboard-only: filters live in the drawer on Dashboard, back in place on every other panel
+  if(document.body.classList.contains('clean')){if(t==='dash')moveControlsToDrawer();else restoreControls();}}
 // ===== Outstanding orders (the demand-side backlog from ShipHero) =====
 let OUT=null, outSort='age', outDir=-1, outFilter='all';
 function money(v){return '$'+Math.round(v||0).toLocaleString();}
@@ -2353,7 +2356,7 @@ function toggleTV(){var on=!document.body.classList.contains('clean');document.b
   if(on)moveControlsToDrawer();else restoreControls();
   var b=document.getElementById('tvtoggle');if(b)b.textContent=on?'Exit TV mode (full controls)':'Enter TV mode (clean board)';
   try{localStorage.setItem('wh_tv',on?'1':'0');}catch(e){} setTimeout(function(){if(chart)chart.resize();},60);}
-function initView(){buildDrawerNav();
+function initView(){buildDrawerNav();document.body.dataset.tab='dash';
   var tv='1',dk='0';try{var a=localStorage.getItem('wh_tv');if(a!==null)tv=a;var d=localStorage.getItem('wh_dark');if(d!==null)dk=d;}catch(e){}
   if(dk==='1')document.body.classList.add('dark');
   if(tv==='1'){document.body.classList.add('clean');moveControlsToDrawer();}
