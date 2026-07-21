@@ -221,20 +221,21 @@ def warehouse():
         totals=tot, people=people)
 
 ACTIVE_BREAK = 2700  # seconds = 45 min. ONE definition of "active time" app-wide: from a person's first
-                     # scan to their last, with any gap >= 45 min removed as a break — EXCEPT on days with
-                     # real replenishment, handled below (Floor Time, Watch List, daily UPLH all use it).
-# Replenishment doesn't scan continuously: the physical work (find boxes, cut them open, place inventory on
-# the shelf one by one) happens across a stretch, and the scan MARKS land wherever the person circles back
-# to log them — often AFTER intervening packing, sometimes before the work. So the mark's exact position is
-# an unreliable guide to when the labor happened; the reliable signal is that on a day with real
-# replenishment, the person's big idle gaps ARE that replenishment. So: on any person-day whose total
-# replenishment is >= REPL_MIN_UNITS, a gap >= 45 min counts as active replenishment time (capped at
-# REPL_PREP_MAX per gap), EXCEPT one lunch/day inside the 11:00–14:00 window. Guards keeping it honest:
-# a day with little/no replenishment (< REPL_MIN_UNITS units) keeps the old rule — big gaps are breaks —
-# so a pure picker's lunch and a stray single box never turn idle time into credited hours. TUNABLE: raise
-# REPL_MIN_UNITS to require a heavier replenishment day, or lower REPL_PREP_MAX to cap any one gap tighter.
+                     # scan to their last, with any gap >= 45 min removed as a break — EXCEPT a gap that
+                     # is replenishment, handled below (Floor Time, Watch List, daily UPLH all use it).
+# Replenishment isn't scanned continuously: the physical work (find boxes, cut them open, place inventory on
+# the shelf one by one) happens across a stretch and is then logged in a BULK BURST of scans — and that
+# burst can land just BEFORE the physical stretch or just AFTER it. So a big idle gap counts as active
+# replenishment ONLY when a genuine replenish burst is immediately adjacent to it: the scan burst right
+# before the gap starts, or right after it ends, is replenishment placing >= REPL_MIN_UNITS units. That
+# credits the work whether the burst was logged before or after it, while a gap fenced by picking/packing on
+# BOTH sides stays a break (so a picker's midday lunch is NOT turned into replenishment). One lunch/day in
+# the 11:00–14:00 window is still carved out; a burst under REPL_MIN_UNITS units (a stray box) never counts.
+# TUNABLE: REPL_MIN_UNITS (how big an adjacent burst must be), REPL_PREP_MAX (max credited to any one gap).
+REPL_BURST_WINDOW = 600   # sec: replenish scans within 10 min of each other are ONE burst (worked + logged
+                          # together). A big gap touching such a burst is that burst's physical work.
 REPL_PREP_MAX  = 10800    # sec = 3 h: ceiling on replenishment time credited to any ONE gap (sanity cap)
-REPL_MIN_UNITS = 12       # a person must replenish >= this many units THAT DAY for their gaps to count
+REPL_MIN_UNITS = 12       # a burst must place >= this many units for a gap immediately touching it to count
 LUNCH_START    = "11:00"  # ET: lunch is taken somewhere in this window and must not read as replenishment
 LUNCH_END      = "14:00"
 LUNCH_MAX      = 3600      # sec = 60 min: one lunch/day carved out of credited time inside the lunch window
@@ -248,18 +249,29 @@ aev AS (
          (ts AT TIME ZONE 'America/New_York')::date d, stage, COALESCE(quantity,0) q
   FROM event_canon
   WHERE is_floor_labor(stage,subtype) AND et_day(ts) BETWEEN %s AND %s),
-aday AS (SELECT *, sum(CASE WHEN stage='replenish' THEN q ELSE 0 END)
-                       OVER (PARTITION BY person,d) day_repl FROM aev),
-aseq AS (SELECT *, EXTRACT(epoch FROM (ts - lag(ts) OVER w)) gap
-         FROM aday WINDOW w AS (PARTITION BY person,d ORDER BY ts)),
+aseq AS (SELECT *, EXTRACT(epoch FROM (ts - lag(ts) OVER w)) gap,
+         lag(stage) OVER w prev_stage, lead(stage) OVER w next_stage,
+         EXTRACT(epoch FROM (lead(ts) OVER w - ts)) next_gap
+         FROM aev WINDOW w AS (PARTITION BY person,d ORDER BY ts)),
+abrs AS (SELECT *,   -- first / last scan of a replenish burst (scans within {bw}s = one burst)
+   CASE WHEN stage='replenish' AND (prev_stage IS DISTINCT FROM 'replenish' OR gap >= {bw}) THEN 1 ELSE 0 END bstart,
+   CASE WHEN stage='replenish' AND (next_stage IS DISTINCT FROM 'replenish' OR next_gap >= {bw} OR next_stage IS NULL) THEN 1 ELSE 0 END blast
+   FROM aseq),
+abid AS (SELECT *, sum(bstart) OVER (PARTITION BY person,d ORDER BY ts) batch FROM abrs),
+abu  AS (SELECT *, sum(CASE WHEN stage='replenish' THEN q ELSE 0 END)
+                       OVER (PARTITION BY person,d,batch) batch_units FROM abid),
+aq   AS (SELECT *, (bstart=1 AND batch_units >= {mu}) qual_first,   -- burst big enough to earn an adjacent gap
+                   (blast=1 AND batch_units >= {mu}) qual_last FROM abu),
+aql  AS (SELECT *, lag(qual_last) OVER (PARTITION BY person,d ORDER BY ts) prev_qual_last FROM aq),
 acred AS (
-  SELECT person, d, lt, gap, day_repl,
+  SELECT person, d, lt, gap,
     CASE WHEN gap IS NULL THEN 0
-         WHEN gap < {ab} THEN gap                       -- continuous work always counts
-         WHEN day_repl >= {mu} THEN LEAST(gap, {pmax})  -- replenishment day: idle gaps ARE the replenishment
-         ELSE 0 END AS credit,                          -- otherwise a >=45-min gap is a real break
-    CASE WHEN gap >= {ab} AND day_repl >= {mu} THEN 1 ELSE 0 END prep
-  FROM aseq),
+         WHEN gap < {ab} THEN gap                                          -- continuous work always counts
+         WHEN qual_first OR COALESCE(prev_qual_last,false)                 -- a qualifying burst is adjacent:
+              THEN LEAST(gap, {pmax})                                      --   before (qual_first) or after (pql)
+         ELSE 0 END AS credit,                                            -- else a >=45-min gap is a real break
+    CASE WHEN gap >= {ab} AND (qual_first OR COALESCE(prev_qual_last,false)) THEN 1 ELSE 0 END prep
+  FROM aql),
 alun AS (
   SELECT person, d, sum(credit) gross,
     sum(CASE WHEN prep=1 THEN GREATEST(0, EXTRACT(epoch FROM (
@@ -269,7 +281,7 @@ alun AS (
 active_day AS (
   SELECT person, d, GREATEST(0, gross - LEAST({lmax}, lunch_overlap)) active_s
   FROM alun)
-""".format(ab=ACTIVE_BREAK, mu=REPL_MIN_UNITS, pmax=REPL_PREP_MAX,
+""".format(bw=REPL_BURST_WINDOW, ab=ACTIVE_BREAK, mu=REPL_MIN_UNITS, pmax=REPL_PREP_MAX,
            ls=LUNCH_START, le=LUNCH_END, lmax=LUNCH_MAX)
 
 @app.route("/floor")
@@ -438,26 +450,40 @@ def person_day():
     if not scans:
         return jsonify(ok=True, person=person, d=day, scans=0, first="", last="",
                        active_h=0, span_h=0, timeline=[], notes=notes)
-    ts=[s[0] for s in scans]; first,last=ts[0],ts[-1]; n=len(scans)
-    # --- day-level rule, IDENTICAL to ACTIVE_CTE so the drill-down matches Floor Time ---
-    # On a day with real replenishment (>= REPL_MIN_UNITS units), a >=45-min idle gap IS replenishment
-    # work (its scan marks land wherever the person circled back), minus one lunch. Otherwise it's a break.
-    day_repl=sum(s[2] for s in scans if s[1]=='replenish')
-    repl_day = day_repl >= REPL_MIN_UNITS
+    ts=[s[0] for s in scans]; st=[s[1] for s in scans]; q=[s[2] for s in scans]
+    first,last=ts[0],ts[-1]; n=len(scans)
+    # --- adjacent-either-side rule, IDENTICAL to ACTIVE_CTE so the drill-down matches Floor Time ---
+    # A >=45-min gap counts as replenishment ONLY if a qualifying replenish burst (>= REPL_MIN_UNITS units)
+    # is immediately adjacent to it — the burst right before the gap, or right after it — minus one lunch.
+    bstart=[0]*n; blast=[0]*n; batch=[0]*n; run=0
+    for i in range(n):
+        gap=None if i==0 else (ts[i]-ts[i-1]).total_seconds()
+        prv=None if i==0 else st[i-1]
+        nxt=st[i+1] if i+1<n else None
+        ngap=(ts[i+1]-ts[i]).total_seconds() if i+1<n else None
+        bstart[i]=1 if (st[i]=='replenish' and (prv!='replenish' or (gap is not None and gap>=REPL_BURST_WINDOW))) else 0
+        blast[i]=1 if (st[i]=='replenish' and (nxt!='replenish' or (ngap is not None and ngap>=REPL_BURST_WINDOW) or nxt is None)) else 0
+        run+=bstart[i]; batch[i]=run
+    bunits={}
+    for i in range(n):
+        if st[i]=='replenish': bunits[batch[i]]=bunits.get(batch[i],0)+q[i]
+    qual_last=[(blast[i]==1 and bunits.get(batch[i],0)>=REPL_MIN_UNITS) for i in range(n)]
     lh,lm=[int(x) for x in LUNCH_START.split(":")]; eh,em=[int(x) for x in LUNCH_END.split(":")]
     dET=first.astimezone(_ET)
     lstart=dET.replace(hour=lh,minute=lm,second=0,microsecond=0)
     lend =dET.replace(hour=eh,minute=em,second=0,microsecond=0)
     gross=0.0; lunch_overlap=0.0; prep=[False]*n; lov=[0.0]*n
     for i in range(1,n):
-        gap=(scans[i][0]-scans[i-1][0]).total_seconds()
+        gap=(ts[i]-ts[i-1]).total_seconds(); u=bunits.get(batch[i],0)
+        qf=(bstart[i]==1 and u>=REPL_MIN_UNITS)   # qualifying burst right AFTER the gap
+        pql=qual_last[i-1]                        # qualifying burst right BEFORE the gap
         if gap<ACTIVE_BREAK: cr=gap
-        elif repl_day: cr=min(gap,REPL_PREP_MAX)
+        elif qf or pql: cr=min(gap,REPL_PREP_MAX)
         else: cr=0.0
         gross+=cr
-        if gap>=ACTIVE_BREAK and repl_day:
+        if gap>=ACTIVE_BREAK and (qf or pql):
             prep[i]=True
-            tET=scans[i][0].astimezone(_ET); w0=tET-dt.timedelta(seconds=cr)
+            tET=ts[i].astimezone(_ET); w0=tET-dt.timedelta(seconds=cr)
             lov[i]=max(0.0,(min(tET,lend)-max(w0,lstart)).total_seconds()); lunch_overlap+=lov[i]
     lunch_deduct=min(LUNCH_MAX,lunch_overlap); active_s=max(0.0,gross-lunch_deduct)
     span_s=(last-first).total_seconds()
