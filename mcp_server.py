@@ -41,6 +41,7 @@ Render web service, Start command:  python mcp_server.py
 Requirements:  mcp>=1.2  uvicorn>=0.30  'psycopg[binary]>=3.1'
 """
 
+import hmac
 import json
 import os
 import re
@@ -51,7 +52,6 @@ import psycopg
 from psycopg.rows import dict_row
 
 from mcp.server.fastmcp import FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
@@ -60,14 +60,26 @@ from starlette.routing import Route
 # --------------------------------------------------------------------------- #
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
-MCP_TOKEN = os.environ.get("MCP_TOKEN")
 STMT_TIMEOUT_MS = int(os.environ.get("DB_STATEMENT_TIMEOUT_MS", "30000"))
 PORT = int(os.environ.get("PORT", "8000"))
 
-if not MCP_TOKEN:
+# Auth accepts one OR many shared secrets, so each teammate can hold a distinct,
+# independently revocable token:
+#   MCP_TOKEN   — a single token (backwards compatible)
+#   MCP_TOKENS  — a comma-separated list of tokens (e.g. one per person)
+# Any token present in either variable is accepted.
+_raw_tokens = []
+if os.environ.get("MCP_TOKEN"):
+    _raw_tokens.append(os.environ["MCP_TOKEN"].strip())
+if os.environ.get("MCP_TOKENS"):
+    _raw_tokens += [t.strip() for t in os.environ["MCP_TOKENS"].split(",") if t.strip()]
+VALID_TOKENS = [t for t in _raw_tokens if t]
+
+if not VALID_TOKENS:
     raise SystemExit(
-        "MCP_TOKEN is not set. Refusing to start an unauthenticated database "
-        "endpoint. Set MCP_TOKEN in the Render environment."
+        "No MCP token is set. Refusing to start an unauthenticated database "
+        "endpoint. Set MCP_TOKEN (one token) or MCP_TOKENS (comma-separated) "
+        "in the Render environment."
     )
 if not DATABASE_URL:
     raise SystemExit(
@@ -95,8 +107,7 @@ def _connect():
     """One short-lived connection per call with a hard statement timeout."""
     conn = psycopg.connect(DATABASE_URL, connect_timeout=15, row_factory=dict_row)
     with conn.cursor() as cur:
-        # SET does not accept bound parameters; inline the (int-validated) value.
-        cur.execute(f"SET statement_timeout = {int(STMT_TIMEOUT_MS)}")
+        cur.execute("SET statement_timeout = %s", (STMT_TIMEOUT_MS,))
     return conn
 
 
@@ -104,16 +115,7 @@ def _connect():
 # MCP server + tools
 # --------------------------------------------------------------------------- #
 
-# Auth is enforced by our own bearer-token middleware below, so the SDK's
-# localhost-only DNS-rebinding protection (which would 421 the Render host) is
-# turned off here — the token, not a host allowlist, is what guards this server.
-mcp = FastMCP(
-    "ikigai-contribution-db",
-    stateless_http=True,
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=False
-    ),
-)
+mcp = FastMCP("ikigai-contribution-db", stateless_http=True)
 
 
 @mcp.tool()
@@ -188,15 +190,16 @@ def list_schema(table: str = "") -> str:
         where += " AND c.table_name = %s"
         params.append(table)
     q = f"""
-        SELECT c.table_name  AS "table",
-               c.column_name  AS "column",
-               c.data_type    AS "type",
-               c.is_nullable  AS "nullable",
+        SELECT c.table_name   AS "table",
+               t.table_type   AS "kind",
+               c.column_name   AS "column",
+               c.data_type     AS "type",
+               c.is_nullable   AS "nullable",
                c.column_default AS "default"
         FROM information_schema.columns c
         JOIN information_schema.tables t
           ON t.table_schema = c.table_schema AND t.table_name = c.table_name
-         AND t.table_type = 'BASE TABLE'
+         AND t.table_type IN ('BASE TABLE', 'VIEW')
         {where}
         ORDER BY c.table_name, c.ordinal_position
     """
@@ -205,6 +208,39 @@ def list_schema(table: str = "") -> str:
             with conn.cursor() as cur:
                 cur.execute(q, params)
                 return json.dumps(cur.fetchall(), default=_json_default)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"error": type(e).__name__, "detail": str(e)})
+
+
+@mcp.tool()
+def db_overview() -> str:
+    """Orientation: every base table in the public schema with its exact row
+    count and any views present. Fast way to see all the data available.
+
+    Returns:
+        JSON {"tables": [{table, rows}], "views": [name, ...]}.
+    """
+    try:
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT table_name, table_type FROM information_schema.tables "
+                    "WHERE table_schema = 'public' "
+                    "AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_name"
+                )
+                rows = cur.fetchall()
+                tables, views = [], []
+                for r in rows:
+                    if r["table_type"] == "VIEW":
+                        views.append(r["table_name"])
+                    else:
+                        tables.append(r["table_name"])
+                out = []
+                for name in tables:
+                    # identifier is from the catalog, not user input — safe to inline
+                    cur.execute(f'SELECT count(*) AS n FROM "{name}"')
+                    out.append({"table": name, "rows": cur.fetchone()["n"]})
+        return json.dumps({"tables": out, "views": views}, default=_json_default)
     except Exception as e:  # noqa: BLE001
         return json.dumps({"error": type(e).__name__, "detail": str(e)})
 
@@ -254,13 +290,20 @@ def refresh_day(et_day: str) -> str:
 # HTTP app: auth middleware + health route
 # --------------------------------------------------------------------------- #
 
+def _token_ok(presented: str) -> bool:
+    if not presented:
+        return False
+    # constant-time comparison against every valid token
+    return any(hmac.compare_digest(presented, t) for t in VALID_TOKENS)
+
+
 def _authorized(request) -> bool:
     auth = request.headers.get("authorization", "")
-    if auth.startswith("Bearer ") and auth[7:] == MCP_TOKEN:
+    if auth.startswith("Bearer ") and _token_ok(auth[7:]):
         return True
-    if request.headers.get("x-api-key") == MCP_TOKEN:
+    if _token_ok(request.headers.get("x-api-key", "")):
         return True
-    if request.query_params.get("token") == MCP_TOKEN:
+    if _token_ok(request.query_params.get("token", "")):
         return True
     return False
 
