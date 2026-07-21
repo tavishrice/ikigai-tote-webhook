@@ -1119,18 +1119,33 @@ body.clean .card>.sub{display:none}
 body.clean{overflow:hidden}
 body.clean .wrap{max-width:none;padding:12px 22px 14px;height:100vh;overflow:hidden;display:flex;flex-direction:column}
 body.clean .apphead{margin-bottom:8px}
-body.clean .shipped{margin:0 0 10px;padding:11px 18px}
-body.clean .cards{grid-template-columns:repeat(6,1fr);gap:10px;margin:0 0 10px}
-body.clean .stat{padding:9px 12px}
-body.clean .stat .v{font-size:20px;margin-top:2px}
-body.clean .stat .k{font-size:10px}
+/* clean mode replaces the app's banner + 6 by-type cards with the approved 4-tile hero strip */
+body.clean .apphead,body.clean .shipped,body.clean .cards{display:none!important}
+body.clean #tvhead{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:10px}
+body.clean #tvkpis{display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr;gap:12px;margin-bottom:10px}
+#tvhead,#tvkpis{display:none}
+.tvbrand .tvtitle{font-size:19px;font-weight:700;letter-spacing:-.01em}
+.tvbrand .tvlive{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-top:3px}
+.tvdatewrap{text-align:center;flex:1}
+.tvdate{font-size:26px;font-weight:700;letter-spacing:-.02em;line-height:1}
+.tvdsub{color:var(--muted);font-size:12.5px;margin-top:3px}
+.tvref{color:var(--muted);font-size:11.5px;text-align:right;min-width:130px;padding-right:46px}
+.kpi{background:var(--surface);border:1px solid var(--line);border-radius:13px;padding:11px 16px;position:relative;overflow:hidden;box-shadow:var(--sh)}
+.kpi .acc{position:absolute;left:0;top:0;bottom:0;width:4px}
+.kpi .kl{color:var(--muted);font-size:10.5px;letter-spacing:.05em;text-transform:uppercase}
+.kpi .kv{font-weight:700;letter-spacing:-.02em;line-height:1;margin-top:5px;font-size:30px}
+.kpi.hero .kv{font-size:44px}
+.kpi .kn{margin-top:6px;color:var(--ink-2);font-size:12px;display:flex;gap:12px;flex-wrap:wrap}
+.kpi .kn .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle}
 body.clean #dash{flex:1;display:flex;flex-direction:column;min-height:0;gap:10px}
 body.clean #dash>.card{margin:0!important}
-body.clean #dash .card:has(.chartwrap){flex:1.25;display:flex;flex-direction:column;min-height:0;padding-top:12px}
-body.clean #dash .chartwrap{flex:1;height:auto!important;min-height:0;margin-top:4px}
-body.clean #dash .card:has(#detail){flex:1;min-height:0;display:flex;flex-direction:column;padding-top:12px}
+body.clean #dash .card:has(.chartwrap){flex:1;display:flex;flex-direction:column;min-height:0;padding-top:10px}
+body.clean #dash .chartwrap{flex:1;height:auto!important;min-height:0;margin-top:2px}
+body.clean #dash .card:has(#detail){flex:1.5;min-height:0;display:flex;flex-direction:column;padding-top:10px}
 body.clean #dash .card:has(#detail) #detail{flex:1;min-height:0;overflow:auto}
-body.clean #dash>.card>h2{font-size:13.5px}
+body.clean #dash .card:has(#detail) td{padding:5px 10px}
+body.clean #dash .card:has(#detail) th{padding:4px 10px}
+body.clean #dash>.card>h2{font-size:13px;margin-bottom:2px}
 /* dark (TV) — flips the surfaces; chart text is re-themed in drawChart() */
 body.dark{--bg:#0d0d0d;--surface:#1a1a19;--line:#2c2c2a;--line-2:#242422;--ink:#f5f5f0;--ink-2:#c3c2b7;--muted:#8a887f;--accent-weak:#1e2a3f}
 body.dark .shipped{background:linear-gradient(180deg,#15211a,#1a1a19)}
@@ -1164,6 +1179,12 @@ body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{backgro
   </div>
 </aside>
 <div class=wrap>
+<div id=tvhead>
+  <div class=tvbrand><div class=tvtitle>Warehouse Contribution</div><div class=tvlive><span class=dot></span>Live &middot; ShipHero &middot; Shopify &middot; Engraving</div></div>
+  <div class=tvdatewrap><div class=tvdate id=tvdate></div><div class=tvdsub id=tvdsub></div></div>
+  <div class=tvref><span id=tvrefstamp></span></div>
+</div>
+<div id=tvkpis></div>
 <div class=apphead><h1>Warehouse Picking &amp; Packing</h1><span class=dot></span><span class=live>Live</span></div>
 <div class=sub>Live contribution from ShipHero <b>+ direct-in-Shopify fulfillments + engraving</b>. <b>Fulfillment</b> (pick + pack + engrave) and <b>Restock</b> are two separate tracks.</div>
 <div class=tabs>
@@ -1600,8 +1621,30 @@ function render(){if(!DATA)return;
   si.classList.toggle('hide',!showItems);so.classList.toggle('hide',!showOrders);
   drawChart(ppl,v);
   drawDetail(ppl,unit,v);
+  fillTV(ppl,T,sh);
   if(FLOOR){renderFloor();renderAnalytics();}
   if(ENGR)renderEngraving();
+}
+// the approved TV hero: centered date + 4 consolidated tiles (replaces the 6 by-type cards in clean mode)
+function fillTV(ppl,T,sh){
+  if(!DATA)return;
+  var r=(DATA.range.from||'').split('-'), dt=document.getElementById('tvdate');
+  if(dt&&r.length===3){var d=new Date(+r[0],+r[1]-1,+r[2]);
+    dt.textContent=d.toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric'});}
+  var ds=document.getElementById('tvdsub');
+  if(ds){var one=DATA.range.from===DATA.range.to;
+    ds.textContent=one?(DATA.range.from===etToday()?'Today':DATA.range.from):(DATA.range.from+' → '+DATA.range.to);}
+  var rs=document.getElementById('tvrefstamp');
+  if(rs)rs.textContent='updated '+new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+  var host=document.getElementById('tvkpis'); if(!host)return;
+  var ful=T.pk_i+T.packsh_i+T.packshop_i+T.eng_i;
+  var working=ppl.filter(function(p){return p.type;}).length;   // matched staff on the floor (excludes unmatched scanner IDs)
+  host.innerHTML=
+    '<div class="kpi hero"><div class=acc style="background:var(--green)"></div><div class=kl>Orders shipped out the door</div><div class=kv>'+fmt(sh.total)+'</div>'+
+      '<div class=kn><span><span class=sw style="background:var(--accent)"></span>'+fmt(sh.shiphero)+' ShipHero</span><span><span class=sw style="background:var(--amber)"></span>'+fmt(sh.shopify_only)+' Shopify</span></div></div>'+
+    '<div class=kpi><div class=acc style="background:var(--accent)"></div><div class=kl>Items fulfilled</div><div class=kv>'+fmt(ful)+'</div><div class=kn>pick + pack + engrave</div></div>'+
+    '<div class=kpi><div class=acc style="background:var(--violet)"></div><div class=kl>Items restocked</div><div class=kv>'+fmt(T.repl)+'</div><div class=kn>replenishment &middot; separate track</div></div>'+
+    '<div class=kpi><div class=acc style="background:var(--teal)"></div><div class=kl>People working</div><div class=kv>'+working+'</div><div class=kn>on the floor today</div></div>';
 }
 function card(k,s,cls,val){return '<div class="card stat"><div class=k>'+k+' <span class="s '+cls+'">'+s+'</span></div><div class=v>'+fmt(val)+'</div></div>';}
 function drawChart(ppl,v){
