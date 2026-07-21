@@ -1259,7 +1259,7 @@ body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{backgro
   <div class=note>Cards and chart follow the Unit / Stage / Source toggles; the table always shows both items and orders. <b>Fulfillment = Picked + Packed + Engraved</b> for the selected filters. Restocking is a separate track, never added into that total.</div>
   <div class=card style=margin-top:8px>
     <h2>Contribution by person</h2>
-    <div id=chartmode title="Static = this view. Rotating = cycle all 5 leaderboards every 60s"><button data-rot=static class=on onclick="setRotate(false)">Static</button><button data-rot=rot onclick="setRotate(true)">Rotating</button></div>
+    <div id=chartmode title="Static = this view. Rotating = cycle all 5 leaderboards every 20s"><button data-rot=static class=on onclick="setRotate(false)">Static</button><button data-rot=rot onclick="setRotate(true)">Rotating</button></div>
     <div class=sub style=margin:0>Each bar is one person&rsquo;s <b>Fulfillment</b> total (Picked + Packed + Engraved) for the selected <b>Unit</b>, tallest first &mdash; the number above each bar is that total. <b>Restocked</b> is a separate track, drawn as its own bar. Click a bar to focus that person.</div>
     <div class=chartwrap><canvas id=chart></canvas></div>
   </div>
@@ -2393,7 +2393,7 @@ function drawRotFrame(){if(!DATA)return;var s=ROT_STAGES[rotIdx];drawChart(DATA.
 function setRotate(on){try{localStorage.setItem('wh_rot',on?'1':'0');}catch(e){}
   if(rotTimer){clearInterval(rotTimer);rotTimer=null;}
   document.querySelectorAll('#chartmode button').forEach(function(bt){bt.classList.toggle('on',(bt.dataset.rot==='rot')===on);});
-  if(on){rotIdx=0;if(DATA)drawRotFrame();rotTimer=setInterval(function(){rotIdx=(rotIdx+1)%ROT_STAGES.length;if(DATA)drawRotFrame();},60000);}
+  if(on){rotIdx=0;if(DATA)drawRotFrame();rotTimer=setInterval(function(){rotIdx=(rotIdx+1)%ROT_STAGES.length;if(DATA)drawRotFrame();},20000);}
   else if(DATA){render();}}
 function toggleRotate(){setRotate(!rotTimer);}
 function toggleTV(){var on=!document.body.classList.contains('clean');document.body.classList.toggle('clean',on);
