@@ -1149,15 +1149,26 @@ body.clean .kpi:not(.hero) .kl{grid-column:1;align-self:center}
 body.clean .kpi:not(.hero) .kv{grid-column:2;font-size:34px}
 body.clean .kpi:not(.hero) .kn{grid-column:1/3;margin-top:2px}
 body.clean #tvkpis .kpi:last-child{padding-right:48px}   /* keep the value clear of the fixed gear button */
-body.clean #dash:not(.hide){flex:1;display:flex;flex-direction:column;min-height:0;gap:8px}   /* :not(.hide) so switching tabs still hides the dashboard */
-body.clean #dash>.card{margin:0!important;padding:8px 16px}
-body.clean #dash .card:has(.chartwrap){flex:1 1 auto;min-height:240px;display:flex;flex-direction:column}
+body.clean #dash:not(.hide){flex:1;display:flex;flex-direction:column;min-height:0;gap:6px}   /* :not(.hide) so switching tabs still hides the dashboard */
+body.clean #dash>.card{margin:0!important;padding:6px 16px}
+body.clean #dash .card:has(.chartwrap){flex:1.35 1 auto;min-height:200px;display:flex;flex-direction:column;position:relative;padding-top:2px}
 body.clean #dash .card:has(.chartwrap)>h2{display:none}   /* the chart's own title carries it — frees a line */
 body.clean #dash .chartwrap{flex:1;height:auto!important;min-height:0;margin-top:0}
-body.clean #dash .card:has(#detail){flex:0 1 auto;max-height:47vh;min-height:0;display:flex;flex-direction:column}
+body.clean #dash .card:has(#detail){flex:1 1 auto;min-height:0;display:flex;flex-direction:column;padding-top:6px}
+body.clean #dash .card:has(#detail)>h2{display:none}   /* drop the title; the group headers already label the sections */
 body.clean #dash .card:has(#detail) #detail{flex:1;min-height:0;overflow:auto}
+body.clean #dash .card:has(#detail) #detail>table{height:100%}   /* rows stretch to fill the box — bigger with fewer people, tighter with more */
+body.clean #dash .card:has(#detail) table{font-size:14px}
 body.clean #dash .card:has(#detail) td{padding:4px 10px}
-body.clean #dash .card:has(#detail) th{padding:3px 10px}
+body.clean #dash .card:has(#detail) th{padding:4px 10px;font-size:11px}
+body.clean #dash .card:has(#detail) .gh{font-size:11.5px}
+/* on-chart Static/Rotating toggle (TV only) */
+#chartmode{display:none}
+body.clean[data-tab=dash] #chartmode{display:inline-flex;position:absolute;top:6px;right:14px;z-index:5;background:#eceef2;border-radius:8px;padding:3px;gap:2px}
+#chartmode button{border:0;background:transparent;color:var(--ink-2);font:inherit;font-size:11.5px;font-weight:700;padding:5px 12px;border-radius:6px;cursor:pointer}
+#chartmode button.on{background:var(--surface);color:var(--accent);box-shadow:0 1px 2px rgba(16,24,40,.12)}
+body.dark #chartmode{background:#2c2c2a}
+body.dark #chartmode button.on{background:#1a1a19}
 body.clean #dash>.card>h2{font-size:12.5px;margin-bottom:2px}
 /* dark (TV) — flips the surfaces; chart text is re-themed in drawChart() */
 body.dark{--bg:#0d0d0d;--surface:#1a1a19;--line:#2c2c2a;--line-2:#242422;--ink:#f5f5f0;--ink-2:#c3c2b7;--muted:#8a887f;--accent-weak:#1e2a3f}
@@ -1185,11 +1196,6 @@ body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{backgro
   <div class=navlist id=drawernav></div>
   <div class=dsec>Filters &amp; date</div>
   <div id=drawerctl></div>
-  <div class=dsec>Chart</div>
-  <div class=navlist>
-    <button onclick="toggleRotate()" id=rottoggle>Chart: Static</button>
-  </div>
-  <div class=dh style="margin:6px 0 0">Rotating cycles the chart through Fulfillment &rarr; Picking &rarr; Packing &rarr; Engraving &rarr; Restocking every 60s.</div>
   <div class=dsec>Display</div>
   <div class=navlist>
     <button onclick="toggleDark()" id=darktoggle>Switch to dark (TV)</button>
@@ -1253,6 +1259,7 @@ body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{backgro
   <div class=note>Cards and chart follow the Unit / Stage / Source toggles; the table always shows both items and orders. <b>Fulfillment = Picked + Packed + Engraved</b> for the selected filters. Restocking is a separate track, never added into that total.</div>
   <div class=card style=margin-top:8px>
     <h2>Contribution by person</h2>
+    <div id=chartmode title="Static = this view. Rotating = cycle all 5 leaderboards every 60s"><button data-rot=static class=on onclick="setRotate(false)">Static</button><button data-rot=rot onclick="setRotate(true)">Rotating</button></div>
     <div class=sub style=margin:0>Each bar is one person&rsquo;s <b>Fulfillment</b> total (Picked + Packed + Engraved) for the selected <b>Unit</b>, tallest first &mdash; the number above each bar is that total. <b>Restocked</b> is a separate track, drawn as its own bar. Click a bar to focus that person.</div>
     <div class=chartwrap><canvas id=chart></canvas></div>
   </div>
@@ -2385,7 +2392,7 @@ function toggleDark(){document.body.classList.toggle('dark');var on=document.bod
 function drawRotFrame(){if(!DATA)return;var s=ROT_STAGES[rotIdx];drawChart(DATA.people.filter(teamFilter),visFor(s,segval('source')),s);}
 function setRotate(on){try{localStorage.setItem('wh_rot',on?'1':'0');}catch(e){}
   if(rotTimer){clearInterval(rotTimer);rotTimer=null;}
-  var b=document.getElementById('rottoggle');if(b)b.textContent=on?'Chart: Rotating — every 60s':'Chart: Static';
+  document.querySelectorAll('#chartmode button').forEach(function(bt){bt.classList.toggle('on',(bt.dataset.rot==='rot')===on);});
   if(on){rotIdx=0;if(DATA)drawRotFrame();rotTimer=setInterval(function(){rotIdx=(rotIdx+1)%ROT_STAGES.length;if(DATA)drawRotFrame();},60000);}
   else if(DATA){render();}}
 function toggleRotate(){setRotate(!rotTimer);}
