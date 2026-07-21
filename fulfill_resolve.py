@@ -82,13 +82,79 @@ SHOPIFY_SAMPLE = (
 )
 
 
+def _alnum(s):
+    return "".join(ch for ch in (s or "").upper() if ch.isalnum())
+
+
+def _order_norm(s):
+    """The shape the logger stores an order_number in: strip a leading '#', upper."""
+    return (s or "").strip().lstrip("#").strip().upper()
+
+
+def resolve_tracking(cur):
+    """DUAL-METHOD: turn a logger row that was a shipping-label TRACKING scan into
+    the real order.
+
+    A packer can scan the tracking barcode instead of the order barcode; that drops
+    the tracking number as order_number. `tracking_sync.py` maps tracking->order_name.
+    Here we (a) rewrite such a row to the real order (so item-count fill + the
+    dashboard credit work), and (b) DEDUP -- if the same real order was also scanned
+    via its order barcode, delete the redundant tracking row so nobody is credited
+    twice. Returns (changed_days, resolved_count, deleted_count).
+    """
+    cur.execute("CREATE TABLE IF NOT EXISTS tracking_order ("
+                " tracking text PRIMARY KEY, order_name text NOT NULL,"
+                " updated_at timestamptz DEFAULT now())")
+    cur.execute("SELECT tracking, order_name FROM tracking_order")
+    tmap = {r[0]: r[1] for r in cur.fetchall()}
+    if not tmap:
+        return [], 0, 0
+    tkeys = [k for k in tmap if len(k) >= 10]
+    # logger fulfillment rows whose scanned value looks like a tracking number (long alnum)
+    cur.execute("SELECT id, order_number, et_day(ts) AS d FROM event "
+                "WHERE source='logger' AND stage='pack' "
+                "AND length(regexp_replace(order_number, '[^0-9A-Za-z]', '', 'g')) >= 12")
+    days, resolved, deleted = set(), 0, 0
+    for rid, ordn, d in cur.fetchall():
+        key = _alnum(ordn)
+        real = tmap.get(key)
+        if real is None:                       # scanned barcode may embed the tracking (e.g. USPS prefix)
+            for tk in tkeys:
+                if tk in key:
+                    real = tmap[tk]; break
+        if real is None:
+            continue
+        stored = _order_norm(real)             # "#IC201854" -> "IC201854"
+        core = "".join(ch for ch in stored if ch.isdigit())
+        if not core:
+            continue
+        cur.execute("SELECT id FROM event WHERE source='logger' AND stage='pack' AND id<>%s "
+                    "AND regexp_replace(upper(btrim(order_number)),'[^0-9]','','g')=%s LIMIT 1",
+                    (rid, core))
+        if cur.fetchone():                     # order already captured -> drop the redundant tracking row
+            cur.execute("DELETE FROM event WHERE id=%s", (rid,))
+            deleted += 1
+        else:
+            cur.execute("UPDATE event SET order_number=%s, dedup_key=%s WHERE id=%s",
+                        (stored, "logger|fulfill|" + stored, rid))
+            resolved += 1
+        if d:
+            days.add(d)
+    return sorted(days), resolved, deleted
+
+
 def main():
     if not DATABASE_URL:
         print("DATABASE_URL not set", file=sys.stderr); sys.exit(1)
     with psycopg.connect(DATABASE_URL, connect_timeout=CONNECT_TIMEOUT) as c, c.cursor() as cur:
+        try:
+            t_days, t_res, t_del = resolve_tracking(cur)
+        except Exception as e:
+            print(f"[fulfill_resolve] tracking-resolve skipped: {e!r}", flush=True)
+            t_days, t_res, t_del = [], 0, 0
         cur.execute(FILL_SQL)
         rows = cur.fetchall()
-        days = sorted({r[3] for r in rows if r[3] is not None})
+        days = sorted(set(r[3] for r in rows if r[3] is not None) | set(t_days))
         for d in days:
             for stmt in REFRESH:
                 try:
@@ -101,8 +167,8 @@ def main():
         cur.execute(SHOPIFY_SAMPLE)
         shop = [r[0] for r in cur.fetchall()]
         c.commit()
-    print(f"[fulfill_resolve] filled {len(rows)} order(s); refreshed {len(days)} day(s): {days}",
-          flush=True)
+    print(f"[fulfill_resolve] filled {len(rows)} order(s); tracking-resolved {t_res}, "
+          f"deduped {t_del}; refreshed {len(days)} day(s): {days}", flush=True)
     if unmatched:
         print(f"[fulfill_resolve] still-unmatched logger orders (sample): {unmatched}", flush=True)
         print(f"[fulfill_resolve] today's shopify pack order_numbers (sample): {shop}", flush=True)
