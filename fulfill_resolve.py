@@ -15,10 +15,20 @@ knows about -- i.e. the existing pack events for the same order. Keep
 `shopify_ingest.py` RUNNING (it still ingests each Shopify fulfillment's item
 quantity). This script reattributes nothing -- it only borrows the per-order qty.
 
-MATCHING: both sides are normalized the SAME way -- upper-case, trimmed, leading
-'#' stripped -- because Shopify order NAMES carry a '#' ("#IC201508") while the
-logger stores the scanned value with the '#' removed. Matching on the raw value
-silently fails on that '#', which is why item counts can read 0.
+MATCHING: both sides are reduced to their NUMERIC CORE -- every non-digit is
+stripped (upper/trim first for good measure) -- because the same Shopify order is
+written in several shapes across the pipeline and the scanner:
+  Shopify order NAME  -> "#IC201198"   (carries '#IC')
+  logger scan (clean) -> "IC201198" or bare "201198"  (scanner drops '#IC' or not)
+Reducing both to "201198" makes all those shapes match. Matching on the raw value
+(or only stripping '#') silently fails on the 'IC' or a bare-number scan, which is
+why item counts can read 0. Order names here are IC+6-digit, so the numeric core
+is unique -- no false matches. Rows with no digits at all are skipped.
+
+Short/garbled scans (a truncated barcode read like "1854" or "IC2011") have no
+6-digit core and simply stay unmatched -- their ORDER credit is still correct
+(one row = one order to the right packer); only the item COUNT is missing. Those
+show up in the diagnostic below so a scanner problem is visible.
 
 Idempotent: only fills rows where quantity IS NULL. Safe to run every few minutes.
 Prints a short diagnostic (matched count + sample unmatched logger orders + sample
@@ -30,8 +40,8 @@ import psycopg
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 CONNECT_TIMEOUT = int(os.environ.get("PG_CONNECT_TIMEOUT", "25"))
 
-# normalized order key, applied identically to both sides of the join
-NORM = "regexp_replace(upper(btrim({col})), '^#+', '')"
+# normalized order key: the numeric core, applied identically to both join sides.
+NORM = "regexp_replace(upper(btrim({col})), '[^0-9]', '', 'g')"
 
 FILL_SQL = """
 WITH src AS (
@@ -39,6 +49,7 @@ WITH src AS (
     FROM event
     WHERE stage = 'pack' AND source <> 'logger'
       AND order_number IS NOT NULL AND quantity IS NOT NULL
+      AND order_number ~ '[0-9]'
     GROUP BY 1
     HAVING SUM(COALESCE(quantity,0)) > 0
 )
@@ -46,6 +57,7 @@ UPDATE event L
 SET quantity = src.qty
 FROM src
 WHERE L.source = 'logger' AND L.stage = 'pack' AND L.quantity IS NULL
+  AND L.order_number ~ '[0-9]'
   AND {norm_l} = src.ordn
 RETURNING L.id, L.order_number, L.quantity, et_day(L.ts) AS d;
 """.format(norm_src=NORM.format(col="order_number"),
