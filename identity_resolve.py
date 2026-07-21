@@ -38,17 +38,30 @@ except Exception:
 # People deliberately hidden everywhere (fraud / departed) — mirror of read_api.
 EXCLUDED = {"Roland Tilk", "Brennen Myrick"}
 
-CANON_VIEW_DDL = """
-CREATE OR REPLACE VIEW event_canon AS
-SELECT ev.id, ev.ts,
-       COALESCE(e.name, ev.person) AS person,
-       ev.stage, ev.station, ev.action, ev.order_number, ev.tote_barcode,
-       ev.sku, ev.quantity, ev.subtype, ev.source, ev.ext_id,
-       ev.dedup_key, ev.raw, ev.ingested_at
-FROM event ev
-LEFT JOIN person_alias a ON a.alias = ev.person
-LEFT JOIN employee    e ON e.id = a.employee_id;
-"""
+def _sqlstr(names):
+    return ",".join("'" + str(n).replace("'", "''") + "'" for n in sorted(names))
+
+def _canon_where():
+    allow = "e.id IS NOT NULL"
+    if NON_EMPLOYEES:
+        allow = "(e.id IS NOT NULL OR ev.person IN (" + _sqlstr(NON_EMPLOYEES) + "))"
+    where = "WHERE " + allow
+    if EXCLUDED:
+        where += " AND COALESCE(e.name, ev.person) NOT IN (" + _sqlstr(EXCLUDED) + ")"
+    return where
+
+# event_canon = the board's data, filtered to REAL known people only (resolved
+# employees + known non-employees, minus hidden). Junk/unresolved ids never show
+# on any dashboard view; Data Issues still lists them (it reads raw `event`).
+CANON_VIEW_DDL = (
+    "CREATE OR REPLACE VIEW event_canon AS "
+    "SELECT ev.id, ev.ts, COALESCE(e.name, ev.person) AS person, "
+    "ev.stage, ev.station, ev.action, ev.order_number, ev.tote_barcode, "
+    "ev.sku, ev.quantity, ev.subtype, ev.source, ev.ext_id, "
+    "ev.dedup_key, ev.raw, ev.ingested_at "
+    "FROM event ev "
+    "LEFT JOIN person_alias a ON a.alias = ev.person "
+    "LEFT JOIN employee e ON e.id = a.employee_id " + _canon_where())
 
 # columns read_api's queries actually touch — the view must expose all of these
 _REQUIRED_COLS = {"person", "ts", "stage", "subtype", "source", "order_number",
@@ -83,6 +96,55 @@ def _keyname(s):
 def _looks_like_id(s):
     return bool(re.fullmatch(r"\d+", s or "")) or (s or "").startswith("User-") \
         or (s or "").startswith("User:")
+
+
+def reattribute_misscans(cur):
+    """Mis-scan recovery (engraving): a tote/barcode scanned into the tablet's
+    login box becomes an 'engraver' named after the barcode. Credit that work to
+    the REAL engraver at that station at that time — the resolved employee with a
+    logger event at the SAME station within 20 min of the mis-scan login, and ONLY
+    when exactly one real engraver is in that window (unambiguous). Writes an alias
+    so the work flows to the right person on the board; never overrides an existing
+    alias. Anything ambiguous is left flagged for a human.
+    """
+    cur.execute("""
+      WITH resolved AS (
+             SELECT a.alias, e.name FROM person_alias a JOIN employee e ON e.id=a.employee_id),
+           unresolved AS (
+             SELECT ev.person, ev.station, min(ev.ts) t0, max(ev.ts) t1
+             FROM event ev
+             WHERE ev.source='logger'
+               AND ev.station IS NOT NULL
+               AND ev.person NOT IN (SELECT alias FROM resolved)
+             GROUP BY ev.person, ev.station)
+      SELECT u.person, u.station,
+             (SELECT r.name FROM event e2 JOIN resolved r ON r.alias=e2.person
+               WHERE e2.source='logger' AND e2.station=u.station
+                 AND e2.ts BETWEEN u.t0 - interval '20 min' AND u.t1 + interval '20 min'
+                 AND r.name <> ALL(%s)
+               GROUP BY r.name
+               ORDER BY min(abs(extract(epoch from (e2.ts - u.t0)))) ASC LIMIT 1) nearest,
+             (SELECT count(DISTINCT r.name) FROM event e2 JOIN resolved r ON r.alias=e2.person
+               WHERE e2.source='logger' AND e2.station=u.station
+                 AND e2.ts BETWEEN u.t0 - interval '20 min' AND u.t1 + interval '20 min'
+                 AND r.name <> ALL(%s)) n_cands
+      FROM unresolved u
+    """, (list(EXCLUDED), list(EXCLUDED)))
+    added = 0
+    for person, station, nearest, n_cands in cur.fetchall():
+        if person in EXCLUDED or person in NON_EMPLOYEES:
+            continue
+        if nearest and n_cands == 1:
+            cur.execute(
+                "INSERT INTO person_alias (alias, employee_id, source, note) "
+                "VALUES (%s,(SELECT id FROM employee WHERE name=%s LIMIT 1),'auto-station',%s) "
+                "ON CONFLICT (alias) DO NOTHING",
+                (person, nearest, "auto: mis-scan credited to %s @ %s" % (nearest, station)))
+            if cur.rowcount:
+                added += 1
+                print("    re-attributed %r -> %s (@%s)" % (person, nearest, station))
+    print("identity_resolve: re-attributed %d mis-scan login(s) to the station engraver" % added)
+    return added
 
 
 def ensure_view(cur):
@@ -152,6 +214,7 @@ def resolve():
                 added += cur.rowcount
             else:
                 still.append((person, int(cnt)))
+        reattribute_misscans(cur)
         c.commit()
 
     still.sort(key=lambda x: -x[1])
