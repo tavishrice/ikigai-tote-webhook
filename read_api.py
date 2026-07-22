@@ -2569,6 +2569,17 @@ load();initAuto();initView();
     if(!h || !it || !h.active_h) return null;
     return it.total / h.active_h;
   }
+  // reconciled floor record (carries scanned_h / unaccounted_h once reconcileFloor ran)
+  function floorFor(name){
+    try{ var F=(typeof FLOOR!=="undefined"&&FLOOR)?FLOOR:null; if(!F||!F.people) return null;
+      return F.people.filter(function(x){return x.person===name;})[0]||null; }catch(e){ return null; }
+  }
+  function unacctFor(name){
+    var fp=floorFor(name), h=hoursFor(name);
+    if(fp && typeof fp.unaccounted_h==="number") return fp.unaccounted_h;
+    if(fp && h && h.active_h!=null && typeof fp._sh==="number") return Math.max(0, Math.round((h.active_h-fp._sh)*10)/10);
+    return null;
+  }
 
   function curRange(){
     var D=appDATA();
@@ -2589,11 +2600,20 @@ load();initAuto();initView();
         HOURS.byName = {};
         HOURS.list.forEach(function(p){ HOURS.byName[p.person]=p; });
         HOURS.loading = false;
+        reconcileFloor();
+        reRenderFloorTabs();
         injectAll();
       })
       .catch(function(e){ HOURS.loading=false; try{console.warn("hours load failed",e);}catch(_){} });
   }
   window.loadHours = loadHours;
+
+  // Re-run the app's FLOOR-consuming renders so reconciled (clocked) numbers show.
+  function reRenderFloorTabs(){
+    try{ if(typeof render==="function" && appDATA()) render(); }catch(e){}
+    try{ if(typeof renderWatch==="function") renderWatch(); }catch(e){}
+    try{ if(typeof renderAnalytics==="function") renderAnalytics(); }catch(e){}
+  }
 
   // Refetch hours whenever the dashboard's range no longer matches what we have.
   function ensureHours(){
@@ -2611,6 +2631,78 @@ load();initAuto();initView();
     });
     return { tot:tot, act:act, brk:brk, ppl:ppl, items:items,
              iphr: covered? items/covered : 0 };
+  }
+
+  /* ---------- RECONCILE: clocked hours become the source of truth ----------
+     The app's FLOOR.people carries scan-inferred hours/util/UPLH (shift = first
+     scan -> last scan; "breaks" = 45-min scan gaps). Now that we have the real
+     time clock, those are retired: Active = clocked - LOGGED breaks; a scan gap
+     with no logged break is NOT a break, it's UNACCOUNTED time. Every tab reads
+     FLOOR.people, so overwriting these fields makes Dashboard / Floor Time /
+     Analytics / Watch List all consistent at once (roll-ups included). */
+  function appFLOOR(){ try{ return (typeof FLOOR!=="undefined" && FLOOR) ? FLOOR : null; }catch(e){ return null; } }
+  function r1(x){ return Math.round(x*10)/10; }
+  function reconcileFloor(){
+    var F=appFLOOR(); if(!F || !F.people || !HOURS.list.length) return;
+    F.people.forEach(function(p){
+      if(p._scap===undefined){ // capture the scan-inferred originals exactly once
+        p._scap=true; p._sh=p.hours; p._su=p.util; p._sspan=p.span_h;
+        p._sfin=p.first_in; p._slout=p.last_out; p._siphr=p.items_per_hr; p._shpd=p.hours_per_day;
+      }
+      var h=HOURS.byName[p.person];
+      if(h && h.total_h>0){
+        var active=h.active_h||0, scanned=p._sh||0;
+        p.has_clock=true;
+        p.scanned_h=Math.round(scanned*100)/100;
+        p.clocked_h=h.total_h; p.break_h=h.break_h;
+        p.hours=active;                                   // denominator everywhere
+        p.hours_per_day=p.active_days? r1(active/p.active_days) : active;
+        p.unaccounted_h=Math.max(0, r1(active-scanned));  // on clock, not on break, not scanning
+        p.util=active>0? Math.min(100, Math.round(100*scanned/active)) : 0; // scanning / paid working
+        p.items_per_hr=active>0? Math.round((p.items||0)/active) : 0;       // UPLH on clocked hours
+        p.span_h=r1(h.total_h);                           // "Floor h" -> clocked total
+        p.first_in=(h.days_detail&&h.days_detail[0])? h.days_detail[0].first_in : p._sfin;
+        p.last_out=h.open? "on the clock" : ((h.days_detail&&h.days_detail.length)? h.days_detail[h.days_detail.length-1].last_out : p._slout);
+        p.open=h.open; p.on_break=h.on_break;
+      } else {
+        p.has_clock=false; p.scanned_h=p._sh; p.clocked_h=0; p.break_h=0; p.unaccounted_h=0;
+        p.hours=p._sh; p.util=p._su; p.span_h=p._sspan; p.first_in=p._sfin;
+        p.last_out=p._slout; p.items_per_hr=p._siphr; p.hours_per_day=p._shpd;
+      }
+    });
+  }
+
+  /* ---------- relabel scan-era wording (text-node level, preserves tooltips) ---------- */
+  function textReplace(root, pairs){
+    if(!root) return;
+    var w=document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false), n;
+    var hits=[];
+    while((n=w.nextNode())){ hits.push(n); }
+    hits.forEach(function(tn){
+      var v=tn.nodeValue, changed=false;
+      pairs.forEach(function(pr){ if(v.indexOf(pr[0])!==-1){ v=v.split(pr[0]).join(pr[1]); changed=true; } });
+      if(changed) tn.nodeValue=v;
+    });
+  }
+  var CLK_NOTE='Hours are from the time clock: <b>Active</b> = clocked − logged breaks (scan gaps are <b>not</b> treated as breaks). <b>Util</b> = time actually scanning ÷ active clocked hours. <b>Unaccounted</b> = active clocked time with no scan activity. Full-timers only — interns (no clock) stay on scan estimates.';
+  function ensureNote(el, id){
+    if(!el) return;
+    if(document.getElementById(id)) return;
+    if(!HOURS.list.length) return;
+    var d=document.createElement('div'); d.id=id;
+    d.style.cssText='margin:6px 0 10px;padding:8px 12px;border-left:3px solid #15803d;background:rgba(21,128,61,.06);font-size:12px;color:var(--muted);border-radius:4px';
+    d.innerHTML='⏱ '+CLK_NOTE;
+    el.insertBefore(d, el.firstChild);
+  }
+  function relabelTab(id){
+    var el=document.getElementById(id); if(!el || !HOURS.list.length) return;
+    textReplace(el, [
+      ['1st→last','clock in→out'],
+      ['breaks out','clocked − breaks'],
+      ['active÷span','scan÷active'],
+      ['45-min-break rule','clocked hours (total − logged breaks)'],
+      ['the 45-min-break rule','clocked hours (total − logged breaks)']
+    ]);
   }
 
   /* ---------- Dashboard tiles ---------- */
@@ -2694,10 +2786,12 @@ load();initAuto();initView();
     var rows = HOURS.list.slice().sort(function(a,b){ return (b.active_h||0)-(a.active_h||0); });
     var body = rows.map(function(p){
       var pa=perActive(p.person);
+      var un=unacctFor(p.person);
       var status = p.on_break? '<span style="color:#b45309">on break</span>'
                  : p.open? '<span style="color:#15803d">on the clock</span>'
                  : esc2((p.days_detail&&p.days_detail.length?p.days_detail[p.days_detail.length-1].last_out:"")||"");
       var firstIn = (p.days_detail&&p.days_detail.length)? esc2(p.days_detail[0].first_in) : "";
+      var unCell = (un==null)? '—' : (un>=0.5? '<b style="color:#b91c1c">'+n1(un)+'h</b>' : n1(un)+'h');
       return '<tr>'
         + '<td style="font-weight:600">'+esc2(p.person)+'</td>'
         + '<td>'+firstIn+'</td>'
@@ -2705,6 +2799,7 @@ load();initAuto();initView();
         + '<td style="text-align:right">'+hh(p.total_h)+'</td>'
         + '<td style="text-align:right">'+hh(p.break_h)+'</td>'
         + '<td style="text-align:right;font-weight:700">'+hh(p.active_h)+'</td>'
+        + '<td style="text-align:right">'+unCell+'</td>'
         + '<td style="text-align:right">'+(pa!=null? '<b>'+n1(pa)+'</b>' : '—')+'</td>'
         + '</tr>';
     }).join("");
@@ -2714,9 +2809,9 @@ load();initAuto();initView();
       + '<tr style="text-align:left;color:var(--muted);border-bottom:1px solid var(--line)">'
       + '<th style="padding:4px 8px">Person</th><th style="padding:4px 8px">Clock in</th><th style="padding:4px 8px">Clock out</th>'
       + '<th style="padding:4px 8px;text-align:right">Total</th><th style="padding:4px 8px;text-align:right">Break</th>'
-      + '<th style="padding:4px 8px;text-align:right">Active</th><th style="padding:4px 8px;text-align:right">Items/active hr</th></tr>'
+      + '<th style="padding:4px 8px;text-align:right">Active</th><th style="padding:4px 8px;text-align:right">Unacct</th><th style="padding:4px 8px;text-align:right">Items/active hr</th></tr>'
       + body + '</table></div>'
-      + '<div style="font-size:11px;color:var(--muted);margin-top:6px">Active = clocked time minus breaks. Items/active hr = total contribution items ÷ active clocked hours. Full-timers only (interns aren’t on the time clock).</div>';
+      + '<div style="font-size:11px;color:var(--muted);margin-top:6px">Active = clocked time minus logged breaks. <b>Unacct</b> = active clocked time with no scan activity (should have been working). Items/active hr = total contribution items ÷ active clocked hours. Full-timers only (interns aren’t on the time clock).</div>';
   }
 
   /* ---------- Hours tab ---------- */
@@ -2767,6 +2862,8 @@ load();initAuto();initView();
     var main = rows.map(function(p){
       var it=itemsFor(p.person)||{ful:0,repl:0,total:0};
       var pa=perActive(p.person);
+      var un=unacctFor(p.person);
+      var unCell = (un==null)? '<span style="color:var(--muted)">—</span>' : (un>=0.5? '<b style="color:#b91c1c">'+n1(un)+'h</b>' : n1(un)+'h');
       var status = p.on_break? '<span style="color:#b45309;font-size:11px">● on break</span>'
                  : p.open? '<span style="color:#15803d;font-size:11px">● on the clock</span>' : '';
       return '<tr style="border-bottom:1px solid var(--line)">'
@@ -2775,6 +2872,7 @@ load();initAuto();initView();
         + '<td style="padding:6px 8px;text-align:right">'+hh(p.total_h)+'</td>'
         + '<td style="padding:6px 8px;text-align:right">'+hh(p.break_h)+'</td>'
         + '<td style="padding:6px 8px;text-align:right;font-weight:700">'+hh(p.active_h)+'</td>'
+        + '<td style="padding:6px 8px;text-align:right">'+unCell+'</td>'
         + '<td style="padding:6px 8px;text-align:right">'+intf(it.ful)+'</td>'
         + '<td style="padding:6px 8px;text-align:right">'+intf(it.repl)+'</td>'
         + '<td style="padding:6px 8px;text-align:right;font-weight:800;color:var(--ink)">'+(pa!=null?n1(pa):"—")+'</td>'
@@ -2817,10 +2915,11 @@ load();initAuto();initView();
       + '<th style="padding:6px 8px">Person</th><th style="padding:6px 8px">Days</th>'
       + '<th style="padding:6px 8px;text-align:right">Total h</th><th style="padding:6px 8px;text-align:right">Break h</th>'
       + '<th style="padding:6px 8px;text-align:right">Active h</th>'
+      + '<th style="padding:6px 8px;text-align:right">Unacct h</th>'
       + '<th style="padding:6px 8px;text-align:right">Ful items</th><th style="padding:6px 8px;text-align:right">Restock</th>'
       + '<th style="padding:6px 8px;text-align:right">Items/active hr</th></tr>'
       + main + '</table></div>'
-      + '<div style="font-size:11px;color:var(--muted);margin-top:8px">Active hours = clocked time − breaks. Items/active hr = (fulfillment + restock items) ÷ active clocked hours. Full-timers only.</div>'
+      + '<div style="font-size:11px;color:var(--muted);margin-top:8px">Active hours = clocked time − logged breaks. <b>Unacct h</b> = active clocked time with no scan activity (should have been working, or unlogged break). Items/active hr = (fulfillment + restock items) ÷ active clocked hours. Full-timers only.</div>'
       + '</div>'
       + '<div class="card">'
       + '<div style="font-weight:700;color:var(--ink);margin-bottom:8px">By day</div>'
@@ -2836,9 +2935,14 @@ load();initAuto();initView();
 
   /* ---------- master inject ---------- */
   function injectAll(){
+    try{ reconcileFloor(); }catch(e){}
     try{ injectDashTiles(); }catch(e){}
     try{ injectSpeedCols(); }catch(e){}
     try{ injectFloorOnClock(); }catch(e){}
+    try{ relabelTab("floor"); ensureNote(document.getElementById("floor"),"clkNoteFloor"); }catch(e){}
+    try{ relabelTab("an"); ensureNote(document.getElementById("an"),"clkNoteAn"); }catch(e){}
+    try{ relabelTab("watch"); ensureNote(document.getElementById("watch"),"clkNoteWatch"); }catch(e){}
+    try{ relabelTab("dash"); }catch(e){}
     try{ if((typeof curTab!=="undefined"?curTab:"")==="hours") renderHours(); }catch(e){}
   }
 
@@ -2852,8 +2956,22 @@ load();initAuto();initView();
       return r;
     };
   }
-  wrap("render", function(){ ensureHours(); injectDashTiles(); });
-  wrap("renderFloor", function(){ injectFloorOnClock(); });
+  function wrapBefore(name, before){
+    var orig=window[name];
+    if(typeof orig!=="function") return;
+    window[name]=function(){
+      try{ before.apply(this,arguments); }catch(e){}
+      return orig.apply(this,arguments);
+    };
+  }
+  // reconcile FLOOR -> clocked BEFORE any FLOOR-consuming render runs
+  ["render","renderFloor","renderAnalytics","renderWatch"].forEach(function(fn){
+    wrapBefore(fn, function(){ reconcileFloor(); });
+  });
+  wrap("render", function(){ ensureHours(); injectDashTiles(); relabelTab("dash"); });
+  wrap("renderFloor", function(){ injectFloorOnClock(); relabelTab("floor"); ensureNote(document.getElementById("floor"),"clkNoteFloor"); });
+  wrap("renderAnalytics", function(){ relabelTab("an"); ensureNote(document.getElementById("an"),"clkNoteAn"); });
+  wrap("renderWatch", function(){ relabelTab("watch"); ensureNote(document.getElementById("watch"),"clkNoteWatch"); });
   wrap("renderSpeed", function(){ injectSpeedCols(); });
   wrap("tab", function(t){
     var h=document.getElementById("hours");
