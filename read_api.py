@@ -876,6 +876,78 @@ def dataqc():
         concurrency=conc, anomalies=anomalies, today_partial=today_rows,
         unidentified=unidentified)
 
+@app.route("/hours")
+def hours():
+    """Real clocked hours from the time clock (source of truth) for the window, per
+    person: TOTAL (clock-in to clock-out span), BREAK (lunch + short breaks), and
+    ACTIVE (total minus break) hours, with a per-ET-day breakdown incl. shift in/out
+    times. Open shifts count up to now(); a shift is attributed to the ET day it
+    started. Names already match the contribution data (canonical roster names)."""
+    frm, to = _range()
+    with connect() as c, c.cursor(row_factory=tuple_row) as cur:
+        cur.execute("""
+        WITH sh AS (
+          SELECT tc.id, tc.person, tc.clock_in, tc.clock_out,
+                 et_day(tc.clock_in) AS d,
+                 EXTRACT(EPOCH FROM (COALESCE(tc.clock_out, now()) - tc.clock_in)) AS total_s,
+                 COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (COALESCE(tb.end_ts, now()) - tb.start_ts)))
+                           FROM time_break tb WHERE tb.shift_id = tc.id), 0) AS break_s,
+                 (tc.clock_out IS NULL) AS is_open,
+                 EXISTS(SELECT 1 FROM time_break tb WHERE tb.shift_id = tc.id
+                        AND tb.end_ts IS NULL) AS on_break
+          FROM time_clock tc
+        )
+        SELECT person, d,
+               SUM(total_s) AS total_s, SUM(break_s) AS break_s,
+               MIN(clock_in) AS first_in, MAX(clock_out) AS last_out,
+               bool_or(clock_out IS NULL) AS day_open,
+               count(*) AS shifts,
+               bool_or(is_open) AS is_open, bool_or(on_break) AS on_break
+        FROM sh
+        WHERE d BETWEEN %s AND %s
+        GROUP BY person, d
+        ORDER BY person, d
+        """, (frm, to))
+        rows = cur.fetchall()
+    people = {}
+    for (person, d, total_s, break_s, first_in, last_out,
+         day_open, shifts, is_open, on_break) in rows:
+        total_s = float(total_s or 0)
+        break_s = float(break_s or 0)
+        active_s = total_s - break_s
+        if active_s < 0:
+            active_s = 0.0
+        p = people.get(person)
+        if not p:
+            p = people[person] = {"person": person, "total_h": 0.0, "active_h": 0.0,
+                                  "break_h": 0.0, "days": 0, "open": False,
+                                  "on_break": False, "days_detail": []}
+        p["total_h"]  += total_s / 3600.0
+        p["active_h"] += active_s / 3600.0
+        p["break_h"]  += break_s / 3600.0
+        p["days"]     += 1
+        p["open"]      = p["open"] or bool(is_open)
+        p["on_break"]  = p["on_break"] or bool(on_break)
+        p["days_detail"].append({
+            "d": d.isoformat(),
+            "total_h": round(total_s / 3600.0, 2),
+            "active_h": round(active_s / 3600.0, 2),
+            "break_h": round(break_s / 3600.0, 2),
+            "shifts": int(shifts),
+            "first_in": _ampm(first_in),
+            "last_out": ("" if day_open else _ampm(last_out)),
+            "open": bool(is_open),
+        })
+    out = []
+    for p in people.values():
+        p["total_h"]  = round(p["total_h"], 2)
+        p["active_h"] = round(p["active_h"], 2)
+        p["break_h"]  = round(p["break_h"], 2)
+        out.append(p)
+    out.sort(key=lambda r: r["active_h"], reverse=True)
+    return jsonify({"range": {"from": frm, "to": to}, "people": out})
+
+
 @app.route("/")
 def dashboard():
     return Response(DASHBOARD_HTML, mimetype="text/html")
@@ -2445,7 +2517,357 @@ function initView(){buildDrawerNav();document.body.dataset.tab='dash';
   setTimeout(function(){if(chart)chart.resize();},80);}
 document.getElementById('from').value=etToday();document.getElementById('to').value=etToday();
 load();initAuto();initView();
-</script></body></html>"""
+</script>
+<script>
+/* ===== ON THE CLOCK — real time-clock hours integration (additive, defensive) =====
+   Reads /hours (time_clock + time_break, source of truth) and folds real clocked
+   hours into the dashboard: Dashboard tiles, Speed & Rankings columns, a Floor Time
+   "On the clock" section, and a dedicated Hours tab. ACTIVE hours (clocked minus
+   break) drive items-per-hour. Everything here is wrapped so a failure can never
+   take down the core dashboard. */
+(function(){
+  "use strict";
+  var HOURS = { byName:{}, list:[], range:null, loading:false };
+  window.HOURS = HOURS;
+
+  function n1(x){ return (x==null||isNaN(x)) ? "0" : (Math.round(x*10)/10).toString(); }
+  function hh(x){ return (x==null||isNaN(x)) ? "—" : n1(x)+"h"; }
+  function intf(x){ try{ return (typeof fmt==="function")? fmt(Math.round(x)) : Math.round(x).toLocaleString(); }catch(e){ return Math.round(x).toString(); } }
+  function esc2(s){ return String(s==null?"":s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c];}); }
+  function hoursFor(name){ return HOURS.byName[name] || null; }
+  window.hoursFor = hoursFor;
+  function matchClockName(txt){
+    if(!txt) return null;
+    if(HOURS.byName[txt]) return txt;
+    for(var i=0;i<HOURS.list.length;i++){ var nm=HOURS.list[i].person; if(nm && txt.indexOf(nm)!==-1) return nm; }
+    return null;
+  }
+
+  // DATA / curTab are top-level let/const in the app script: reachable by bare
+  // name across scripts, but NOT as window properties. Read them bare.
+  function appDATA(){ try{ return (typeof DATA!=="undefined" && DATA) ? DATA : null; }catch(e){ return null; } }
+
+  // per-person output from the main /warehouse payload (DATA.people)
+  function itemsFor(name){
+    try{
+      var D=appDATA(); if(!D || !D.people) return null;
+      var p = D.people.filter(function(x){return x.person===name;})[0];
+      if(!p) return null;
+      var ful = (p.items_picked_sh||0)+(p.items_packed_sh||0)+(p.items_packed_shop||0)+(p.engraved_items||0);
+      var repl = (p.replenished||0);
+      return { ful:ful, repl:repl, total:ful+repl, type:p.type };
+    }catch(e){ return null; }
+  }
+  function perActive(name){
+    var h=hoursFor(name), it=itemsFor(name);
+    if(!h || !it || !h.active_h) return null;
+    return it.total / h.active_h;
+  }
+
+  function curRange(){
+    var D=appDATA();
+    if(D && D.range) return {from:D.range.from, to:D.range.to};
+    return null;
+  }
+  function sameRange(a,b){ return a&&b&&a.from===b.from&&a.to===b.to; }
+
+  function loadHours(cb){
+    var r = curRange();
+    if(!r){ if(cb) cb(); return; }
+    HOURS.loading = true;
+    fetch("/hours?from="+encodeURIComponent(r.from)+"&to="+encodeURIComponent(r.to))
+      .then(function(res){ return res.json(); })
+      .then(function(j){
+        HOURS.list = (j&&j.people)||[];
+        HOURS.range = (j&&j.range)||r;
+        HOURS.byName = {};
+        HOURS.list.forEach(function(p){ HOURS.byName[p.person]=p; });
+        HOURS.loading = false;
+        injectAll();
+      })
+      .catch(function(e){ HOURS.loading=false; try{console.warn("hours load failed",e);}catch(_){} });
+  }
+  window.loadHours = loadHours;
+
+  // Refetch hours whenever the dashboard's range no longer matches what we have.
+  function ensureHours(){
+    var r = curRange();
+    if(!r) return;
+    if(!HOURS.loading && !sameRange(HOURS.range, r)) loadHours();
+  }
+
+  /* ---------- fleet totals ---------- */
+  function fleet(){
+    var tot=0, act=0, brk=0, ppl=0, items=0, covered=0;
+    HOURS.list.forEach(function(p){
+      tot+=p.total_h||0; act+=p.active_h||0; brk+=p.break_h||0; ppl++;
+      var it=itemsFor(p.person); if(it){ items+=it.total; if(p.active_h) covered+=p.active_h; }
+    });
+    return { tot:tot, act:act, brk:brk, ppl:ppl, items:items,
+             iphr: covered? items/covered : 0 };
+  }
+
+  /* ---------- Dashboard tiles ---------- */
+  function injectDashTiles(){
+    var dash=document.getElementById("dash"); if(!dash) return;
+    var host=document.getElementById("hoursTiles");
+    if(!host){
+      host=document.createElement("div");
+      host.id="hoursTiles";
+      host.className="card";
+      host.style.margin="10px 0";
+      var anchor=document.getElementById("shipped");
+      if(anchor && anchor.parentNode===dash){ dash.insertBefore(host, anchor.nextSibling); }
+      else { dash.insertBefore(host, dash.firstChild); }
+    }
+    if(!HOURS.list.length){ host.style.display="none"; return; }
+    host.style.display="";
+    var f=fleet();
+    function tile(big,label,sub){
+      return '<div style="flex:1;min-width:120px">'
+        + '<div style="font-size:26px;font-weight:800;color:var(--ink)">'+big+'</div>'
+        + '<div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:700">'+label+'</div>'
+        + (sub?'<div style="font-size:12px;color:var(--muted);margin-top:2px">'+sub+'</div>':'')
+        + '</div>';
+    }
+    host.innerHTML =
+      '<div style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:700;margin-bottom:8px">⏱ On the clock &middot; real hours from the time clock</div>'
+      + '<div style="display:flex;gap:18px;flex-wrap:wrap">'
+      + tile(hh(f.act), "Active hours", intf(f.tot)+"h clocked · "+intf(f.brk)+"h break")
+      + tile(n1(f.iphr), "Items / active hr", "fleet, clocked FT")
+      + tile(String(f.ppl), "On the clock", "full-timers with hours")
+      + tile(hh(f.ppl? f.act/f.ppl : 0), "Avg active / person", "")
+      + '</div>';
+  }
+
+  /* ---------- Speed & Rankings: add Active-h + Items/active-hr columns ---------- */
+  function injectSpeedCols(){
+    var sp=document.getElementById("speed"); if(!sp) return;
+    var tbl=sp.querySelector("table"); if(!tbl) return;
+    if(!HOURS.list.length) return;
+    var rows=[].slice.call(tbl.rows);
+    if(!rows.length) return;
+    // header row = the row whose cells are <th>
+    var headIdx=-1;
+    for(var i=0;i<rows.length;i++){ if(rows[i].querySelector("th")){ headIdx=i; break; } }
+    rows.forEach(function(row, idx){
+      if(row.getAttribute("data-clk")==="1") return;
+      if(idx===headIdx || (row.querySelector("th") && !row.querySelector("td"))){
+        var th1=document.createElement("th"); th1.textContent="Active h (clocked)";
+        var th2=document.createElement("th"); th2.textContent="Items/active hr";
+        th1.style.color=th2.style.color="var(--ink)";
+        row.appendChild(th1); row.appendChild(th2);
+        row.setAttribute("data-clk","1");
+        return;
+      }
+      var first=row.cells[0]; if(!first) return;
+      var txt=(first.textContent||"").trim();
+      var name=matchClockName(txt);
+      var h=name?hoursFor(name):null, pa=name?perActive(name):null;
+      var c1=row.insertCell(-1), c2=row.insertCell(-1);
+      c1.textContent = h? hh(h.active_h) : "—";
+      c2.innerHTML = (pa!=null)? '<b>'+n1(pa)+'</b>' : '<span style="color:var(--muted)">—</span>';
+      c1.style.whiteSpace=c2.style.whiteSpace="nowrap";
+      row.setAttribute("data-clk","1");
+    });
+  }
+
+  /* ---------- Floor Time: On-the-clock section ---------- */
+  function injectFloorOnClock(){
+    var fl=document.getElementById("floor"); if(!fl) return;
+    var host=document.getElementById("floorOnClock");
+    if(!host){
+      host=document.createElement("div");
+      host.id="floorOnClock";
+      host.className="card";
+      host.style.marginBottom="12px";
+      fl.insertBefore(host, fl.firstChild);
+    }
+    if(!HOURS.list.length){ host.style.display="none"; return; }
+    host.style.display="";
+    var rows = HOURS.list.slice().sort(function(a,b){ return (b.active_h||0)-(a.active_h||0); });
+    var body = rows.map(function(p){
+      var pa=perActive(p.person);
+      var status = p.on_break? '<span style="color:#b45309">on break</span>'
+                 : p.open? '<span style="color:#15803d">on the clock</span>'
+                 : esc2((p.days_detail&&p.days_detail.length?p.days_detail[p.days_detail.length-1].last_out:"")||"");
+      var firstIn = (p.days_detail&&p.days_detail.length)? esc2(p.days_detail[0].first_in) : "";
+      return '<tr>'
+        + '<td style="font-weight:600">'+esc2(p.person)+'</td>'
+        + '<td>'+firstIn+'</td>'
+        + '<td>'+status+'</td>'
+        + '<td style="text-align:right">'+hh(p.total_h)+'</td>'
+        + '<td style="text-align:right">'+hh(p.break_h)+'</td>'
+        + '<td style="text-align:right;font-weight:700">'+hh(p.active_h)+'</td>'
+        + '<td style="text-align:right">'+(pa!=null? '<b>'+n1(pa)+'</b>' : '—')+'</td>'
+        + '</tr>';
+    }).join("");
+    host.innerHTML =
+      '<div style="font-size:14px;font-weight:700;color:var(--ink)">⏱ On the clock <span style="font-weight:400;color:var(--muted)">— real shift times from the time clock (source of truth)</span></div>'
+      + '<div style="overflow-x:auto;margin-top:8px"><table style="width:100%;border-collapse:collapse;font-size:13px">'
+      + '<tr style="text-align:left;color:var(--muted);border-bottom:1px solid var(--line)">'
+      + '<th style="padding:4px 8px">Person</th><th style="padding:4px 8px">Clock in</th><th style="padding:4px 8px">Clock out</th>'
+      + '<th style="padding:4px 8px;text-align:right">Total</th><th style="padding:4px 8px;text-align:right">Break</th>'
+      + '<th style="padding:4px 8px;text-align:right">Active</th><th style="padding:4px 8px;text-align:right">Items/active hr</th></tr>'
+      + body + '</table></div>'
+      + '<div style="font-size:11px;color:var(--muted);margin-top:6px">Active = clocked time minus breaks. Items/active hr = total contribution items ÷ active clocked hours. Full-timers only (interns aren’t on the time clock).</div>';
+  }
+
+  /* ---------- Hours tab ---------- */
+  function ensureHoursTab(){
+    // nav button in the .tabs strip
+    var tabs=document.querySelector(".tabs");
+    if(tabs && !tabs.querySelector('[data-tab="hours"]')){
+      var b=document.createElement("button");
+      b.className="tab"; b.setAttribute("data-tab","hours"); b.textContent="Hours";
+      b.onclick=function(){ try{ tab("hours"); }catch(e){} };
+      tabs.appendChild(b);
+    }
+    // drawer nav mirror
+    var dn=document.getElementById("drawernav");
+    if(dn && !dn.querySelector('[data-tab="hours"]')){
+      var d=document.createElement("button");
+      d.setAttribute("data-tab","hours"); d.textContent="Hours";
+      d.onclick=function(){ try{ tab("hours"); var all=dn.querySelectorAll("button"); [].forEach.call(all,function(x){x.classList.remove("cur");}); d.classList.add("cur"); if(typeof closeDrawer==="function") closeDrawer(); }catch(e){} };
+      dn.appendChild(d);
+    }
+    // view container
+    var view=document.getElementById("hours");
+    if(!view){
+      view=document.createElement("div");
+      view.id="hours"; view.className="hide";
+      var anchor=document.getElementById("dash");
+      if(anchor && anchor.parentNode){ anchor.parentNode.appendChild(view); }
+      else { document.querySelector(".wrap").appendChild(view); }
+    }
+  }
+
+  function renderHours(){
+    var view=document.getElementById("hours"); if(!view) return;
+    if(!HOURS.list.length){
+      view.innerHTML='<div class="card"><div style="padding:20px;color:var(--muted)">No time-clock hours in this range yet. Full-timers clock in/out at <b>ikigai-timeclock.onrender.com</b>; those hours appear here as the source of truth.</div></div>';
+      return;
+    }
+    var f=fleet();
+    var rows=HOURS.list.slice().sort(function(a,b){
+      var pa=perActive(a.person), pb=perActive(b.person);
+      return (pb==null?-1:pb)-(pa==null?-1:pa);
+    });
+    function tcard(big,label,sub){
+      return '<div style="flex:1;min-width:130px"><div style="font-size:24px;font-weight:800;color:var(--ink)">'+big+'</div>'
+        +'<div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:700">'+label+'</div>'
+        +(sub?'<div style="font-size:12px;color:var(--muted);margin-top:2px">'+sub+'</div>':'')+'</div>';
+    }
+    var main = rows.map(function(p){
+      var it=itemsFor(p.person)||{ful:0,repl:0,total:0};
+      var pa=perActive(p.person);
+      var status = p.on_break? '<span style="color:#b45309;font-size:11px">● on break</span>'
+                 : p.open? '<span style="color:#15803d;font-size:11px">● on the clock</span>' : '';
+      return '<tr style="border-bottom:1px solid var(--line)">'
+        + '<td style="padding:6px 8px;font-weight:600">'+esc2(p.person)+' '+status+'</td>'
+        + '<td style="padding:6px 8px;color:var(--muted)">'+esc2(p.days||0)+'</td>'
+        + '<td style="padding:6px 8px;text-align:right">'+hh(p.total_h)+'</td>'
+        + '<td style="padding:6px 8px;text-align:right">'+hh(p.break_h)+'</td>'
+        + '<td style="padding:6px 8px;text-align:right;font-weight:700">'+hh(p.active_h)+'</td>'
+        + '<td style="padding:6px 8px;text-align:right">'+intf(it.ful)+'</td>'
+        + '<td style="padding:6px 8px;text-align:right">'+intf(it.repl)+'</td>'
+        + '<td style="padding:6px 8px;text-align:right;font-weight:800;color:var(--ink)">'+(pa!=null?n1(pa):"—")+'</td>'
+        + '</tr>';
+    }).join("");
+
+    // per-day breakdown
+    var dayRows=[];
+    rows.forEach(function(p){
+      (p.days_detail||[]).forEach(function(d){
+        dayRows.push({person:p.person, d:d.d, total:d.total_h, active:d.active_h, brk:d.break_h, fin:d.first_in, fout:d.last_out, open:d.open});
+      });
+    });
+    dayRows.sort(function(a,b){ return a.d<b.d?1:a.d>b.d?-1:a.person.localeCompare(b.person); });
+    var dayBody = dayRows.map(function(d){
+      return '<tr style="border-bottom:1px solid var(--line)">'
+        +'<td style="padding:5px 8px">'+esc2(d.d)+'</td>'
+        +'<td style="padding:5px 8px;font-weight:600">'+esc2(d.person)+'</td>'
+        +'<td style="padding:5px 8px">'+esc2(d.fin||"")+'</td>'
+        +'<td style="padding:5px 8px">'+(d.open?'<span style="color:#15803d">on the clock</span>':esc2(d.fout||""))+'</td>'
+        +'<td style="padding:5px 8px;text-align:right">'+hh(d.total)+'</td>'
+        +'<td style="padding:5px 8px;text-align:right">'+hh(d.brk)+'</td>'
+        +'<td style="padding:5px 8px;text-align:right;font-weight:700">'+hh(d.active)+'</td>'
+        +'</tr>';
+    }).join("");
+
+    view.innerHTML =
+      '<div class="card" style="margin-bottom:12px">'
+      + '<div style="font-size:16px;font-weight:800;color:var(--ink)">⏱ Hours <span style="font-weight:400;color:var(--muted)">— real clocked time from the time clock (source of truth)</span></div>'
+      + '<div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:12px">'
+      + tcard(hh(f.act),"Active hours", intf(f.tot)+"h clocked · "+intf(f.brk)+"h break")
+      + tcard(n1(f.iphr),"Items / active hr","fleet")
+      + tcard(String(f.ppl),"On the clock","full-timers")
+      + tcard(hh(f.ppl?f.act/f.ppl:0),"Avg active / person","")
+      + '</div></div>'
+      + '<div class="card" style="margin-bottom:12px">'
+      + '<div style="font-weight:700;color:var(--ink);margin-bottom:8px">By person <span style="font-weight:400;color:var(--muted)">— ranked by items per active hour</span></div>'
+      + '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px">'
+      + '<tr style="text-align:left;color:var(--muted);border-bottom:2px solid var(--line)">'
+      + '<th style="padding:6px 8px">Person</th><th style="padding:6px 8px">Days</th>'
+      + '<th style="padding:6px 8px;text-align:right">Total h</th><th style="padding:6px 8px;text-align:right">Break h</th>'
+      + '<th style="padding:6px 8px;text-align:right">Active h</th>'
+      + '<th style="padding:6px 8px;text-align:right">Ful items</th><th style="padding:6px 8px;text-align:right">Restock</th>'
+      + '<th style="padding:6px 8px;text-align:right">Items/active hr</th></tr>'
+      + main + '</table></div>'
+      + '<div style="font-size:11px;color:var(--muted);margin-top:8px">Active hours = clocked time − breaks. Items/active hr = (fulfillment + restock items) ÷ active clocked hours. Full-timers only.</div>'
+      + '</div>'
+      + '<div class="card">'
+      + '<div style="font-weight:700;color:var(--ink);margin-bottom:8px">By day</div>'
+      + '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px">'
+      + '<tr style="text-align:left;color:var(--muted);border-bottom:2px solid var(--line)">'
+      + '<th style="padding:5px 8px">Day</th><th style="padding:5px 8px">Person</th>'
+      + '<th style="padding:5px 8px">Clock in</th><th style="padding:5px 8px">Clock out</th>'
+      + '<th style="padding:5px 8px;text-align:right">Total</th><th style="padding:5px 8px;text-align:right">Break</th>'
+      + '<th style="padding:5px 8px;text-align:right">Active</th></tr>'
+      + dayBody + '</table></div></div>';
+  }
+  window.renderHours = renderHours;
+
+  /* ---------- master inject ---------- */
+  function injectAll(){
+    try{ injectDashTiles(); }catch(e){}
+    try{ injectSpeedCols(); }catch(e){}
+    try{ injectFloorOnClock(); }catch(e){}
+    try{ if((typeof curTab!=="undefined"?curTab:"")==="hours") renderHours(); }catch(e){}
+  }
+
+  /* ---------- hook existing globals ---------- */
+  function wrap(name, after){
+    var orig=window[name];
+    if(typeof orig!=="function") return;
+    window[name]=function(){
+      var r=orig.apply(this,arguments);
+      try{ after.apply(this,arguments); }catch(e){}
+      return r;
+    };
+  }
+  wrap("render", function(){ ensureHours(); injectDashTiles(); });
+  wrap("renderFloor", function(){ injectFloorOnClock(); });
+  wrap("renderSpeed", function(){ injectSpeedCols(); });
+  wrap("tab", function(t){
+    var h=document.getElementById("hours");
+    if(h) h.classList.toggle("hide", t!=="hours");
+    if(t==="hours") renderHours();
+  });
+
+  /* ---------- init ---------- */
+  function init(){
+    try{ ensureHoursTab(); }catch(e){}
+    loadHours();
+  }
+  if(document.readyState==="loading") document.addEventListener("DOMContentLoaded", init);
+  else init();
+  // also retry once after a moment in case the main app finishes loading DATA later
+  setTimeout(function(){ try{ ensureHoursTab(); ensureHours(); if(!HOURS.list.length) loadHours(); }catch(e){} }, 4000);
+})();
+
+</script>
+</body></html>"""
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8090")))
