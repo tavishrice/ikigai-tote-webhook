@@ -2771,6 +2771,55 @@ load();initAuto();initView();
     }
   }
 
+  /* ---------- Dashboard: split FULFILLMENT into Pick / Engrave / Pack / Total items / Share ---------- */
+  function num(x){ return (x==null||isNaN(x))?0:x; }
+  function matchDataName(txt){
+    var D=appDATA(); if(!D||!D.people||!txt) return null;
+    for(var i=0;i<D.people.length;i++){ if(D.people[i].person && txt.indexOf(D.people[i].person)===0) return D.people[i]; }
+    for(var j=0;j<D.people.length;j++){ if(D.people[j].person && txt.indexOf(D.people[j].person)!==-1) return D.people[j]; }
+    return null;
+  }
+  function injectDashFulfillmentCols(){
+    var D=appDATA(); if(!D || !D.people) return;
+    var dash=document.getElementById("dash"); if(!dash) return;
+    var tbl=[].slice.call(dash.querySelectorAll("table")).filter(function(t){
+      return /ON THE CLOCK/i.test(t.textContent) && /FULFILLMENT/i.test(t.textContent); })[0];
+    if(!tbl) return;
+    var rows=[].slice.call(tbl.rows); if(rows.length<2) return;
+    var sub=rows[1];
+    if([].slice.call(sub.cells).some(function(c){return /Total items/i.test(c.textContent);})) return; // already done
+    var fulStart=-1;
+    for(var i=0;i<sub.cells.length;i++){ if(/pick\+pack\+engrave/i.test(sub.cells[i].textContent) || /^Items/i.test(sub.cells[i].textContent.trim())){ fulStart=i; break; } }
+    if(fulStart<0) return;
+    var groupTh=[].slice.call(rows[0].cells).filter(function(c){return c.textContent.trim().toLowerCase()==="fulfillment";})[0];
+    if(!groupTh) return;
+    var thCls=sub.cells[fulStart]?sub.cells[fulStart].className:"";
+    var shareLabel=sub.cells[fulStart+1]?sub.cells[fulStart+1].innerHTML:"Share";
+    sub.deleteCell(fulStart+2); sub.deleteCell(fulStart+1); sub.deleteCell(fulStart);
+    var hAnchor=sub.cells[fulStart]||null;
+    ["Pick","Engrave","Pack","Total items",shareLabel].forEach(function(lbl){
+      var th=document.createElement("th"); th.className=thCls; th.style.textAlign="right"; th.innerHTML=lbl; sub.insertBefore(th,hAnchor); });
+    groupTh.colSpan = groupTh.colSpan + 2;
+    for(var r=2;r<rows.length;r++){
+      var row=rows[r]; if(row.cells.length<=fulStart+2) continue;
+      var name=row.cells[0]?row.cells[0].textContent.trim():"";
+      var shareHTML=row.cells[fulStart+1]?row.cells[fulStart+1].innerHTML:"";
+      var shareCls=row.cells[fulStart+1]?row.cells[fulStart+1].className:"";
+      var cls=row.cells[fulStart]?row.cells[fulStart].className:"";
+      var pick,eng,pack,total;
+      if(/^Total/i.test(name)){ var T=D.totals||{}; pick=num(T.pk_i); eng=num(T.eng_i); pack=num(T.packsh_i)+num(T.packshop_i); total=pick+eng+pack; }
+      else { var p=matchDataName(name);
+             if(p){ pick=num(p.items_picked_sh); eng=num(p.engraved_items); pack=num(p.items_packed_sh)+num(p.items_packed_shop); total=pick+eng+pack; }
+             else { pick=eng=pack=total=null; } }
+      row.deleteCell(fulStart+2); row.deleteCell(fulStart+1); row.deleteCell(fulStart);
+      var anchor=row.cells[fulStart]||null;
+      [pick,eng,pack].forEach(function(v){ var td=document.createElement("td"); td.className=cls; td.style.textAlign="right";
+        td.innerHTML=(v==null)?'<span style="color:var(--muted)">—</span>':intf(v); row.insertBefore(td,anchor); });
+      var tt=document.createElement("td"); tt.className=cls; tt.style.textAlign="right"; tt.innerHTML=(total==null)?"—":'<b>'+intf(total)+'</b>'; row.insertBefore(tt,anchor);
+      var ts=document.createElement("td"); ts.className=shareCls; ts.innerHTML=shareHTML; row.insertBefore(ts,anchor);
+    }
+  }
+
   /* ---------- Speed & Rankings: add Active-h + Items/active-hr columns ---------- */
   function injectSpeedCols(){
     var sp=document.getElementById("speed"); if(!sp) return;
@@ -2975,6 +3024,7 @@ load();initAuto();initView();
     try{ relabelTab("floor"); ensureNote(document.getElementById("floor"),"clkNoteFloor"); }catch(e){}
     try{ relabelTab("an"); ensureNote(document.getElementById("an"),"clkNoteAn"); }catch(e){}
     try{ relabelTab("watch"); ensureNote(document.getElementById("watch"),"clkNoteWatch"); }catch(e){}
+    try{ injectDashFulfillmentCols(); }catch(e){}
     try{ relabelTab("dash"); injectDashClockCol(); }catch(e){}
     try{ if((typeof curTab!=="undefined"?curTab:"")==="hours") renderHours(); }catch(e){}
   }
@@ -3001,7 +3051,7 @@ load();initAuto();initView();
   ["render","renderFloor","renderAnalytics","renderWatch"].forEach(function(fn){
     wrapBefore(fn, function(){ reconcileFloor(); });
   });
-  wrap("render", function(){ ensureHours(); removeDashBand(); relabelTab("dash"); injectDashClockCol(); });
+  wrap("render", function(){ ensureHours(); removeDashBand(); injectDashFulfillmentCols(); relabelTab("dash"); injectDashClockCol(); });
   wrap("renderFloor", function(){ injectFloorOnClock(); relabelTab("floor"); ensureNote(document.getElementById("floor"),"clkNoteFloor"); });
   wrap("renderAnalytics", function(){ relabelTab("an"); ensureNote(document.getElementById("an"),"clkNoteAn"); });
   wrap("renderWatch", function(){ relabelTab("watch"); ensureNote(document.getElementById("watch"),"clkNoteWatch"); });
