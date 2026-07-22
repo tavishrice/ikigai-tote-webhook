@@ -2705,37 +2705,50 @@ load();initAuto();initView();
     ]);
   }
 
-  /* ---------- Dashboard tiles ---------- */
-  function injectDashTiles(){
-    var dash=document.getElementById("dash"); if(!dash) return;
-    var host=document.getElementById("hoursTiles");
-    if(!host){
-      host=document.createElement("div");
-      host.id="hoursTiles";
-      host.className="card";
-      host.style.margin="10px 0";
-      var anchor=document.getElementById("shipped");
-      if(anchor && anchor.parentNode===dash){ dash.insertBefore(host, anchor.nextSibling); }
-      else { dash.insertBefore(host, dash.firstChild); }
+  /* ---------- Dashboard: NO separate top band (removed per Tavish). Instead add an
+     Items/hr column INSIDE the existing "On the clock" section of the detail table. */
+  function removeDashBand(){ var el=document.getElementById("hoursTiles"); if(el) el.remove(); }
+
+  function matchAnyName(txt){
+    var F=appFLOOR(); if(!F||!F.people||!txt) return null;
+    for(var i=0;i<F.people.length;i++){ if(F.people[i].person && txt.indexOf(F.people[i].person)===0) return F.people[i].person; }
+    for(var j=0;j<F.people.length;j++){ if(F.people[j].person && txt.indexOf(F.people[j].person)!==-1) return F.people[j].person; }
+    return null;
+  }
+  function fleetUPLH(){
+    var F=appFLOOR(); if(!F||!F.people) return null;
+    var it=0, hr=0; F.people.forEach(function(p){ if(p.has_clock){ it+=(p.items||0); hr+=(p.hours||0); } });
+    return hr>0? Math.round(it/hr) : null;
+  }
+  function injectDashClockCol(){
+    var dash=document.getElementById("dash"); if(!dash || !HOURS.list.length) return;
+    var tbl=[].slice.call(dash.querySelectorAll("table")).filter(function(t){
+      return /ON THE CLOCK/i.test(t.textContent) && /FULFILLMENT/i.test(t.textContent); })[0];
+    if(!tbl) return;
+    var rows=[].slice.call(tbl.rows); if(rows.length<2) return;
+    var groupTh=[].slice.call(rows[0].cells).filter(function(c){ return c.textContent.trim().toLowerCase()==="on the clock"; })[0];
+    if(!groupTh || groupTh.colSpan>=4) return; // already injected this render
+    var sub=rows[1], ai=-1;
+    for(var i=0;i<sub.cells.length;i++){ if(/Active/i.test(sub.cells[i].textContent)){ ai=i; break; } }
+    if(ai<0) return;
+    var pos=ai+1;
+    var F=appFLOOR(); var iphr={}; F.people.forEach(function(p){ iphr[p.person]=p.items_per_hr; });
+    groupTh.colSpan = groupTh.colSpan + 1;
+    var th=document.createElement("th");
+    if(sub.cells[ai]) th.className=sub.cells[ai].className;
+    th.style.textAlign="right"; th.textContent="Items/hr";
+    sub.insertBefore(th, sub.cells[pos]||null);
+    for(var r=2;r<rows.length;r++){
+      var row=rows[r]; if(row.cells.length<pos) continue;
+      var name=row.cells[0]? row.cells[0].textContent.trim() : "";
+      var td=document.createElement("td");
+      if(row.cells[ai]) td.className=row.cells[ai].className;
+      td.style.textAlign="right";
+      if(/^Total/i.test(name)){ var fu=fleetUPLH(); td.innerHTML=(fu!=null)? '<b>'+fu+'</b>' : ''; }
+      else { var nm=matchAnyName(name); var v=(nm!=null)? iphr[nm] : null;
+             td.innerHTML=(v!=null && !isNaN(v))? String(v) : '<span style="color:var(--muted)">—</span>'; }
+      row.insertBefore(td, row.cells[pos]||null);
     }
-    if(!HOURS.list.length){ host.style.display="none"; return; }
-    host.style.display="";
-    var f=fleet();
-    function tile(big,label,sub){
-      return '<div style="flex:1;min-width:120px">'
-        + '<div style="font-size:26px;font-weight:800;color:var(--ink)">'+big+'</div>'
-        + '<div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:700">'+label+'</div>'
-        + (sub?'<div style="font-size:12px;color:var(--muted);margin-top:2px">'+sub+'</div>':'')
-        + '</div>';
-    }
-    host.innerHTML =
-      '<div style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:700;margin-bottom:8px">⏱ On the clock &middot; real hours from the time clock</div>'
-      + '<div style="display:flex;gap:18px;flex-wrap:wrap">'
-      + tile(hh(f.act), "Active hours", intf(f.tot)+"h clocked · "+intf(f.brk)+"h break")
-      + tile(n1(f.iphr), "Items / active hr", "fleet, clocked FT")
-      + tile(String(f.ppl), "On the clock", "full-timers with hours")
-      + tile(hh(f.ppl? f.act/f.ppl : 0), "Avg active / person", "")
-      + '</div>';
   }
 
   /* ---------- Speed & Rankings: add Active-h + Items/active-hr columns ---------- */
@@ -2936,13 +2949,13 @@ load();initAuto();initView();
   /* ---------- master inject ---------- */
   function injectAll(){
     try{ reconcileFloor(); }catch(e){}
-    try{ injectDashTiles(); }catch(e){}
+    try{ removeDashBand(); }catch(e){}
     try{ injectSpeedCols(); }catch(e){}
     try{ injectFloorOnClock(); }catch(e){}
     try{ relabelTab("floor"); ensureNote(document.getElementById("floor"),"clkNoteFloor"); }catch(e){}
     try{ relabelTab("an"); ensureNote(document.getElementById("an"),"clkNoteAn"); }catch(e){}
     try{ relabelTab("watch"); ensureNote(document.getElementById("watch"),"clkNoteWatch"); }catch(e){}
-    try{ relabelTab("dash"); }catch(e){}
+    try{ relabelTab("dash"); injectDashClockCol(); }catch(e){}
     try{ if((typeof curTab!=="undefined"?curTab:"")==="hours") renderHours(); }catch(e){}
   }
 
@@ -2968,7 +2981,7 @@ load();initAuto();initView();
   ["render","renderFloor","renderAnalytics","renderWatch"].forEach(function(fn){
     wrapBefore(fn, function(){ reconcileFloor(); });
   });
-  wrap("render", function(){ ensureHours(); injectDashTiles(); relabelTab("dash"); });
+  wrap("render", function(){ ensureHours(); removeDashBand(); relabelTab("dash"); injectDashClockCol(); });
   wrap("renderFloor", function(){ injectFloorOnClock(); relabelTab("floor"); ensureNote(document.getElementById("floor"),"clkNoteFloor"); });
   wrap("renderAnalytics", function(){ relabelTab("an"); ensureNote(document.getElementById("an"),"clkNoteAn"); });
   wrap("renderWatch", function(){ relabelTab("watch"); ensureNote(document.getElementById("watch"),"clkNoteWatch"); });
