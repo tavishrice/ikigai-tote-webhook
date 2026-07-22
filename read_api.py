@@ -1170,6 +1170,39 @@ body.clean[data-tab=dash] #chartmode{display:inline-flex;position:absolute;top:6
 body.dark #chartmode{background:#2c2c2a}
 body.dark #chartmode button.on{background:#1a1a19}
 body.clean #dash>.card>h2{font-size:12.5px;margin-bottom:2px}
+/* ===== MOBILE (phones): the TV no-scroll layout doesn't fit — reflow to a scrolling, stacked view ===== */
+@media (max-width:700px){
+  body.clean[data-tab=dash]{overflow:auto}
+  body.clean[data-tab=dash] .wrap{height:auto;min-height:100vh;overflow:visible;display:block;max-width:none;padding:12px 12px 40px}
+  /* header stacks: title, then date, updated-stamp dropped */
+  body.clean[data-tab=dash] #tvhead{flex-direction:column;align-items:flex-start;gap:1px;margin-bottom:12px}
+  body.clean[data-tab=dash] .tvdatewrap{justify-content:flex-start;text-align:left;width:100%;gap:8px}
+  body.clean[data-tab=dash] .tvbrand{flex-wrap:wrap}
+  body.clean[data-tab=dash] .tvref{display:none}
+  /* KPI tiles: hero full-width, other three in a 3-up row below */
+  body.clean[data-tab=dash] #tvkpis{grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}
+  body.clean[data-tab=dash] #tvkpis .kpi.hero{grid-column:1/3}
+  body.clean[data-tab=dash] #tvkpis .kpi:last-child{grid-column:1/3;padding-right:14px}
+  body.clean[data-tab=dash] .kpi:not(.hero){display:block}
+  body.clean[data-tab=dash] .kpi .kl{white-space:normal}
+  body.clean[data-tab=dash] .kpi .kv{font-size:24px;margin-top:2px}
+  body.clean[data-tab=dash] .kpi.hero .kv{font-size:34px}
+  body.clean[data-tab=dash] .kpi:not(.hero) .kn{display:none}   /* drop captions on the small tiles */
+  /* stack the chart and table, natural heights, page scrolls */
+  body.clean[data-tab=dash] #dash{display:block}
+  body.clean[data-tab=dash] #dash>.card{margin:0 0 12px!important;padding:12px 14px}
+  body.clean[data-tab=dash] #dash .card:has(.chartwrap){min-height:0;position:relative}
+  body.clean[data-tab=dash] #dash .chartwrap{height:300px!important;flex:none;margin-top:8px}
+  body.clean[data-tab=dash] #chartmode{position:static;display:inline-flex;margin:0 0 4px}
+  /* dense table → swipe sideways; reset the fill-height trick */
+  body.clean[data-tab=dash] #dash .card:has(#detail){max-height:none}
+  body.clean[data-tab=dash] #dash .card:has(#detail) #detail{overflow:auto;-webkit-overflow-scrolling:touch}
+  body.clean[data-tab=dash] #dash .card:has(#detail) #detail>table{height:auto;min-width:660px}
+  body.clean[data-tab=dash] #dash .card:has(#detail) table{font-size:12.5px}
+  body.clean[data-tab=dash] #dash .card:has(#detail) td,body.clean[data-tab=dash] #dash .card:has(#detail) th{padding:6px 8px}
+  /* the gear stays reachable; drawer is near full-width on a phone */
+  #drawer{width:86vw;max-width:340px}
+}
 /* dark (TV) — flips the surfaces; chart text is re-themed in drawChart() */
 body.dark{--bg:#0d0d0d;--surface:#1a1a19;--line:#2c2c2a;--line-2:#242422;--ink:#f5f5f0;--ink-2:#c3c2b7;--muted:#8a887f;--accent-weak:#1e2a3f}
 body.dark .shipped{background:linear-gradient(180deg,#15211a,#1a1a19)}
@@ -1682,7 +1715,8 @@ function drawChart(ppl,v,forceStage){
   const CLEAN=document.body.classList.contains('clean');   // TV mode → bigger, horizontal person names
   const stageSel=forceStage||segval('stage');   // forceStage lets the rotating leaderboard drive the chart
   const C_AX=DK?'#c3c2b7':'#64748b', C_GRID=DK?'#2c2c2a':'#eef1f5', C_TTL=DK?'#f5f5f0':'#0f172a', C_LBL=DK?'#e2e2dc':'#334155';
-  const NMSZ=CLEAN?13.5:11, NMWT=CLEAN?'600':'400', NMROT=CLEAN?0:40, LBLSZ=CLEAN?12.5:11;
+  const MOBILE=window.innerWidth<=700;                 // phones: smaller, rotated names so they don't collide
+  const NMSZ=MOBILE?10:(CLEAN?13.5:11), NMWT=(CLEAN&&!MOBILE)?'600':'400', NMROT=(CLEAN&&!MOBILE)?0:(MOBILE?50:40), LBLSZ=MOBILE?10:(CLEAN?12.5:11);
   const ord=segval('unit')==='orders';            // chart follows the Items/Orders toggle
   const val=(p,c)=>{
     if(ord){ if(c==='pick')return v.pick?p.orders_picked_sh:0;
