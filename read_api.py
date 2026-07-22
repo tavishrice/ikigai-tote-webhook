@@ -886,6 +886,41 @@ def dataqc():
         concurrency=conc, anomalies=anomalies, today_partial=today_rows,
         unidentified=unidentified)
 
+@app.route("/teamdaily")
+def teamdaily():
+    """Team-wide per-ET-day totals for the window: items picked / packed / engraved /
+    replenished, distinct fulfillment orders, and distinct people — one row per working
+    day. Fast simple aggregate (no window functions) so it stays snappy on free tier."""
+    frm, to = _range()
+    with connect() as c, c.cursor(row_factory=tuple_row) as cur:
+        cur.execute("""
+        SELECT to_char(et_day(ts),'YYYY-MM-DD') AS d,
+               COALESCE(SUM(quantity) FILTER (WHERE stage='pick'),0)      AS picks,
+               COALESCE(SUM(quantity) FILTER (WHERE stage='pack'),0)      AS packs,
+               COALESCE(SUM(quantity) FILTER (WHERE stage='engrave'),0)   AS engraves,
+               COALESCE(SUM(quantity) FILTER (WHERE stage='replenish'),0) AS restocks,
+               COUNT(DISTINCT order_number) FILTER (WHERE stage IN ('pick','pack','engrave')) AS orders,
+               COUNT(DISTINCT person) AS people
+        FROM event_canon
+        WHERE et_day(ts) BETWEEN %s AND %s
+        GROUP BY et_day(ts)
+        ORDER BY et_day(ts)
+        """, (frm, to))
+        rows = cur.fetchall()
+    days = []
+    tot = {"picks": 0, "packs": 0, "engraves": 0, "restocks": 0, "ful": 0, "orders": 0}
+    for (d, picks, packs, engraves, restocks, orders, people) in rows:
+        picks = int(picks or 0); packs = int(packs or 0)
+        engraves = int(engraves or 0); restocks = int(restocks or 0)
+        ful = picks + packs + engraves
+        days.append({"d": d, "picks": picks, "packs": packs, "engraves": engraves,
+                     "restocks": restocks, "ful": ful, "orders": int(orders or 0),
+                     "people": int(people or 0)})
+        tot["picks"] += picks; tot["packs"] += packs; tot["engraves"] += engraves
+        tot["restocks"] += restocks; tot["ful"] += ful; tot["orders"] += int(orders or 0)
+    return jsonify({"range": {"from": frm, "to": to}, "days": days, "totals": tot})
+
+
 @app.route("/hours")
 def hours():
     """Real clocked hours from the time clock (source of truth) for the window, per
@@ -3047,6 +3082,96 @@ load();initAuto();initView();
   }
   window.renderHours = renderHours;
 
+  /* ================= TEAM-WIDE ANALYTICS (replaces the per-person Analytics tab) ================= */
+  var TEAM={ range:null, days:[], totals:null, loading:false };
+  var TEAM_COLORS={ picks:"#2563eb", packs:"#16a34a", engraves:"#d97706", restocks:"#7c3aed", ful:"#0f766e", orders:"#475569" };
+  function dayLabel(s){ try{ var p=String(s).split("-"); var dt=new Date(Date.UTC(+p[0],+p[1]-1,+p[2]));
+    return ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][dt.getUTCDay()]+" "+(+p[2]); }catch(e){ return s; } }
+  function loadTeamDaily(){
+    var r=curRange(); if(!r || TEAM.loading) return;
+    TEAM.loading=true;
+    fetch("/teamdaily?from="+encodeURIComponent(r.from)+"&to="+encodeURIComponent(r.to))
+      .then(function(res){ return res.json(); })
+      .then(function(j){ TEAM.range=(j&&j.range)||r; TEAM.days=(j&&j.days)||[]; TEAM.totals=(j&&j.totals)||null; TEAM.loading=false; renderTeamAnalytics(); })
+      .catch(function(e){ TEAM.loading=false; try{console.warn("teamdaily failed",e);}catch(_){ } });
+  }
+  function teamBar(title, key, color, sub){
+    var days=TEAM.days; if(!days.length) return "";
+    var max=1; days.forEach(function(d){ if((d[key]||0)>max) max=d[key]; });
+    var total=0; days.forEach(function(d){ total+=(d[key]||0); });
+    var avg=days.length? Math.round(total/days.length):0;
+    var bars=days.map(function(d){
+      var h=Math.max(2, Math.round((d[key]||0)/max*100));
+      return '<div style="display:flex;flex-direction:column;align-items:center;gap:3px;flex:1;min-width:26px">'
+        +'<div style="font-size:10px;color:var(--muted)">'+intf(d[key]||0)+'</div>'
+        +'<div style="height:100px;display:flex;align-items:flex-end"><div title="'+dayLabel(d.d)+': '+intf(d[key]||0)+'" style="width:60%;max-width:26px;min-width:10px;height:'+h+'px;background:'+color+';border-radius:3px 3px 0 0"></div></div>'
+        +'<div style="font-size:10px;color:var(--muted);white-space:nowrap">'+dayLabel(d.d)+'</div></div>';
+    }).join("");
+    return '<div class="card" style="flex:1 1 300px;min-width:280px">'
+      +'<div style="display:flex;justify-content:space-between;align-items:baseline">'
+      +'<div style="font-weight:700;color:var(--ink)">'+title+'</div>'
+      +'<div style="font-size:12px;color:var(--muted)"><b style="color:var(--ink)">'+intf(total)+'</b> total &middot; '+intf(avg)+'/day</div></div>'
+      +'<div style="font-size:11px;color:var(--muted);margin-bottom:6px">'+(sub||"")+'</div>'
+      +'<div style="display:flex;align-items:flex-end;gap:6px;overflow-x:auto;padding-top:4px">'+bars+'</div></div>';
+  }
+  function renderTeamAnalytics(){
+    var view=document.getElementById("an"); if(!view) return;
+    var r=curRange(); if(!r) return;
+    if(!sameRange(TEAM.range,r) || !TEAM.days.length){
+      loadTeamDaily();
+      view.innerHTML='<div class="card"><div style="padding:22px;color:var(--muted)">Loading team analytics…</div></div>';
+      return;
+    }
+    var t=TEAM.totals||{picks:0,packs:0,engraves:0,restocks:0,ful:0,orders:0};
+    var nd=TEAM.days.length||1;
+    function tile(big,label,sub){ return '<div style="flex:1;min-width:110px"><div style="font-size:24px;font-weight:800;color:var(--ink)">'+big+'</div>'
+      +'<div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;font-weight:700">'+label+'</div>'
+      +(sub?'<div style="font-size:12px;color:var(--muted);margin-top:2px">'+sub+'</div>':'')+'</div>'; }
+    var head='<div class="card" style="margin-bottom:12px">'
+      +'<div style="font-size:16px;font-weight:800;color:var(--ink)">Team analytics <span style="font-weight:400;color:var(--muted)">— how the whole team performed over '+esc2(r.from)+(r.from!==r.to?" → "+esc2(r.to):"")+' ('+nd+' working day'+(nd>1?"s":"")+')</span></div>'
+      +'<div style="display:flex;gap:20px;flex-wrap:wrap;margin-top:12px">'
+      +tile(intf(t.ful),"Fulfillment items", intf(Math.round(t.ful/nd))+"/day")
+      +tile(intf(t.orders),"Orders", intf(Math.round(t.orders/nd))+"/day")
+      +tile(intf(t.picks),"Picks","")
+      +tile(intf(t.packs),"Packs","")
+      +tile(intf(t.engraves),"Engravings","")
+      +tile(intf(t.restocks),"Restocks","")
+      +'</div></div>';
+    var charts='<div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px">'
+      +teamBar("Picks per day","picks",TEAM_COLORS.picks,"items picked (ShipHero)")
+      +teamBar("Packs per day","packs",TEAM_COLORS.packs,"items packed (ShipHero + Shopify)")
+      +teamBar("Engravings per day","engraves",TEAM_COLORS.engraves,"items engraved")
+      +teamBar("Restocks per day","restocks",TEAM_COLORS.restocks,"replenishment units into pick bins")
+      +teamBar("Total fulfillment items per day","ful",TEAM_COLORS.ful,"pick + pack + engrave")
+      +teamBar("Orders per day","orders",TEAM_COLORS.orders,"distinct fulfillment orders")
+      +'</div>';
+    var rowsHtml=TEAM.days.map(function(d){
+      return '<tr style="border-bottom:1px solid var(--line)">'
+        +'<td style="padding:5px 8px">'+dayLabel(d.d)+' <span style="color:var(--muted)">'+esc2(d.d)+'</span></td>'
+        +'<td style="padding:5px 8px;text-align:right">'+intf(d.picks)+'</td>'
+        +'<td style="padding:5px 8px;text-align:right">'+intf(d.packs)+'</td>'
+        +'<td style="padding:5px 8px;text-align:right">'+intf(d.engraves)+'</td>'
+        +'<td style="padding:5px 8px;text-align:right">'+intf(d.restocks)+'</td>'
+        +'<td style="padding:5px 8px;text-align:right;font-weight:700">'+intf(d.ful)+'</td>'
+        +'<td style="padding:5px 8px;text-align:right">'+intf(d.orders)+'</td>'
+        +'<td style="padding:5px 8px;text-align:right">'+intf(d.people)+'</td></tr>';
+    }).join("");
+    var table='<div class="card"><div style="font-weight:700;color:var(--ink);margin-bottom:8px">By day</div>'
+      +'<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px">'
+      +'<tr style="text-align:left;color:var(--muted);border-bottom:2px solid var(--line)">'
+      +'<th style="padding:6px 8px">Day</th><th style="padding:6px 8px;text-align:right">Picks</th><th style="padding:6px 8px;text-align:right">Packs</th>'
+      +'<th style="padding:6px 8px;text-align:right">Engravings</th><th style="padding:6px 8px;text-align:right">Restocks</th>'
+      +'<th style="padding:6px 8px;text-align:right">Total items</th><th style="padding:6px 8px;text-align:right">Orders</th><th style="padding:6px 8px;text-align:right">People</th></tr>'
+      +rowsHtml
+      +'<tr style="border-top:2px solid var(--line);font-weight:700"><td style="padding:6px 8px">Total</td>'
+      +'<td style="padding:6px 8px;text-align:right">'+intf(t.picks)+'</td><td style="padding:6px 8px;text-align:right">'+intf(t.packs)+'</td>'
+      +'<td style="padding:6px 8px;text-align:right">'+intf(t.engraves)+'</td><td style="padding:6px 8px;text-align:right">'+intf(t.restocks)+'</td>'
+      +'<td style="padding:6px 8px;text-align:right">'+intf(t.ful)+'</td><td style="padding:6px 8px;text-align:right">'+intf(t.orders)+'</td><td style="padding:6px 8px;text-align:right">—</td></tr>'
+      +'</table></div></div>';
+    view.innerHTML=head+charts+table;
+  }
+  window.renderTeamAnalytics=renderTeamAnalytics;
+
   /* ---------- master inject ---------- */
   function injectAll(){
     try{ reconcileFloor(); }catch(e){}
@@ -3054,7 +3179,7 @@ load();initAuto();initView();
     try{ injectSpeedCols(); }catch(e){}
     try{ injectFloorOnClock(); }catch(e){}
     try{ relabelTab("floor"); ensureNote(document.getElementById("floor"),"clkNoteFloor"); }catch(e){}
-    try{ relabelTab("an"); ensureNote(document.getElementById("an"),"clkNoteAn"); }catch(e){}
+    try{ if((typeof curTab!=="undefined"?curTab:"")==="an") renderTeamAnalytics(); }catch(e){}
     try{ relabelTab("watch"); ensureNote(document.getElementById("watch"),"clkNoteWatch"); }catch(e){}
     try{ injectDashFulfillmentCols(); }catch(e){}
     try{ relabelTab("dash"); injectDashClockCol(); }catch(e){}
@@ -3081,18 +3206,20 @@ load();initAuto();initView();
     };
   }
   // reconcile FLOOR -> clocked BEFORE any FLOOR-consuming render runs
-  ["render","renderFloor","renderAnalytics","renderWatch"].forEach(function(fn){
+  ["render","renderFloor","renderWatch"].forEach(function(fn){
     wrapBefore(fn, function(){ reconcileFloor(); });
   });
   wrap("render", function(){ ensureHours(); removeDashBand(); injectDashFulfillmentCols(); relabelTab("dash"); injectDashClockCol(); tidyDetail(); });
   wrap("renderFloor", function(){ injectFloorOnClock(); relabelTab("floor"); ensureNote(document.getElementById("floor"),"clkNoteFloor"); });
-  wrap("renderAnalytics", function(){ relabelTab("an"); ensureNote(document.getElementById("an"),"clkNoteAn"); });
   wrap("renderWatch", function(){ relabelTab("watch"); ensureNote(document.getElementById("watch"),"clkNoteWatch"); });
   wrap("renderSpeed", function(){ injectSpeedCols(); });
+  // Analytics tab fully replaced by the team-wide over-time view
+  window.renderAnalytics = renderTeamAnalytics;
   wrap("tab", function(t){
     var h=document.getElementById("hours");
     if(h) h.classList.toggle("hide", t!=="hours");
     if(t==="hours") renderHours();
+    if(t==="an"){ try{ renderTeamAnalytics(); }catch(e){} }
   });
 
   /* ---------- init ---------- */
