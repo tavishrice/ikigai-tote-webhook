@@ -204,14 +204,14 @@ def warehouse():
           count(DISTINCT order_number) FILTER (WHERE stage='pick')                                pk_orders,
           COALESCE(sum(quantity) FILTER (WHERE stage='pack' AND source='shiphero'),0)             packsh_items,
           count(DISTINCT order_number) FILTER (WHERE stage='pack' AND source='shiphero')          packsh_orders,
-          COALESCE(sum(quantity) FILTER (WHERE stage='pack' AND source='logger'),0)               packshop_items,
-          count(DISTINCT order_number) FILTER (WHERE stage='pack' AND source='logger')            packshop_orders,
+          COALESCE(sum(quantity) FILTER (WHERE stage='pack' AND (source='logger' OR (source='shopify' AND et_day(ts) < DATE '2026-07-21'))),0) packshop_items,
+          count(DISTINCT order_number) FILTER (WHERE stage='pack' AND (source='logger' OR (source='shopify' AND et_day(ts) < DATE '2026-07-21'))) packshop_orders,
           COALESCE(sum(quantity) FILTER (WHERE stage='replenish'),0)                              repl_units,
           COALESCE(sum(quantity) FILTER (WHERE stage='engrave'),0)                                 eng_items,
           count(DISTINCT order_number) FILTER (WHERE stage='engrave')                             eng_orders,
           count(*) FILTER (WHERE stage='pick')                                pick_cnt,
           count(*) FILTER (WHERE stage='pack' AND source='shiphero')          pack_cnt,
-          count(*) FILTER (WHERE stage='pack' AND source='logger')            fulfill_cnt,
+          count(*) FILTER (WHERE stage='pack' AND (source='logger' OR (source='shopify' AND et_day(ts) < DATE '2026-07-21'))) fulfill_cnt,
           count(*) FILTER (WHERE stage='replenish')                          move_cnt,
           count(*) FILTER (WHERE stage='count')                              count_cnt,
           count(DISTINCT tote_barcode) FILTER (WHERE stage='engrave')        eng_cnt,
@@ -222,19 +222,23 @@ def warehouse():
         rows = cur.fetchall()
 
         cur.execute("""
-        -- SHIPPED = orders with a ShipHero OR Logger pack event. Shopify label-print-only
-        -- orders do NOT count (printing a label is not a shipment). Key is normalized with
-        -- ltrim('#') because the Logger stores order numbers WITHOUT the leading '#'
-        -- (shiphero/shopify store WITH it) -- see project note order-number-normalization-CRITICAL.
+        -- SHIPPED = orders with a ShipHero OR Logger pack event. Shopify label prints do NOT
+        -- count from the Logger cutover (2026-07-21) onward (a label is not a shipment); but
+        -- BEFORE the cutover the Logger did not exist, so Shopify is the only hand-pack signal
+        -- and DOES count for those historical days (keeps history consistent, no gap).
+        -- Key is normalized with ltrim('#') because the Logger stores order numbers WITHOUT the
+        -- leading '#' -- see project note order-number-normalization-CRITICAL.
         WITH o AS (SELECT ltrim(order_number,'#') ordn,
-                     bool_or(source='shiphero') sh, bool_or(source='logger') lg
+                     bool_or(source='shiphero') sh,
+                     bool_or(source='logger') lg,
+                     bool_or(source='shopify' AND et_day(ts) < DATE '2026-07-21') shop_pre
                    FROM event WHERE stage='pack' AND order_number IS NOT NULL AND order_number<>''
                      AND person <> ALL(%s)              -- fired/departed packers don't count an order as shipped
                      AND et_day(ts) BETWEEN %s AND %s GROUP BY ltrim(order_number,'#'))
-        SELECT count(*) FILTER (WHERE sh OR lg) total,
+        SELECT count(*) FILTER (WHERE sh OR lg OR shop_pre) total,
                count(*) FILTER (WHERE sh) shiphero,
-               count(*) FILTER (WHERE lg AND NOT sh) shopify_only,
-               count(*) FILTER (WHERE sh AND lg) both FROM o""", [list(EXCLUDED), frm, to])
+               count(*) FILTER (WHERE (lg OR shop_pre) AND NOT sh) shopify_only,
+               count(*) FILTER (WHERE sh AND (lg OR shop_pre)) both FROM o""", [list(EXCLUDED), frm, to])
         shipped = cur.fetchone()
 
     people = []
