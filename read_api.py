@@ -204,14 +204,14 @@ def warehouse():
           count(DISTINCT order_number) FILTER (WHERE stage='pick')                                pk_orders,
           COALESCE(sum(quantity) FILTER (WHERE stage='pack' AND source='shiphero'),0)             packsh_items,
           count(DISTINCT order_number) FILTER (WHERE stage='pack' AND source='shiphero')          packsh_orders,
-          COALESCE(sum(quantity) FILTER (WHERE stage='pack' AND source='shopify'),0)              packshop_items,
-          count(DISTINCT order_number) FILTER (WHERE stage='pack' AND source='shopify')           packshop_orders,
+          COALESCE(sum(quantity) FILTER (WHERE stage='pack' AND source='logger'),0)               packshop_items,
+          count(DISTINCT order_number) FILTER (WHERE stage='pack' AND source='logger')            packshop_orders,
           COALESCE(sum(quantity) FILTER (WHERE stage='replenish'),0)                              repl_units,
           COALESCE(sum(quantity) FILTER (WHERE stage='engrave'),0)                                 eng_items,
           count(DISTINCT order_number) FILTER (WHERE stage='engrave')                             eng_orders,
           count(*) FILTER (WHERE stage='pick')                                pick_cnt,
           count(*) FILTER (WHERE stage='pack' AND source='shiphero')          pack_cnt,
-          count(*) FILTER (WHERE stage='pack' AND source='shopify')           fulfill_cnt,
+          count(*) FILTER (WHERE stage='pack' AND source='logger')            fulfill_cnt,
           count(*) FILTER (WHERE stage='replenish')                          move_cnt,
           count(*) FILTER (WHERE stage='count')                              count_cnt,
           count(DISTINCT tote_barcode) FILTER (WHERE stage='engrave')        eng_cnt,
@@ -222,13 +222,19 @@ def warehouse():
         rows = cur.fetchall()
 
         cur.execute("""
-        WITH o AS (SELECT order_number, bool_or(source='shiphero') sh, bool_or(source='shopify') shop
-                   FROM event WHERE stage='pack' AND order_number IS NOT NULL
+        -- SHIPPED = orders with a ShipHero OR Logger pack event. Shopify label-print-only
+        -- orders do NOT count (printing a label is not a shipment). Key is normalized with
+        -- ltrim('#') because the Logger stores order numbers WITHOUT the leading '#'
+        -- (shiphero/shopify store WITH it) -- see project note order-number-normalization-CRITICAL.
+        WITH o AS (SELECT ltrim(order_number,'#') ordn,
+                     bool_or(source='shiphero') sh, bool_or(source='logger') lg
+                   FROM event WHERE stage='pack' AND order_number IS NOT NULL AND order_number<>''
                      AND person <> ALL(%s)              -- fired/departed packers don't count an order as shipped
-                     AND et_day(ts) BETWEEN %s AND %s GROUP BY order_number)
-        SELECT count(*) total, count(*) FILTER (WHERE sh) shiphero,
-               count(*) FILTER (WHERE NOT sh AND shop) shopify_only,
-               count(*) FILTER (WHERE sh AND shop) both FROM o""", [list(EXCLUDED), frm, to])
+                     AND et_day(ts) BETWEEN %s AND %s GROUP BY ltrim(order_number,'#'))
+        SELECT count(*) FILTER (WHERE sh OR lg) total,
+               count(*) FILTER (WHERE sh) shiphero,
+               count(*) FILTER (WHERE lg AND NOT sh) shopify_only,
+               count(*) FILTER (WHERE sh AND lg) both FROM o""", [list(EXCLUDED), frm, to])
         shipped = cur.fetchone()
 
     people = []
@@ -1309,7 +1315,7 @@ body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{backgro
 </aside>
 <div class=wrap>
 <div class=apphead><h1>Warehouse Picking &amp; Packing</h1><span class=dot></span><span class=live>Live</span></div>
-<div class=sub>Live contribution from ShipHero <b>+ direct-in-Shopify fulfillments + engraving</b>. <b>Fulfillment</b> (pick + pack + engrave) and <b>Restock</b> are two separate tracks.</div>
+<div class=sub>Live contribution from ShipHero <b>+ Logger hand-fulfillments + engraving</b>. <b>Fulfillment</b> (pick + pack + engrave) and <b>Restock</b> are two separate tracks.</div>
 <div class=tabs>
   <div class="tab on" data-tab=dash onclick="tab('dash')">Dashboard</div>
   <div class=tab data-tab=out onclick="tab('out')">Outstanding</div>
@@ -1339,7 +1345,7 @@ body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{backgro
 <div class=ctl id=ctl1>
   <span class=lbl>Unit</span><span class=seg id=unit><button class=on data-v=both>Both</button><button data-v=items>Items</button><button data-v=orders>Orders</button></span>
   <span class=lbl style=margin-left:14px>Stage</span><span class=seg id=stage><button class=on data-v=all>All</button><button data-v=pick>Picked</button><button data-v=pack>Packed</button><button data-v=engrave>Engraved</button><button data-v=repl>Restocked</button></span>
-  <span class=lbl style=margin-left:14px>Source</span><span class=seg id=source><button class=on data-v=both>Both</button><button data-v=shiphero>ShipHero</button><button data-v=shopify>Shopify</button></span>
+  <span class=lbl style=margin-left:14px>Source</span><span class=seg id=source><button class=on data-v=both>Both</button><button data-v=shiphero>ShipHero</button><button data-v=shopify>Logger</button></span>
   <div class=spacer></div>
   <button class=pill onclick="copyChat()">Copy for chat</button>
   <button class=pill onclick="dl('csv')">CSV</button>
@@ -1353,7 +1359,7 @@ body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{backgro
 
 <div id=dash>
   <div id=tvhead>
-    <div class=tvbrand><div class=tvtitle>Warehouse Contribution</div><div class=tvlive><span class=dot></span>Live &middot; ShipHero &middot; Shopify &middot; Engraving</div></div>
+    <div class=tvbrand><div class=tvtitle>Warehouse Contribution</div><div class=tvlive><span class=dot></span>Live &middot; ShipHero &middot; Logger &middot; Engraving</div></div>
     <div class=tvdatewrap><div class=tvdate id=tvdate></div><div class=tvdsub id=tvdsub></div></div>
     <div class=tvref><span id=tvrefstamp></span></div>
   </div>
@@ -1498,7 +1504,7 @@ body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{backgro
 </div>
 
 <div class=foot>
-  <b>Chart colours:</b> <span class=s-sh>Picked&middot;ShipHero</span>, <span style=color:#16a34a>Packed&middot;ShipHero</span>, <span class=s-shop>Packed&middot;Shopify</span>, <span class=s-eng>Engraved</span> &mdash; these four stack into the <b>Fulfillment</b> bar. <span class=s-repl>Restocked</span> is drawn as its own separate bar (a parallel track, never added into the fulfillment/items total).
+  <b>Chart colours:</b> <span class=s-sh>Picked&middot;ShipHero</span>, <span style=color:#16a34a>Packed&middot;ShipHero</span>, <span class=s-shop>Packed&middot;Logger</span>, <span class=s-eng>Engraved</span> &mdash; these four stack into the <b>Fulfillment</b> bar. <span class=s-repl>Restocked</span> is drawn as its own separate bar (a parallel track, never added into the fulfillment/items total).
 </div>
 </div>
 <script>
@@ -1732,9 +1738,9 @@ function render(){if(!DATA)return;
   const sh=DATA.shipped, T=DATA.totals;
   const actItems=T.pk_i+T.packsh_i+T.packshop_i+T.eng_i;
   document.getElementById('summary').innerHTML=ppl.length+' people &middot; <b>'+fmt(sh.total)+'</b> orders shipped &middot; '+
-    fmt(actItems)+' fulfillment items ('+fmt(T.pk_i)+' picked + '+fmt(T.packsh_i)+' packed·SH + '+fmt(T.packshop_i)+' packed·Shopify + '+fmt(T.eng_i)+' engraved) &middot; '+fmt(T.repl)+' restocked &middot; '+DATA.range.from;
+    fmt(actItems)+' fulfillment items ('+fmt(T.pk_i)+' picked + '+fmt(T.packsh_i)+' packed·SH + '+fmt(T.packshop_i)+' packed·Logger + '+fmt(T.eng_i)+' engraved) &middot; '+fmt(T.repl)+' restocked &middot; '+DATA.range.from;
   document.getElementById('shipped').innerHTML='<div class=big>'+fmt(sh.total)+'</div><div class=t>orders shipped out the door</div>'+
-    '<div class=d><b>'+fmt(sh.shiphero)+'</b> ShipHero &middot; <span class=o>'+fmt(sh.shopify_only)+'</span> Shopify-only ('+fmt(sh.both)+' ShipHero orders were finished by hand in Shopify)</div>';
+    '<div class=d><b>'+fmt(sh.shiphero)+'</b> ShipHero &middot; <span class=o>'+fmt(sh.shopify_only)+'</span> Logger-only ('+fmt(sh.both)+' orders scanned in both)</div>';
   // ---- stat cards (honor toggles) ----
   const showItems=unit!=='orders', showOrders=unit!=='items';
   const itemsSel=(v.pick?T.pk_i:0)+(v.packsh?T.packsh_i:0)+(v.packshop?T.packshop_i:0)+(v.eng?T.eng_i:0);
@@ -1743,14 +1749,14 @@ function render(){if(!DATA)return;
   si.innerHTML=!showItems?'':[
     card('Items picked','ShipHero','s-sh',v.pick?T.pk_i:0),
     card('Items packed','ShipHero','s-pksh',v.packsh?T.packsh_i:0),
-    card('Items packed','Shopify','s-shop',v.packshop?T.packshop_i:0),
+    card('Items packed','Logger','s-shop',v.packshop?T.packshop_i:0),
     card('Items engraved','logger','s-eng',v.eng?T.eng_i:0),
     card('Items — total','fulfillment','s-sel',itemsSel),
     card('Restocked','units · incl. tote moves','s-repl',v.repl?T.repl:0)].join('');
   so.innerHTML=!showOrders?'':[
     card('Orders picked','ShipHero','s-sh',v.pick?T.pk_o:0),
     card('Orders packed','ShipHero','s-pksh',v.packsh?T.packsh_o:0),
-    card('Orders packed','Shopify','s-shop',v.packshop?T.packshop_o:0),
+    card('Orders packed','Logger','s-shop',v.packshop?T.packshop_o:0),
     card('Order-lines','pick+pack+engrave, not distinct','s-sel',ordersSel)].join('');
   si.classList.toggle('hide',!showItems);so.classList.toggle('hide',!showOrders);
   if(rotTimer){var _rs=ROT_STAGES[rotIdx];drawChart(ppl,visFor(_rs,segval('source')),_rs);}else{drawChart(ppl,v);}
@@ -1776,7 +1782,7 @@ function fillTV(ppl,T,sh){
   host.innerHTML=
     '<div class="kpi hero"><div class=acc style="background:var(--green)"></div><div class=kl>Orders shipped out the door</div>'+
       '<div class=herorow><div class=kv>'+fmt(sh.total)+'</div>'+
-        '<div class=herosplit><span><span class=sw style="background:var(--accent)"></span>'+fmt(sh.shiphero)+' ShipHero</span><span><span class=sw style="background:var(--amber)"></span>'+fmt(Math.max(0,sh.total-sh.shiphero))+' Shopify</span></div></div></div>'+
+        '<div class=herosplit><span><span class=sw style="background:var(--accent)"></span>'+fmt(sh.shiphero)+' ShipHero</span><span><span class=sw style="background:var(--amber)"></span>'+fmt(Math.max(0,sh.total-sh.shiphero))+' Logger</span></div></div></div>'+
     '<div class=kpi><div class=acc style="background:var(--accent)"></div><div class=kl>Items fulfilled</div><div class=kv>'+fmt(ful)+'</div><div class=kn>pick + pack + engrave</div></div>'+
     '<div class=kpi><div class=acc style="background:var(--violet)"></div><div class=kl>Items restocked</div><div class=kv>'+fmt(T.repl)+'</div><div class=kn>replenishment &middot; separate track</div></div>'+
     '<div class=kpi><div class=acc style="background:var(--teal)"></div><div class=kl>People working</div><div class=kv>'+working+'</div><div class=kn>on the floor today</div></div>';
@@ -1814,7 +1820,7 @@ function drawChart(ppl,v,forceStage){
   const ds=[
     {label:'Picked · ShipHero',stack:'ful',backgroundColor:C.pick,data:arr.map(p=>val(p,'pick'))},
     {label:'Packed · ShipHero',stack:'ful',backgroundColor:C.pack,data:arr.map(p=>val(p,'packsh'))},
-    {label:'Packed · Shopify',stack:'ful',backgroundColor:C.fulfill,data:arr.map(p=>val(p,'packshop'))},
+    {label:'Packed · Logger',stack:'ful',backgroundColor:C.fulfill,data:arr.map(p=>val(p,'packshop'))},
     {label:'Engraved',stack:'ful',backgroundColor:C.engrave,data:arr.map(p=>val(p,'eng'))}];
   if(!ord) ds.push({label:'Restocked (separate track)',stack:'repl',backgroundColor:C.repl,data:arr.map(p=>val(p,'repl'))});
   // plugin: print each bar's stack total just above it, so the numbers are readable at a glance
@@ -1896,7 +1902,7 @@ function drawDetail(ppl,unit,v){
     thg('gct','worked_h','Active','breaks out')+
     '<th class=gsep></th>'+
     thg('gcf','items_total','Items','pick+pack+engrave')+
-    (det? thg('gcf','_pick','Picked','ShipHero')+thg('gcf','_pack','Packed','SH + Shopify')+thg('gcf','_eng','Engraved','logger') : '')+
+    (det? thg('gcf','_pick','Picked','ShipHero')+thg('gcf','_pack','Packed','SH + Logger')+thg('gcf','_eng','Engraved','logger') : '')+
     thg('gcf','share','Share','of team')+
     thg('gcf','orders_total','Orders','fulfillment')+
     '<th class=gsep></th>'+
@@ -2330,7 +2336,7 @@ function renderAnalytics(){if(!FLOOR)return;
       scales:{x:{beginAtZero:true,grid:{color:'#eef1f5'},title:{display:true,text:'items / active hr',color:'#64748b',font:{size:10}}},y:{grid:{display:false},ticks:{font:{size:10}}}}}});
   // fulfillment mix doughnut
   if(stage&&(stage.pick+stage.packsh+stage.packshop+stage.eng)>0){
-    anMix=new Chart(document.getElementById('anMixC'),{type:'doughnut',data:{labels:['Picked·SH','Packed·SH','Packed·Shopify','Engraved'],datasets:[{data:[stage.pick,stage.packsh,stage.packshop,stage.eng],backgroundColor:[C.pick,C.pack,C.fulfill,C.engrave]}]},
+    anMix=new Chart(document.getElementById('anMixC'),{type:'doughnut',data:{labels:['Picked·SH','Packed·SH','Packed·Logger','Engraved'],datasets:[{data:[stage.pick,stage.packsh,stage.packshop,stage.eng],backgroundColor:[C.pick,C.pack,C.fulfill,C.engrave]}]},
       options:{responsive:true,maintainAspectRatio:false,cutout:'55%',
         plugins:{legend:{position:'bottom',labels:{font:{size:10},boxWidth:12}},title:{display:true,text:'Fulfillment mix',color:'#0f172a',font:{size:12,weight:'600'}}}}});}
 }
@@ -2343,7 +2349,7 @@ function copyChat(){const v=vis();const rows=DATA.people.filter(teamFilter).map(
   navigator.clipboard.writeText('Warehouse '+DATA.range.from+'\n'+DATA.shipped.total+' orders shipped\n'+rows.join('\n'));document.getElementById('status').textContent='copied!';setTimeout(()=>document.getElementById('status').textContent='',1500);}
 function dl(kind){const ppl=DATA.people.filter(teamFilter);let blob,name;
   if(kind==='json'){blob=new Blob([JSON.stringify(DATA,null,2)],{type:'application/json'});name='warehouse.json';}
-  else{const hdr=['person','type','items_picked_sh','items_packed_sh','items_packed_shopify','engraved_items','items_total','replenished','orders_picked_sh','orders_packed_sh','orders_packed_shopify'];
+  else{const hdr=['person','type','items_picked_sh','items_packed_sh','items_packed_logger','engraved_items','items_total','replenished','orders_picked_sh','orders_packed_sh','orders_packed_logger'];
     const lines=[hdr.join(',')].concat(ppl.map(p=>[p.person,p.type,p.items_picked_sh,p.items_packed_sh,p.items_packed_shop,p.engraved_items,(p.items_picked_sh+p.items_packed_sh+p.items_packed_shop+p.engraved_items),p.replenished,p.orders_picked_sh,p.orders_packed_sh,p.orders_packed_shop].join(',')));
     blob=new Blob([lines.join('\n')],{type:'text/csv'});name='warehouse.csv';}
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();}
