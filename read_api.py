@@ -1704,7 +1704,7 @@ function fillTV(ppl,T,sh){
   host.innerHTML=
     '<div class="kpi hero"><div class=acc style="background:var(--green)"></div><div class=kl>Orders shipped out the door</div>'+
       '<div class=herorow><div class=kv>'+fmt(sh.total)+'</div>'+
-        '<div class=herosplit><span><span class=sw style="background:var(--accent)"></span>'+fmt(sh.shiphero)+' ShipHero</span><span><span class=sw style="background:var(--amber)"></span>'+fmt(sh.shopify_only)+' Shopify</span></div></div></div>'+
+        '<div class=herosplit><span><span class=sw style="background:var(--accent)"></span>'+fmt(sh.shiphero)+' ShipHero</span><span><span class=sw style="background:var(--amber)"></span>'+fmt(Math.max(0,sh.total-sh.shiphero))+' Shopify</span></div></div></div>'+
     '<div class=kpi><div class=acc style="background:var(--accent)"></div><div class=kl>Items fulfilled</div><div class=kv>'+fmt(ful)+'</div><div class=kn>pick + pack + engrave</div></div>'+
     '<div class=kpi><div class=acc style="background:var(--violet)"></div><div class=kl>Items restocked</div><div class=kv>'+fmt(T.repl)+'</div><div class=kn>replenishment &middot; separate track</div></div>'+
     '<div class=kpi><div class=acc style="background:var(--teal)"></div><div class=kl>People working</div><div class=kv>'+working+'</div><div class=kn>on the floor today</div></div>';
