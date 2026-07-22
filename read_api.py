@@ -2820,6 +2820,34 @@ load();initAuto();initView();
     }
   }
 
+  /* ---------- Dashboard detail: equal-width, fixed-layout columns (tidy) ---------- */
+  function tidyDetail(){
+    var dash=document.getElementById("dash"); if(!dash) return;
+    var tbl=[].slice.call(dash.querySelectorAll("table")).filter(function(t){
+      return /ON THE CLOCK/i.test(t.textContent) && /FULFILLMENT/i.test(t.textContent); })[0];
+    if(!tbl) return;
+    var rows=[].slice.call(tbl.rows); if(rows.length<2) return;
+    var sub=rows[1], n=sub.cells.length;
+    var kinds=[];
+    for(var i=0;i<n;i++){ var txt=(sub.cells[i].textContent||"").trim();
+      if(i===0) kinds.push("person"); else if(i===1) kinds.push("type");
+      else if(txt==="") kinds.push("spacer"); else kinds.push("metric"); }
+    var metricCount=kinds.filter(function(k){return k==="metric";}).length||1;
+    var spacerCount=kinds.filter(function(k){return k==="spacer";}).length;
+    var mw=(100-15-7-spacerCount*1)/metricCount;
+    var old=tbl.querySelector("colgroup"); if(old) old.remove();
+    var cg=document.createElement("colgroup");
+    kinds.forEach(function(k){ var col=document.createElement("col");
+      col.style.width = k==="person"?"15%":k==="type"?"7%":k==="spacer"?"1%":mw.toFixed(3)+"%";
+      cg.appendChild(col); });
+    tbl.insertBefore(cg, tbl.firstChild);
+    tbl.style.tableLayout="fixed"; tbl.style.width="100%";
+    // data rows: keep metric cells on one line (headers may wrap if space is tight)
+    for(var r=2;r<rows.length;r++){ var row=rows[r];
+      for(var ci=2;ci<row.cells.length;ci++){ var c=row.cells[ci];
+        c.style.whiteSpace="nowrap"; c.style.overflow="hidden"; c.style.textOverflow="ellipsis"; } }
+  }
+
   /* ---------- Speed & Rankings: add Active-h + Items/active-hr columns ---------- */
   function injectSpeedCols(){
     var sp=document.getElementById("speed"); if(!sp) return;
@@ -3026,6 +3054,7 @@ load();initAuto();initView();
     try{ relabelTab("watch"); ensureNote(document.getElementById("watch"),"clkNoteWatch"); }catch(e){}
     try{ injectDashFulfillmentCols(); }catch(e){}
     try{ relabelTab("dash"); injectDashClockCol(); }catch(e){}
+    try{ tidyDetail(); }catch(e){}
     try{ if((typeof curTab!=="undefined"?curTab:"")==="hours") renderHours(); }catch(e){}
   }
 
@@ -3051,7 +3080,7 @@ load();initAuto();initView();
   ["render","renderFloor","renderAnalytics","renderWatch"].forEach(function(fn){
     wrapBefore(fn, function(){ reconcileFloor(); });
   });
-  wrap("render", function(){ ensureHours(); removeDashBand(); injectDashFulfillmentCols(); relabelTab("dash"); injectDashClockCol(); });
+  wrap("render", function(){ ensureHours(); removeDashBand(); injectDashFulfillmentCols(); relabelTab("dash"); injectDashClockCol(); tidyDetail(); });
   wrap("renderFloor", function(){ injectFloorOnClock(); relabelTab("floor"); ensureNote(document.getElementById("floor"),"clkNoteFloor"); });
   wrap("renderAnalytics", function(){ relabelTab("an"); ensureNote(document.getElementById("an"),"clkNoteAn"); });
   wrap("renderWatch", function(){ relabelTab("watch"); ensureNote(document.getElementById("watch"),"clkNoteWatch"); });
