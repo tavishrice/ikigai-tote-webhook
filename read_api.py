@@ -2565,6 +2565,10 @@ load();initAuto();initView();
     }catch(e){ return null; }
   }
   function perActive(name){
+    // items-per-active-hr scoped to CLOCKED days (numerator + denominator both clock-days),
+    // so multi-day ranges that include pre-clock days aren't distorted.
+    var fp=floorFor(name);
+    if(fp && fp.has_clock && fp.clk_active>0) return fp.clk_items / fp.clk_active;
     var h=hoursFor(name), it=itemsFor(name);
     if(!h || !it || !h.active_h) return null;
     return it.total / h.active_h;
@@ -2650,25 +2654,41 @@ load();initAuto();initView();
         p._sfin=p.first_in; p._slout=p.last_out; p._siphr=p.items_per_hr; p._shpd=p.hours_per_day;
       }
       var h=HOURS.byName[p.person];
-      if(h && h.total_h>0){
-        var active=h.active_h||0, scanned=p._sh||0;
-        p.has_clock=true;
-        p.scanned_h=Math.round(scanned*100)/100;
-        p.clocked_h=h.total_h; p.break_h=h.break_h;
-        p.hours=active;                                   // denominator everywhere
-        p.hours_per_day=p.active_days? r1(active/p.active_days) : active;
-        p.unaccounted_h=Math.max(0, r1(active-scanned));  // on clock, not on break, not scanning
-        p.util=active>0? Math.min(100, Math.round(100*scanned/active)) : 0; // scanning / paid working
-        p.items_per_hr=active>0? Math.round((p.items||0)/active) : 0;       // UPLH on clocked hours
-        p.span_h=r1(h.total_h);                           // "Floor h" -> clocked total
-        p.first_in=(h.days_detail&&h.days_detail[0])? h.days_detail[0].first_in : p._sfin;
-        p.last_out=h.open? "on the clock" : ((h.days_detail&&h.days_detail.length)? h.days_detail[h.days_detail.length-1].last_out : p._slout);
-        p.open=h.open; p.on_break=h.on_break;
-      } else {
+      // per-day clock map (only days the person actually clocked)
+      var clockByDay={}, anyClock=false;
+      if(h && h.days_detail){ h.days_detail.forEach(function(d){ clockByDay[d.d]=d; anyClock=true; }); }
+      // per-day scan map from FLOOR (each: {d, hours=scan-active, ful, repl, span, util})
+      var scanByDay={}; (p.days||[]).forEach(function(sd){ scanByDay[sd.d]=sd; });
+      if(!anyClock){ // no clock data anywhere in range -> pure scan (all we have for pre-clock days)
         p.has_clock=false; p.scanned_h=p._sh; p.clocked_h=0; p.break_h=0; p.unaccounted_h=0;
         p.hours=p._sh; p.util=p._su; p.span_h=p._sspan; p.first_in=p._sfin;
         p.last_out=p._slout; p.items_per_hr=p._siphr; p.hours_per_day=p._shpd;
+        p.clk_days=0; p.range_days=(p.days?p.days.length:0); p.clk_active=0; p.clk_items=0;
+        return;
       }
+      // BLEND per day: clocked hours where the day has a clock record, scan hours otherwise
+      var dayset={}; Object.keys(scanByDay).forEach(function(k){dayset[k]=1;}); Object.keys(clockByDay).forEach(function(k){dayset[k]=1;});
+      var activeRange=0, clkActive=0, clkTotal=0, brk=0, scanOnClock=0, clkItems=0, spanNonClock=0, clkDays=0, nDays=0;
+      Object.keys(dayset).forEach(function(dk){
+        nDays++; var cd=clockByDay[dk], sd=scanByDay[dk]; var scanH=sd?(sd.hours||0):0;
+        if(cd){ clkDays++; clkActive+=(cd.active_h||0); clkTotal+=(cd.total_h||0); brk+=(cd.break_h||0);
+                scanOnClock+=scanH; clkItems += sd?((sd.ful||0)+(sd.repl||0)):0; activeRange+=(cd.active_h||0); }
+        else  { activeRange+=scanH; spanNonClock += sd?(sd.span||0):0; }
+      });
+      p.has_clock=true; p.clk_days=clkDays; p.range_days=nDays;
+      p.scanned_h=Math.round((p._sh||0)*100)/100;
+      p.clk_active=Math.round(clkActive*100)/100; p.clk_items=clkItems;
+      p.clocked_h=r1(clkTotal); p.break_h=r1(brk);
+      p.hours=Math.round(activeRange*100)/100;                          // blended working hours (denominator)
+      p.hours_per_day= nDays? r1(activeRange/nDays) : activeRange;
+      p.unaccounted_h=Math.max(0, r1(clkActive - scanOnClock));         // idle only measurable on clock days
+      p.util= clkActive>0? Math.min(100, Math.round(100*scanOnClock/clkActive)) : p._su;
+      p.items_per_hr= activeRange>0? Math.round((p.items||0)/activeRange) : 0;
+      p.span_h= r1(clkTotal + spanNonClock);
+      if(clkDays===1 && nDays===1){ var only=clockByDay[Object.keys(clockByDay)[0]];
+        p.first_in=only.first_in; p.last_out= h.open?"on the clock":only.last_out; }
+      else { p.first_in=p._sfin; p.last_out=p._slout; }
+      p.open=h.open; p.on_break=h.on_break;
     });
   }
 
@@ -2684,7 +2704,7 @@ load();initAuto();initView();
       if(changed) tn.nodeValue=v;
     });
   }
-  var CLK_NOTE='Hours are from the time clock: <b>Active</b> = clocked − logged breaks (scan gaps are <b>not</b> treated as breaks). <b>Util</b> = time actually scanning ÷ active clocked hours. <b>Unaccounted</b> = active clocked time with no scan activity. Full-timers only — interns (no clock) stay on scan estimates.';
+  var CLK_NOTE='Hours are from the time clock: <b>Active</b> = clocked − logged breaks (scan gaps are <b>not</b> treated as breaks). <b>Util</b> = time actually scanning ÷ active clocked hours. <b>Unaccounted</b> = active clocked time with no scan activity. Full-timers only — interns (no clock) stay on scan estimates. The time clock started 2026-07-22, so any day before that (in a multi-day range) falls back to scan estimates for hours.';
   function ensureNote(el, id){
     if(!el) return;
     if(document.getElementById(id)) return;
