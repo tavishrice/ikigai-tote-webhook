@@ -1771,7 +1771,7 @@ function drawChart(ppl,v,forceStage){
     plugins:[stackTotals]});
 }
 // ---- Champion trophies: five titles, assigned to the leader of each action type (a person can hold several) ----
-const CHAMP_DEFS=[['overall','Overall','#c8901a'],['pick','Pick','var(--accent)'],['pack','Pack','var(--green)'],['eng','Engrave','var(--teal)'],['repl','Restock','var(--violet)']];
+const CHAMP_DEFS=[['pick','Pick','var(--accent)'],['pack','Pack','var(--green)'],['eng','Engrave','var(--teal)'],['repl','Restock','var(--violet)']];
 function teamChampions(ppl){
   const m={overall:p=>(p.items_picked_sh||0)+(p.items_packed_sh||0)+(p.items_packed_shop||0)+(p.engraved_items||0)+(p.replenished||0),
     pick:p=>p.items_picked_sh||0, pack:p=>(p.items_packed_sh||0)+(p.items_packed_shop||0),
