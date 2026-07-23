@@ -893,13 +893,17 @@ def teamdaily():
     day. Fast simple aggregate (no window functions) so it stays snappy on free tier."""
     frm, to = _range()
     with connect() as c, c.cursor(row_factory=tuple_row) as cur:
+        # Pack + shipped use the SAME rule as the main dashboard: ShipHero + Logger, plus
+        # pre-Logger-cutover (2026-07-21) Shopify as the historical hand-pack proxy. Shipped
+        # orders keyed on the normalized order number (Logger omits the leading '#').
         cur.execute("""
         SELECT to_char(et_day(ts),'YYYY-MM-DD') AS d,
-               COALESCE(SUM(quantity) FILTER (WHERE stage='pick'),0)      AS picks,
-               COALESCE(SUM(quantity) FILTER (WHERE stage='pack'),0)      AS packs,
-               COALESCE(SUM(quantity) FILTER (WHERE stage='engrave'),0)   AS engraves,
-               COALESCE(SUM(quantity) FILTER (WHERE stage='replenish'),0) AS restocks,
-               COUNT(DISTINCT order_number) FILTER (WHERE stage IN ('pick','pack','engrave')) AS orders,
+               COALESCE(SUM(quantity) FILTER (WHERE stage='pick'),0)                                   AS picks,
+               COALESCE(SUM(quantity) FILTER (WHERE stage='pack' AND source='shiphero'),0)             AS packsh,
+               COALESCE(SUM(quantity) FILTER (WHERE stage='pack' AND (source='logger' OR (source='shopify' AND et_day(ts) < DATE '2026-07-21'))),0) AS packhand,
+               COALESCE(SUM(quantity) FILTER (WHERE stage='engrave'),0)                                AS engraves,
+               COALESCE(SUM(quantity) FILTER (WHERE stage='replenish'),0)                              AS restocks,
+               COUNT(DISTINCT ltrim(order_number,'#')) FILTER (WHERE stage='pack' AND (source='shiphero' OR source='logger' OR (source='shopify' AND et_day(ts) < DATE '2026-07-21'))) AS shipped,
                COUNT(DISTINCT person) AS people
         FROM event_canon
         WHERE et_day(ts) BETWEEN %s AND %s
@@ -908,16 +912,20 @@ def teamdaily():
         """, (frm, to))
         rows = cur.fetchall()
     days = []
-    tot = {"picks": 0, "packs": 0, "engraves": 0, "restocks": 0, "ful": 0, "orders": 0}
-    for (d, picks, packs, engraves, restocks, orders, people) in rows:
-        picks = int(picks or 0); packs = int(packs or 0)
-        engraves = int(engraves or 0); restocks = int(restocks or 0)
+    tot = {"picks": 0, "packsh": 0, "packhand": 0, "packs": 0, "engraves": 0,
+           "restocks": 0, "ful": 0, "shipped": 0, "orders": 0}
+    for (d, picks, packsh, packhand, engraves, restocks, shipped, people) in rows:
+        picks = int(picks or 0); packsh = int(packsh or 0); packhand = int(packhand or 0)
+        engraves = int(engraves or 0); restocks = int(restocks or 0); shipped = int(shipped or 0)
+        packs = packsh + packhand
         ful = picks + packs + engraves
-        days.append({"d": d, "picks": picks, "packs": packs, "engraves": engraves,
-                     "restocks": restocks, "ful": ful, "orders": int(orders or 0),
-                     "people": int(people or 0)})
-        tot["picks"] += picks; tot["packs"] += packs; tot["engraves"] += engraves
-        tot["restocks"] += restocks; tot["ful"] += ful; tot["orders"] += int(orders or 0)
+        days.append({"d": d, "picks": picks, "packsh": packsh, "packhand": packhand,
+                     "packs": packs, "engraves": engraves, "restocks": restocks, "ful": ful,
+                     "shipped": shipped, "orders": shipped, "people": int(people or 0)})
+        tot["picks"] += picks; tot["packsh"] += packsh; tot["packhand"] += packhand
+        tot["packs"] += packs; tot["engraves"] += engraves; tot["restocks"] += restocks
+        tot["ful"] += ful; tot["shipped"] += shipped
+    tot["orders"] = tot["shipped"]
     return jsonify({"range": {"from": frm, "to": to}, "days": days, "totals": tot})
 
 
@@ -3085,6 +3093,9 @@ load();initAuto();initView();
   /* ================= TEAM-WIDE ANALYTICS (replaces the per-person Analytics tab) ================= */
   var TEAM={ range:null, days:[], totals:null, loading:false };
   var TEAM_COLORS={ picks:"#2563eb", packs:"#16a34a", engraves:"#d97706", restocks:"#7c3aed", ful:"#0f766e", orders:"#475569" };
+  // main-dashboard palette (kept in sync with `const C` in the primary script) for the two big charts
+  var TEAM_CHART={ pick:"#2563eb", packsh:"#16a34a", packhand:"#d97706", eng:"#0d9488", repl:"#7c3aed", ship:"#16a34a" };
+  var teamShipChart=null, teamMixChart=null;
   function dayLabel(s){ try{ var p=String(s).split("-"); var dt=new Date(Date.UTC(+p[0],+p[1]-1,+p[2]));
     return ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][dt.getUTCDay()]+" "+(+p[2]); }catch(e){ return s; } }
   function loadTeamDaily(){
@@ -3139,11 +3150,11 @@ load();initAuto();initView();
       +'</div></div>';
     var charts='<div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px">'
       +teamBar("Picks per day","picks",TEAM_COLORS.picks,"items picked (ShipHero)")
-      +teamBar("Packs per day","packs",TEAM_COLORS.packs,"items packed (ShipHero + Shopify)")
+      +teamBar("Packs per day","packs",TEAM_COLORS.packs,"items packed (ShipHero + Logger)")
       +teamBar("Engravings per day","engraves",TEAM_COLORS.engraves,"items engraved")
       +teamBar("Restocks per day","restocks",TEAM_COLORS.restocks,"replenishment units into pick bins")
       +teamBar("Total fulfillment items per day","ful",TEAM_COLORS.ful,"pick + pack + engrave")
-      +teamBar("Orders per day","orders",TEAM_COLORS.orders,"distinct fulfillment orders")
+      +teamBar("Orders per day","orders",TEAM_COLORS.orders,"orders shipped out the door")
       +'</div>';
     var rowsHtml=TEAM.days.map(function(d){
       return '<tr style="border-bottom:1px solid var(--line)">'
@@ -3168,7 +3179,41 @@ load();initAuto();initView();
       +'<td style="padding:6px 8px;text-align:right">'+intf(t.engraves)+'</td><td style="padding:6px 8px;text-align:right">'+intf(t.restocks)+'</td>'
       +'<td style="padding:6px 8px;text-align:right">'+intf(t.ful)+'</td><td style="padding:6px 8px;text-align:right">'+intf(t.orders)+'</td><td style="padding:6px 8px;text-align:right">—</td></tr>'
       +'</table></div></div>';
-    view.innerHTML=head+charts+table;
+    var chartsBig='<div class="card" style="margin-bottom:12px">'
+      +'<div style="font-weight:700;color:var(--ink);margin-bottom:2px">Orders shipped out the door — by day</div>'
+      +'<div style="font-size:11px;color:var(--muted);margin-bottom:8px">ShipHero + Logger (label-only Shopify not counted from 2026-07-21)</div>'
+      +'<div style="height:300px"><canvas id="teamShipC"></canvas></div></div>'
+      +'<div class="card" style="margin-bottom:12px">'
+      +'<div style="font-weight:700;color:var(--ink);margin-bottom:2px">Fulfillment items per day <span style="font-weight:400;color:var(--muted)">— pick + pack + engrave stacked, restock alongside</span></div>'
+      +'<div style="font-size:11px;color:var(--muted);margin-bottom:8px">same colors as the main dashboard</div>'
+      +'<div style="height:340px"><canvas id="teamMixC"></canvas></div></div>';
+    view.innerHTML=head+chartsBig+charts+table;
+    drawTeamCharts();
+  }
+  function drawTeamCharts(){
+    if(!window.Chart) return;
+    var days=TEAM.days||[]; var labels=days.map(function(d){return dayLabel(d.d);});
+    if(teamShipChart){try{teamShipChart.destroy();}catch(e){} teamShipChart=null;}
+    if(teamMixChart){try{teamMixChart.destroy();}catch(e){} teamMixChart=null;}
+    var sc=document.getElementById("teamShipC");
+    if(sc){ teamShipChart=new Chart(sc,{type:"bar",
+      data:{labels:labels,datasets:[{label:"Orders shipped",data:days.map(function(d){return d.shipped||0;}),backgroundColor:TEAM_CHART.ship,borderRadius:4,maxBarThickness:48}]},
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},
+        tooltip:{callbacks:{title:function(it){var i=it[0].dataIndex;return dayLabel(days[i].d)+" "+days[i].d;}}}},
+        scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{color:"#eef1f5"}}}}}); }
+    var mc=document.getElementById("teamMixC");
+    if(mc){ teamMixChart=new Chart(mc,{type:"bar",
+      data:{labels:labels,datasets:[
+        {label:"Picked · ShipHero",stack:"ful",backgroundColor:TEAM_CHART.pick,data:days.map(function(d){return d.picks||0;})},
+        {label:"Packed · ShipHero",stack:"ful",backgroundColor:TEAM_CHART.packsh,data:days.map(function(d){return d.packsh||0;})},
+        {label:"Packed · Logger",stack:"ful",backgroundColor:TEAM_CHART.packhand,data:days.map(function(d){return d.packhand||0;})},
+        {label:"Engraved",stack:"ful",backgroundColor:TEAM_CHART.eng,data:days.map(function(d){return d.engraves||0;})},
+        {label:"Restocked (separate track)",stack:"repl",backgroundColor:TEAM_CHART.repl,data:days.map(function(d){return d.restocks||0;})}
+      ]},
+      options:{responsive:true,maintainAspectRatio:false,
+        plugins:{legend:{position:"bottom",labels:{boxWidth:12,font:{size:11}}},
+          tooltip:{callbacks:{title:function(it){var i=it[0].dataIndex;return dayLabel(days[i].d)+" "+days[i].d;}}}},
+        scales:{x:{stacked:true,grid:{display:false}},y:{stacked:true,beginAtZero:true,grid:{color:"#eef1f5"}}}}}); }
   }
   window.renderTeamAnalytics=renderTeamAnalytics;
 
