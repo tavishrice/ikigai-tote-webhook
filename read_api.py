@@ -911,9 +911,22 @@ def teamdaily():
         ORDER BY et_day(ts)
         """, (frm, to))
         rows = cur.fetchall()
+        # Team active clocked hours per day (breaks removed); time clock is the source of
+        # truth. Reliably populated only from 2026-07-22 on — earlier days have no rows.
+        cur.execute("""
+        WITH sh AS (
+          SELECT tc.id, et_day(tc.clock_in) AS d,
+                 EXTRACT(EPOCH FROM (COALESCE(tc.clock_out, now()) - tc.clock_in)) AS total_s,
+                 COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (COALESCE(tb.end_ts, now()) - tb.start_ts)))
+                           FROM time_break tb WHERE tb.shift_id = tc.id), 0) AS break_s
+          FROM time_clock tc)
+        SELECT to_char(d,'YYYY-MM-DD') AS d, SUM(total_s - break_s)/3600.0 AS active_h
+        FROM sh WHERE d BETWEEN %s AND %s GROUP BY d
+        """, (frm, to))
+        active = {r[0]: round(float(r[1] or 0), 1) for r in cur.fetchall()}
     days = []
     tot = {"picks": 0, "packsh": 0, "packhand": 0, "packs": 0, "engraves": 0,
-           "restocks": 0, "ful": 0, "shipped": 0, "orders": 0}
+           "restocks": 0, "ful": 0, "shipped": 0, "orders": 0, "active_h": 0.0}
     for (d, picks, packsh, packhand, engraves, restocks, shipped, people) in rows:
         picks = int(picks or 0); packsh = int(packsh or 0); packhand = int(packhand or 0)
         engraves = int(engraves or 0); restocks = int(restocks or 0); shipped = int(shipped or 0)
@@ -921,11 +934,13 @@ def teamdaily():
         ful = picks + packs + engraves
         days.append({"d": d, "picks": picks, "packsh": packsh, "packhand": packhand,
                      "packs": packs, "engraves": engraves, "restocks": restocks, "ful": ful,
-                     "shipped": shipped, "orders": shipped, "people": int(people or 0)})
+                     "shipped": shipped, "orders": shipped, "active_h": active.get(d),
+                     "people": int(people or 0)})
         tot["picks"] += picks; tot["packsh"] += packsh; tot["packhand"] += packhand
         tot["packs"] += packs; tot["engraves"] += engraves; tot["restocks"] += restocks
-        tot["ful"] += ful; tot["shipped"] += shipped
+        tot["ful"] += ful; tot["shipped"] += shipped; tot["active_h"] += active.get(d) or 0
     tot["orders"] = tot["shipped"]
+    tot["active_h"] = round(tot["active_h"], 1)
     return jsonify({"range": {"from": frm, "to": to}, "days": days, "totals": tot})
 
 
@@ -3094,8 +3109,32 @@ load();initAuto();initView();
   var TEAM={ range:null, days:[], totals:null, loading:false };
   var TEAM_COLORS={ picks:"#2563eb", packs:"#16a34a", engraves:"#d97706", restocks:"#7c3aed", ful:"#0f766e", orders:"#475569" };
   // main-dashboard palette (kept in sync with `const C` in the primary script) for the two big charts
-  var TEAM_CHART={ pick:"#2563eb", packsh:"#16a34a", packhand:"#d97706", eng:"#0d9488", repl:"#7c3aed", ship:"#16a34a" };
-  var teamShipChart=null, teamMixChart=null;
+  var TEAM_CHART={ pick:"#2563eb", packsh:"#16a34a", packhand:"#d97706", eng:"#0d9488", repl:"#7c3aed", ship:"#16a34a", hours:"#4f46e5" };
+  var teamShipChart=null, teamMixChart=null, teamHoursChart=null;
+  // bar value-label plugin: draws each stack-group's total above the bar, and (when segments:true)
+  // each visible segment's value centered inside it. fmt formats the total (counts vs hours).
+  function mkTeamLabels(opts){ opts=opts||{};
+    var fmt=opts.fmt||function(v){return Math.round(v).toLocaleString();};
+    return {id:"teamvlabels",afterDatasetsDraw:function(ch){
+      var ctx=ch.ctx, groups={};
+      ch.data.datasets.forEach(function(d,di){var k=d.stack||("s"+di);(groups[k]=groups[k]||[]).push(di);});
+      ctx.save();
+      if(opts.segments){
+        ctx.font="700 10px Inter, system-ui, sans-serif";ctx.textAlign="center";ctx.textBaseline="middle";
+        ch.data.datasets.forEach(function(d,di){var meta=ch.getDatasetMeta(di);
+          (d.data||[]).forEach(function(v,i){ if(!v)return; var bar=meta.data[i]; if(!bar)return;
+            var base=(typeof bar.base==="number"?bar.base:bar.y); if(Math.abs(base-bar.y)<16)return;
+            ctx.fillStyle="#ffffff";ctx.fillText(Math.round(v).toLocaleString(),bar.x,(bar.y+base)/2); });});
+      }
+      ctx.font="800 11px Inter, system-ui, sans-serif";ctx.textAlign="center";ctx.textBaseline="bottom";ctx.fillStyle="#0f172a";
+      (ch.data.labels||[]).forEach(function(_,i){ Object.keys(groups).forEach(function(k){ var dis=groups[k];
+        var sum=0,topY=1e9,x=null;
+        dis.forEach(function(di){var vv=ch.data.datasets[di].data[i]||0,bar=ch.getDatasetMeta(di).data[i];
+          if(vv&&bar){sum+=vv;if(bar.y<topY)topY=bar.y;x=bar.x;}});
+        if(sum&&x!=null)ctx.fillText(fmt(sum),x,topY-3); });});
+      ctx.restore();
+    }};
+  }
   function dayLabel(s){ try{ var p=String(s).split("-"); var dt=new Date(Date.UTC(+p[0],+p[1]-1,+p[2]));
     return ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][dt.getUTCDay()]+" "+(+p[2]); }catch(e){ return s; } }
   function loadTeamDaily(){
@@ -3179,28 +3218,50 @@ load();initAuto();initView();
       +'<td style="padding:6px 8px;text-align:right">'+intf(t.engraves)+'</td><td style="padding:6px 8px;text-align:right">'+intf(t.restocks)+'</td>'
       +'<td style="padding:6px 8px;text-align:right">'+intf(t.ful)+'</td><td style="padding:6px 8px;text-align:right">'+intf(t.orders)+'</td><td style="padding:6px 8px;text-align:right">—</td></tr>'
       +'</table></div></div>';
-    var chartsBig='<div class="card" style="margin-bottom:12px">'
+    var hasHours=(TEAM.days||[]).some(function(d){return d.active_h!=null;});
+    var hoursFrom=""; if(hasHours){var hf=(TEAM.days||[]).filter(function(d){return d.active_h!=null;}); if(hf.length)hoursFrom=hf[0].d;}
+    var ordersCard='<div class="card" style="flex:1 1 360px;min-width:300px">'
       +'<div style="font-weight:700;color:var(--ink);margin-bottom:2px">Orders shipped out the door — by day</div>'
       +'<div style="font-size:11px;color:var(--muted);margin-bottom:8px">ShipHero + Logger (label-only Shopify not counted from 2026-07-21)</div>'
-      +'<div style="height:300px"><canvas id="teamShipC"></canvas></div></div>'
+      +'<div style="height:300px"><canvas id="teamShipC"></canvas></div></div>';
+    var hoursCard=hasHours?('<div class="card" style="flex:1 1 360px;min-width:300px">'
+      +'<div style="font-weight:700;color:var(--ink);margin-bottom:2px">Active hours — by day</div>'
+      +'<div style="font-size:11px;color:var(--muted);margin-bottom:8px">clocked active time, breaks removed &middot; from '+esc2(hoursFrom)+' (first accurate clock day)</div>'
+      +'<div style="height:300px"><canvas id="teamHoursC"></canvas></div></div>'):"";
+    var chartsBig='<div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px">'+ordersCard+hoursCard+'</div>'
       +'<div class="card" style="margin-bottom:12px">'
       +'<div style="font-weight:700;color:var(--ink);margin-bottom:2px">Fulfillment items per day <span style="font-weight:400;color:var(--muted)">— pick + pack + engrave stacked, restock alongside</span></div>'
-      +'<div style="font-size:11px;color:var(--muted);margin-bottom:8px">same colors as the main dashboard</div>'
-      +'<div style="height:340px"><canvas id="teamMixC"></canvas></div></div>';
+      +'<div style="font-size:11px;color:var(--muted);margin-bottom:8px">numbers shown on each section and above each bar &middot; same colors as the main dashboard</div>'
+      +'<div style="height:360px"><canvas id="teamMixC"></canvas></div></div>';
     view.innerHTML=head+chartsBig+charts+table;
     drawTeamCharts();
   }
   function drawTeamCharts(){
     if(!window.Chart) return;
     var days=TEAM.days||[]; var labels=days.map(function(d){return dayLabel(d.d);});
+    var PAD={padding:{top:26}};
+    var lblCount=mkTeamLabels({});
+    var lblHours=mkTeamLabels({fmt:function(v){return (Math.round(v*10)/10)+"h";}});
+    var lblMix=mkTeamLabels({segments:true});
     if(teamShipChart){try{teamShipChart.destroy();}catch(e){} teamShipChart=null;}
     if(teamMixChart){try{teamMixChart.destroy();}catch(e){} teamMixChart=null;}
+    if(teamHoursChart){try{teamHoursChart.destroy();}catch(e){} teamHoursChart=null;}
     var sc=document.getElementById("teamShipC");
     if(sc){ teamShipChart=new Chart(sc,{type:"bar",
-      data:{labels:labels,datasets:[{label:"Orders shipped",data:days.map(function(d){return d.shipped||0;}),backgroundColor:TEAM_CHART.ship,borderRadius:4,maxBarThickness:48}]},
-      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},
+      data:{labels:labels,datasets:[{label:"Orders shipped",data:days.map(function(d){return d.shipped||0;}),backgroundColor:TEAM_CHART.ship,borderRadius:4,maxBarThickness:56}]},
+      options:{responsive:true,maintainAspectRatio:false,layout:PAD,plugins:{legend:{display:false},
         tooltip:{callbacks:{title:function(it){var i=it[0].dataIndex;return dayLabel(days[i].d)+" "+days[i].d;}}}},
-        scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{color:"#eef1f5"}}}}}); }
+        scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{color:"#eef1f5"}}}},
+      plugins:[lblCount]}); }
+    var hc=document.getElementById("teamHoursC");
+    if(hc){ var hd=days.filter(function(d){return d.active_h!=null;});
+      teamHoursChart=new Chart(hc,{type:"bar",
+        data:{labels:hd.map(function(d){return dayLabel(d.d);}),datasets:[{label:"Active hours",data:hd.map(function(d){return d.active_h||0;}),backgroundColor:TEAM_CHART.hours,borderRadius:4,maxBarThickness:56}]},
+        options:{responsive:true,maintainAspectRatio:false,layout:PAD,plugins:{legend:{display:false},
+          tooltip:{callbacks:{title:function(it){var i=it[0].dataIndex;return dayLabel(hd[i].d)+" "+hd[i].d;},
+            label:function(it){return (Math.round(it.parsed.y*10)/10)+" active hours";}}}},
+          scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{color:"#eef1f5"},title:{display:true,text:"active hours",font:{size:10}}}}},
+        plugins:[lblHours]}); }
     var mc=document.getElementById("teamMixC");
     if(mc){ teamMixChart=new Chart(mc,{type:"bar",
       data:{labels:labels,datasets:[
@@ -3210,10 +3271,11 @@ load();initAuto();initView();
         {label:"Engraved",stack:"ful",backgroundColor:TEAM_CHART.eng,data:days.map(function(d){return d.engraves||0;})},
         {label:"Restocked (separate track)",stack:"repl",backgroundColor:TEAM_CHART.repl,data:days.map(function(d){return d.restocks||0;})}
       ]},
-      options:{responsive:true,maintainAspectRatio:false,
+      options:{responsive:true,maintainAspectRatio:false,layout:PAD,
         plugins:{legend:{position:"bottom",labels:{boxWidth:12,font:{size:11}}},
           tooltip:{callbacks:{title:function(it){var i=it[0].dataIndex;return dayLabel(days[i].d)+" "+days[i].d;}}}},
-        scales:{x:{stacked:true,grid:{display:false}},y:{stacked:true,beginAtZero:true,grid:{color:"#eef1f5"}}}}}); }
+        scales:{x:{stacked:true,grid:{display:false}},y:{stacked:true,beginAtZero:true,grid:{color:"#eef1f5"}}}},
+      plugins:[lblMix]}); }
   }
   window.renderTeamAnalytics=renderTeamAnalytics;
 
