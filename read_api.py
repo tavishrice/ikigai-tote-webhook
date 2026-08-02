@@ -1214,7 +1214,7 @@ td.sub2{color:var(--muted)}
 .tgap b{font-weight:700}.tgap .m{font-size:10px;opacity:.85}.tgap .fill{font-size:9.5px;text-transform:uppercase;letter-spacing:.03em;font-weight:700;opacity:.7}
 .tarrow{color:var(--muted);font-size:11px}
 .grp th{border-bottom:none;padding:0 8px 3px}
-.gh{text-align:center;font-size:10px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;padding:4px 6px;border-radius:6px}
+.gh{text-align:center;font-size:10px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;padding:4px 6px;border-radius:6px;white-space:normal;line-height:1.2}
 .gt{color:#334155;background:#eef2f7}
 .gf{color:#1e40af;background:#eaf1ff}
 .gr{color:#6d28d9;background:#f3eeff}
@@ -1337,9 +1337,12 @@ body.clean #dash>.card>h2{font-size:12.5px;margin-bottom:2px}
   /* dense table → swipe sideways; reset the fill-height trick */
   body.clean[data-tab=dash] #dash .card:has(#detail){max-height:none}
   body.clean[data-tab=dash] #dash .card:has(#detail) #detail{overflow:auto;-webkit-overflow-scrolling:touch}
-  body.clean[data-tab=dash] #dash .card:has(#detail) #detail>table{height:auto;min-width:660px}
-  body.clean[data-tab=dash] #dash .card:has(#detail) table{font-size:12.5px}
-  body.clean[data-tab=dash] #dash .card:has(#detail) td,body.clean[data-tab=dash] #dash .card:has(#detail) th{padding:6px 8px}
+  /* the real DOM is #detail > .tablewrap > table; tidyDetail() pins the table to
+     table-layout:fixed;width:100% inline, which crushes ~14 columns into the phone
+     width. Override to content-sized columns (min 100%) so names + numbers stay
+     legible and the table scrolls sideways instead of overlapping. */
+  body.clean[data-tab=dash] #dash .card:has(#detail) #detail table{table-layout:auto!important;width:auto!important;min-width:100%;height:auto;font-size:12.5px}
+  body.clean[data-tab=dash] #dash .card:has(#detail) #detail td,body.clean[data-tab=dash] #dash .card:has(#detail) #detail th{padding:6px 8px;overflow:visible;text-overflow:clip}
   /* the gear stays reachable; drawer is near full-width on a phone */
   #drawer{width:86vw;max-width:340px}
 }
@@ -2904,6 +2907,10 @@ load();initAuto();initView();
       cg.appendChild(col); });
     tbl.insertBefore(cg, tbl.firstChild);
     tbl.style.tableLayout="fixed"; tbl.style.width="100%";
+    // Floor a legible width: on a wide desktop/TV min-width < container so width:100%
+    // still fills with no scroll, but once the window is too narrow for the columns the
+    // wrap scrolls sideways instead of crushing headers/values into each other.
+    tbl.style.minWidth = (210 + spacerCount*12 + metricCount*62) + "px";
     // data rows: keep metric cells on one line (headers may wrap if space is tight)
     for(var r=2;r<rows.length;r++){ var row=rows[r];
       for(var ci=2;ci<row.cells.length;ci++){ var c=row.cells[ci];
