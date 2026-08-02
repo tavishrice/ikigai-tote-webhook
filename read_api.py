@@ -1334,15 +1334,14 @@ body.clean #dash>.card>h2{font-size:12.5px;margin-bottom:2px}
   body.clean[data-tab=dash] #dash .card:has(.chartwrap){min-height:0;position:relative}
   body.clean[data-tab=dash] #dash .chartwrap{height:300px!important;flex:none;margin-top:8px}
   body.clean[data-tab=dash] #chartmode{position:static;display:inline-flex;margin:0 0 4px}
-  /* dense table → swipe sideways; reset the fill-height trick */
+  /* dense table → swipe sideways; reset the fill-height trick.
+     tidyDetail() gives the table an inline min-width, so on a phone it keeps the exact
+     desktop column proportions (bands, colours, spacing all preserved) and simply
+     scrolls horizontally inside the wrap instead of crushing the columns together. */
   body.clean[data-tab=dash] #dash .card:has(#detail){max-height:none}
   body.clean[data-tab=dash] #dash .card:has(#detail) #detail{overflow:auto;-webkit-overflow-scrolling:touch}
-  /* the real DOM is #detail > .tablewrap > table; tidyDetail() pins the table to
-     table-layout:fixed;width:100% inline, which crushes ~14 columns into the phone
-     width. Override to content-sized columns (min 100%) so names + numbers stay
-     legible and the table scrolls sideways instead of overlapping. */
-  body.clean[data-tab=dash] #dash .card:has(#detail) #detail table{table-layout:auto!important;width:auto!important;min-width:100%;height:auto;font-size:12.5px}
-  body.clean[data-tab=dash] #dash .card:has(#detail) #detail td,body.clean[data-tab=dash] #dash .card:has(#detail) #detail th{padding:6px 8px;overflow:visible;text-overflow:clip}
+  body.clean[data-tab=dash] #dash .card:has(#detail) #detail table{height:auto;font-size:12.5px}
+  body.clean[data-tab=dash] #dash .card:has(#detail) #detail td,body.clean[data-tab=dash] #dash .card:has(#detail) #detail th{padding:6px 8px}
   /* the gear stays reachable; drawer is near full-width on a phone */
   #drawer{width:86vw;max-width:340px}
 }
@@ -1941,6 +1940,7 @@ function drawDetail(ppl,unit,v){
     _pack:(v.packsh?p.items_packed_sh:0)+(v.packshop?p.items_packed_shop:0),
     _eng:(v.eng?p.engraved_items:0),
     worked_h:(fl.hours||0), span_h:(fl.span_h||0),
+    iphr:(fl.items_per_hr||0),   // items per active hr — so the injected "Items/hr" column can sort too
     active_days:(fl.active_days!=null?fl.active_days:(p.active_days||0))};});
   arr.forEach(p=>{p.share=Math.round(p.items/teamItems*100); p.rshare=Math.round(p.restock/teamRestock*100);});
   const K={items_total:'items',orders_total:'orders',replenished:'restock',share:'share',rshare:'rshare'}[sortKey]||sortKey;
@@ -2605,6 +2605,17 @@ load();initAuto();initView();
   function hh(x){ return (x==null||isNaN(x)) ? "—" : n1(x)+"h"; }
   function intf(x){ try{ return (typeof fmt==="function")? fmt(Math.round(x)) : Math.round(x).toLocaleString(); }catch(e){ return Math.round(x).toString(); } }
   function esc2(s){ return String(s==null?"":s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c];}); }
+  // ---- click-to-sort for the columns this module rebuilds (Items/hr, Pick, Engrave,
+  // Pack, Total items, Share). The base table wires sortBy() on its own headers, but
+  // cells we recreate here lose that handler; re-attach it so EVERY column sorts. ----
+  function sortArrow(k){ try{ return (typeof sortKey!=="undefined" && sortKey===k) ? '<span class=arw>'+(sortDir<0?'▼':'▲')+'</span>' : ''; }catch(e){ return ''; } }
+  function sortActive(k){ try{ return (typeof sortKey!=="undefined" && sortKey===k) ? ' act' : ''; }catch(e){ return ''; } }
+  function makeSortable(th, key, labelHTML){
+    th.className = (th.className? th.className+' ' : '') + 'srt' + sortActive(key);
+    th.style.cursor = 'pointer';
+    th.innerHTML = labelHTML + sortArrow(key);
+    th.setAttribute('onclick', "sortBy('"+key+"')");
+  }
   function hoursFor(name){ return HOURS.byName[name] || null; }
   window.hoursFor = hoursFor;
   function matchClockName(txt){
@@ -2821,7 +2832,8 @@ load();initAuto();initView();
     groupTh.colSpan = groupTh.colSpan + 1;
     var th=document.createElement("th");
     if(sub.cells[ai]) th.className=sub.cells[ai].className;
-    th.style.textAlign="right"; th.textContent="Items/hr";
+    th.style.textAlign="right";
+    makeSortable(th, "iphr", "Items/hr");
     sub.insertBefore(th, sub.cells[pos]||null);
     for(var r=2;r<rows.length;r++){
       var row=rows[r]; if(row.cells.length<pos) continue;
@@ -2860,10 +2872,13 @@ load();initAuto();initView();
     if(!groupTh) return;
     var thCls=sub.cells[fulStart]?sub.cells[fulStart].className:"";
     var shareLabel=sub.cells[fulStart+1]?sub.cells[fulStart+1].innerHTML:"Share";
+    shareLabel=shareLabel.replace(/<span class=arw>[\s\S]*?<\/span>/,"");   // drop any inherited sort arrow; makeSortable re-adds it
     sub.deleteCell(fulStart+2); sub.deleteCell(fulStart+1); sub.deleteCell(fulStart);
     var hAnchor=sub.cells[fulStart]||null;
-    ["Pick","Engrave","Pack","Total items",shareLabel].forEach(function(lbl){
-      var th=document.createElement("th"); th.className=thCls; th.style.textAlign="right"; th.innerHTML=lbl; sub.insertBefore(th,hAnchor); });
+    // each rebuilt fulfillment header stays click-to-sort, keyed to the field it shows
+    [["Pick","_pick"],["Engrave","_eng"],["Pack","_pack"],["Total items","items_total"],[shareLabel,"share"]].forEach(function(pair){
+      var th=document.createElement("th"); th.className=thCls; th.style.textAlign="right";
+      makeSortable(th, pair[1], pair[0]); sub.insertBefore(th,hAnchor); });
     groupTh.colSpan = groupTh.colSpan + 2;
     for(var r=2;r<rows.length;r++){
       var row=rows[r]; if(row.cells.length<=fulStart+2) continue;
@@ -2885,7 +2900,11 @@ load();initAuto();initView();
     }
   }
 
-  /* ---------- Dashboard detail: equal-width, fixed-layout columns (tidy) ---------- */
+  /* ---------- Dashboard detail: content-sized columns that fill wide, scroll narrow ----------
+     Fixed equal-width columns squeezed the name/type columns until long names, badges and
+     champion chips overlapped (and crushed every column on a phone). Content-sizing lets each
+     column take exactly what it needs — no overlaps — while width:100% still fills a wide TV
+     and a min-width floor makes a narrow window scroll sideways instead of squishing. */
   function tidyDetail(){
     var dash=document.getElementById("dash"); if(!dash) return;
     var tbl=[].slice.call(dash.querySelectorAll("table")).filter(function(t){
@@ -2893,28 +2912,19 @@ load();initAuto();initView();
     if(!tbl) return;
     var rows=[].slice.call(tbl.rows); if(rows.length<2) return;
     var sub=rows[1], n=sub.cells.length;
-    var kinds=[];
-    for(var i=0;i<n;i++){ var txt=(sub.cells[i].textContent||"").trim();
-      if(i===0) kinds.push("person"); else if(i===1) kinds.push("type");
-      else if(txt==="") kinds.push("spacer"); else kinds.push("metric"); }
-    var metricCount=kinds.filter(function(k){return k==="metric";}).length||1;
-    var spacerCount=kinds.filter(function(k){return k==="spacer";}).length;
-    var mw=(100-15-7-spacerCount*1)/metricCount;
-    var old=tbl.querySelector("colgroup"); if(old) old.remove();
-    var cg=document.createElement("colgroup");
-    kinds.forEach(function(k){ var col=document.createElement("col");
-      col.style.width = k==="person"?"15%":k==="type"?"7%":k==="spacer"?"1%":mw.toFixed(3)+"%";
-      cg.appendChild(col); });
-    tbl.insertBefore(cg, tbl.firstChild);
-    tbl.style.tableLayout="fixed"; tbl.style.width="100%";
+    var metricCount=0, spacerCount=0;
+    for(var i=2;i<n;i++){ var txt=(sub.cells[i].textContent||"").trim();
+      if(txt==="") spacerCount++; else metricCount++; }
+    if(!metricCount) metricCount=1;
+    var old=tbl.querySelector("colgroup"); if(old) old.remove();   // no forced widths — let content size the columns
+    tbl.style.tableLayout="auto"; tbl.style.width="100%";
     // Floor a legible width: on a wide desktop/TV min-width < container so width:100%
-    // still fills with no scroll, but once the window is too narrow for the columns the
-    // wrap scrolls sideways instead of crushing headers/values into each other.
-    tbl.style.minWidth = (210 + spacerCount*12 + metricCount*62) + "px";
-    // data rows: keep metric cells on one line (headers may wrap if space is tight)
+    // still fills, but once the window is too narrow the wrap scrolls sideways instead
+    // of crushing headers/values into each other.
+    tbl.style.minWidth = (210 + spacerCount*12 + metricCount*66) + "px";
+    // keep each metric value on a single line (content-sized columns won't clip)
     for(var r=2;r<rows.length;r++){ var row=rows[r];
-      for(var ci=2;ci<row.cells.length;ci++){ var c=row.cells[ci];
-        c.style.whiteSpace="nowrap"; c.style.overflow="hidden"; c.style.textOverflow="ellipsis"; } }
+      for(var ci=2;ci<row.cells.length;ci++){ row.cells[ci].style.whiteSpace="nowrap"; } }
   }
 
   /* ---------- Speed & Rankings: add Active-h + Items/active-hr columns ---------- */
