@@ -1384,12 +1384,12 @@ body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{backgro
   <div class="tab on" data-tab=dash onclick="tab('dash')">Dashboard</div>
   <div class=tab data-tab=out onclick="tab('out')">Outstanding</div>
   <div class=tab data-tab=floor onclick="tab('floor')">Floor Time</div>
-  <div class=tab data-tab=log onclick="tab('log')">Log time</div>
+  <!-- archived tab (hidden from nav; #log view + loadLog() retained, still reachable via the "Log time" links on Floor Time): <div class=tab data-tab=log onclick="tab('log')">Log time</div> -->
   <div class=tab data-tab=plan onclick="tab('plan')">Planner</div>
   <div class=tab data-tab=trend onclick="tab('trend')">Trends</div>
   <div class=tab data-tab=speed onclick="tab('speed')">Speed &amp; Rankings</div>
   <div class=tab data-tab=engt onclick="tab('engt')">Engraving</div>
-  <div class=tab data-tab=watch onclick="tab('watch')">Watch List</div>
+  <!-- archived tab (hidden from nav; #watch view + loadWatch() retained): <div class=tab data-tab=watch onclick="tab('watch')">Watch List</div> -->
   <div class=tab data-tab=an onclick="tab('an')">Analytics</div>
   <div class=tab data-tab=dataqc onclick="tab('dataqc')">Data Issues</div>
 </div>
@@ -3005,6 +3005,10 @@ load();initAuto();initView();
 
   /* ---------- Hours tab ---------- */
   function ensureHoursTab(){
+    /* Hours tab archived: nav button intentionally not added (kept out of the top strip
+       and drawer). renderHours() + the #hours view below are retained, so restoring it is
+       just un-commenting these two blocks. */
+    /*
     // nav button in the .tabs strip
     var tabs=document.querySelector(".tabs");
     if(tabs && !tabs.querySelector('[data-tab="hours"]')){
@@ -3021,7 +3025,8 @@ load();initAuto();initView();
       d.onclick=function(){ try{ tab("hours"); var all=dn.querySelectorAll("button"); [].forEach.call(all,function(x){x.classList.remove("cur");}); d.classList.add("cur"); if(typeof closeDrawer==="function") closeDrawer(); }catch(e){} };
       dn.appendChild(d);
     }
-    // view container
+    */
+    // view container (retained so #hours references stay valid even while the tab is archived)
     var view=document.getElementById("hours");
     if(!view){
       view=document.createElement("div");
