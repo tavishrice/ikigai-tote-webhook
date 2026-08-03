@@ -4,9 +4,8 @@ Warehouse fulfillment & contribution analytics for **Ikigai Cases** — how much
 picked, packed, engraved and restocked, how long they were on the floor, and how the team is
 trending. A live dashboard plus the ingest/resolve jobs that feed it.
 
-> The repo is still named `ikigai-tote-webhook` after its original component (the ShipHero
-> "Tote Complete" webhook listener, below). It has since grown into the full warehouse
-> dashboard; the dashboard is the main thing here now.
+> Originally `ikigai-tote-webhook`, this repo began as the ShipHero "Tote Complete" webhook
+> listener (below) and has since grown into the full warehouse dashboard — now the main thing here.
 
 ## What's in the repo
 
