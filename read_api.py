@@ -1,6 +1,7 @@
 """
-Read API + dashboard for the Ikigai contribution store.
-Serves the "Warehouse Picking & Packing" dashboard (Dashboard / Floor Time / Analytics)
+Read API + dashboard for Ikigai Warehouse — the fulfillment/contribution analytics
+dashboard (warehouse picking, packing, engraving and restocking) for Ikigai Cases.
+Serves the "Ikigai Warehouse" dashboard (Dashboard / Floor Time / Analytics)
 plus JSON endpoints. Reads pre-aggregated + raw event data; live on every open.
 
 CORRECTED 2026-07-15 (frontend presentation):
@@ -983,7 +984,7 @@ def dashboard():
 
 DASHBOARD_HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>Warehouse Picking &amp; Packing</title>
+<title>Ikigai Warehouse</title>
 <link rel=preconnect href="https://fonts.googleapis.com"><link rel=preconnect href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel=stylesheet>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.0/dist/chart.umd.js"></script>
@@ -1339,7 +1340,7 @@ body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{backgro
   </div>
 </aside>
 <div class=wrap>
-<div class=apphead><h1>Warehouse Picking &amp; Packing</h1><span class=dot></span><span class=live>Live</span></div>
+<div class=apphead><h1>Ikigai Warehouse</h1><span class=dot></span><span class=live>Live</span></div>
 <div class=sub>Live contribution from ShipHero <b>+ Logger hand-fulfillments + engraving</b>. <b>Fulfillment</b> (pick + pack + engrave) and <b>Restock</b> are two separate tracks.</div>
 <div class=tabs>
   <div class="tab on" data-tab=dash onclick="tab('dash')">Dashboard</div>
@@ -1384,7 +1385,7 @@ body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{backgro
 
 <div id=dash>
   <div id=tvhead>
-    <div class=tvbrand><div class=tvtitle>Warehouse Contribution</div><div class=tvlive><span class=dot></span>Live &middot; ShipHero &middot; Logger &middot; Engraving</div></div>
+    <div class=tvbrand><div class=tvtitle>Ikigai Warehouse</div><div class=tvlive><span class=dot></span>Live &middot; ShipHero &middot; Logger &middot; Engraving</div></div>
     <div class=tvdatewrap><div class=tvdate id=tvdate></div><div class=tvdsub id=tvdsub></div></div>
     <div class=tvref><span id=tvrefstamp></span></div>
   </div>
@@ -2254,7 +2255,7 @@ function copyChat(){const v=vis();const rows=DATA.people.filter(teamFilter).map(
     if(v.packsh||v.packshop)parts.push('packed '+((v.packsh?p.items_packed_sh:0)+(v.packshop?p.items_packed_shop:0)));
     if(v.eng)parts.push('engraved '+p.engraved_items);
     return p.person+': fulfillment '+fulItems(p,v)+(parts.length?' ('+parts.join(', ')+')':'')+(v.repl?', restocked '+p.replenished:'');});
-  navigator.clipboard.writeText('Warehouse '+DATA.range.from+'\n'+DATA.shipped.total+' orders shipped\n'+rows.join('\n'));document.getElementById('status').textContent='copied!';setTimeout(()=>document.getElementById('status').textContent='',1500);}
+  navigator.clipboard.writeText('Ikigai Warehouse '+DATA.range.from+'\n'+DATA.shipped.total+' orders shipped\n'+rows.join('\n'));document.getElementById('status').textContent='copied!';setTimeout(()=>document.getElementById('status').textContent='',1500);}
 function dl(kind){const ppl=DATA.people.filter(teamFilter);let blob,name;
   if(kind==='json'){blob=new Blob([JSON.stringify(DATA,null,2)],{type:'application/json'});name='warehouse.json';}
   else{const hdr=['person','type','items_picked_sh','items_packed_sh','items_packed_logger','engraved_items','items_total','replenished','orders_picked_sh','orders_packed_sh','orders_packed_logger'];
