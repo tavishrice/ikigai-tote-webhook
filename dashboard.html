@@ -871,34 +871,37 @@ function drawDetail(ppl,unit,v){
   // Three visually separated groups: ON THE CLOCK (days + hours, merged from /floor so you can tell
   // whether someone leads because they worked more time), FULFILLMENT (pick+pack+engrave, items+orders),
   // and RESTOCKING (separate). Every header is click-to-sort.
-  const det=DET();
   const teamItems=ppl.reduce((a,p)=>a+fulItems(p,v),0)||1;
   const teamRestock=ppl.reduce((a,p)=>a+(v.repl?p.replenished:0),0)||1;
   const fmap={}; if(FLOOR&&FLOOR.people)FLOOR.people.forEach(p=>fmap[p.person]=p);
   const wd=(FLOOR&&FLOOR.work_days)||0;
   const CH=teamChampions(ppl);   // champions computed on full per-person data, independent of the stage filter
+  const hasHours=!!(window.HOURS&&window.HOURS.list&&window.HOURS.list.length);
   const arr=ppl.map(p=>{const fl=fmap[p.person]||{};return {person:p.person, type:p.type,
-    items:fulItems(p,v), orders:fulOrders(p,v), restock:(v.repl?p.replenished:0),
+    items:fulItems(p,v), restock:(v.repl?p.replenished:0),
     _pick:(v.pick?p.items_picked_sh:0),
     _pack:(v.packsh?p.items_packed_sh:0)+(v.packshop?p.items_packed_shop:0),
     _eng:(v.eng?p.engraved_items:0),
     worked_h:(fl.hours||0), span_h:(fl.span_h||0),
-    iphr:(fl.items_per_hr||0),   // items per active hr — so the injected "Items/hr" column can sort too
+    iphr:(fl.items_per_hr!=null?fl.items_per_hr:null),   // items per active hr (from /floor)
     active_days:(fl.active_days!=null?fl.active_days:(p.active_days||0))};});
   arr.forEach(p=>{p.share=Math.round(p.items/teamItems*100); p.rshare=Math.round(p.restock/teamRestock*100);});
-  const K={items_total:'items',orders_total:'orders',replenished:'restock',share:'share',rshare:'rshare'}[sortKey]||sortKey;
+  const K={items_total:'items',replenished:'restock',share:'share',rshare:'rshare'}[sortKey]||sortKey;
   arr.sort((a,b)=>{const x=a[K],y=b[K];return (x>y?1:(x<y?-1:0))*sortDir;});
   const arw=k=>sortKey===k?'<span class=arw>'+(sortDir<0?'▼':'▲')+'</span>':'';
   const th=(k,lab,sub)=>'<th class="srt'+(sortKey===k?' act':'')+'" onclick="sortBy(\''+k+'\')">'+lab+(sub?' <span class=s>'+sub+'</span>':'')+arw(k)+'</th>';
-  const nful=det?6:3;   // items,[pick,pack,eng],share,orders
   // sortable header with a per-group tint class (gct/gcf/gcr) so the whole column band is coloured
   const thg=(g,k,l,s)=>'<th class="srt '+g+(sortKey===k?' act':'')+'" onclick="sortBy(\''+k+'\')">'+l+(s?' <span class=s>'+s+'</span>':'')+arw(k)+'</th>';
+  // Columns are rendered natively here (Items/hr + the Pick/Engrave/Pack/Total-items/Share split
+  // used to be grafted on after render by a fragile DOM-patch layer). Items/hr only shows once the
+  // time-clock data (/hours) has loaded; the Detail toggle still drives Floor Time / Engraving.
+  const nclock=hasHours?4:3;
   // group-title header row
   let h='<table><tr class=grp>'+
     '<th></th><th></th>'+
-    '<th colspan=3 class="gh gt">On the clock</th>'+
+    '<th colspan='+nclock+' class="gh gt">On the clock</th>'+
     '<th class=gsep></th>'+
-    '<th colspan='+nful+' class="gh gf">Fulfillment</th>'+
+    '<th colspan=5 class="gh gf">Fulfillment</th>'+
     '<th class=gsep></th>'+
     '<th colspan=2 class="gh gr">Restocking</th>'+
     '</tr>';
@@ -908,37 +911,47 @@ function drawDetail(ppl,unit,v){
     thg('gct','active_days','Days',(wd?'of '+wd:'active'))+
     thg('gct','span_h','Hours','1st&rarr;last')+
     thg('gct','worked_h','Active','breaks out')+
+    (hasHours? thg('gct','iphr','Items/hr','') : '')+
     '<th class=gsep></th>'+
-    thg('gcf','items_total','Items','pick+pack+engrave')+
-    (det? thg('gcf','_pick','Picked','ShipHero')+thg('gcf','_pack','Packed','SH + Logger')+thg('gcf','_eng','Engraved','logger') : '')+
+    thg('gcf','_pick','Pick','')+
+    thg('gcf','_eng','Engrave','')+
+    thg('gcf','_pack','Pack','')+
+    thg('gcf','items_total','Total items','')+
     thg('gcf','share','Share','of team')+
-    thg('gcf','orders_total','Orders','fulfillment')+
     '<th class=gsep></th>'+
     thg('gcr','replenished','Units','')+
     thg('gcr','rshare','Share','of team')+
     '</tr>';
-  const T={items:0,orders:0,restock:0,_pick:0,_pack:0,_eng:0,worked:0,span:0};
+  const T={items:0,restock:0,_pick:0,_pack:0,_eng:0,worked:0,span:0};
+  const muted=v=>'<span style="color:var(--muted)">'+v+'</span>';
   arr.forEach(p=>{
     const dstr=p.active_days?(p.active_days+(wd?' / '+wd:'')):'&mdash;';
     h+='<tr><td class=name>'+esc(p.person)+champChips(p.person,CH)+'</td><td>'+badge(p.type)+'</td>'+
       '<td class=gct>'+dstr+'</td>'+
       '<td class=gct><b>'+(p.span_h?p.span_h.toFixed(1):'&mdash;')+'</b></td>'+
       '<td class="gct sub2">'+(p.worked_h?p.worked_h.toFixed(1):'&mdash;')+'</td>'+
+      (hasHours? '<td class="gct sub2">'+((p.iphr!=null&&!isNaN(p.iphr))?p.iphr:muted('&mdash;'))+'</td>' : '')+
       '<td class=gsep></td>'+
+      '<td class=gcf>'+fmt(p._pick)+'</td>'+
+      '<td class=gcf>'+fmt(p._eng)+'</td>'+
+      '<td class=gcf>'+fmt(p._pack)+'</td>'+
       '<td class="gcf fi"><b>'+fmt(p.items)+'</b></td>'+
-      (det? '<td class=gcf>'+fmt(p._pick)+'</td><td class=gcf>'+fmt(p._pack)+'</td><td class="gcf eng">'+fmt(p._eng)+'</td>' : '')+
       '<td class="gcf shr">'+p.share+'%</td>'+
-      '<td class=gcf>'+fmt(p.orders)+'</td>'+
       '<td class=gsep></td>'+
       '<td class="gcr p"><b>'+fmt(p.restock)+'</b></td>'+
       '<td class="gcr shr">'+(p.restock?p.rshare+'%':'&mdash;')+'</td></tr>';
-    T.items+=p.items;T.orders+=p.orders;T.restock+=p.restock;T._pick+=p._pick;T._pack+=p._pack;T._eng+=p._eng;T.worked+=p.worked_h;T.span+=p.span_h;});
+    T.items+=p.items;T.restock+=p.restock;T._pick+=p._pick;T._pack+=p._pack;T._eng+=p._eng;T.worked+=p.worked_h;T.span+=p.span_h;});
+  // fleet items per active hr (clocked people only) — matches the old injected Total cell
+  const fleetIp=(function(){if(!(FLOOR&&FLOOR.people))return null;let it=0,hr=0;FLOOR.people.forEach(p=>{if(p.has_clock){it+=(p.items||0);hr+=(p.hours||0);}});return hr>0?Math.round(it/hr):null;})();
   h+='<tr class=tot><td>Total</td><td></td>'+
     '<td class=gct></td><td class=gct><b>'+(T.span?T.span.toFixed(0):'')+'</b></td><td class="gct sub2">'+(T.worked?T.worked.toFixed(0):'')+'</td>'+
+    (hasHours? '<td class="gct sub2">'+(fleetIp!=null?'<b>'+fleetIp+'</b>':'')+'</td>' : '')+
     '<td class=gsep></td>'+
-    '<td class=gcf><b>'+fmt(T.items)+'</b></td>'+
-    (det? '<td class=gcf>'+fmt(T._pick)+'</td><td class=gcf>'+fmt(T._pack)+'</td><td class=gcf>'+fmt(T._eng)+'</td>' : '')+
-    '<td class=gcf>100%</td><td class=gcf>'+fmt(T.orders)+'</td>'+
+    '<td class=gcf>'+fmt(T._pick)+'</td>'+
+    '<td class=gcf>'+fmt(T._eng)+'</td>'+
+    '<td class=gcf>'+fmt(T._pack)+'</td>'+
+    '<td class="gcf fi"><b>'+fmt(T.items)+'</b></td>'+
+    '<td class=gcf>100%</td>'+
     '<td class=gsep></td>'+
     '<td class="gcr p"><b>'+fmt(T.restock)+'</b></td><td class=gcr>100%</td></tr>';
   h+='</table>';
@@ -1465,17 +1478,6 @@ load();initAuto();initView();
   function hh(x){ return (x==null||isNaN(x)) ? "—" : n1(x)+"h"; }
   function intf(x){ try{ return (typeof fmt==="function")? fmt(Math.round(x)) : Math.round(x).toLocaleString(); }catch(e){ return Math.round(x).toString(); } }
   function esc2(s){ return String(s==null?"":s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c];}); }
-  // ---- click-to-sort for the columns this module rebuilds (Items/hr, Pick, Engrave,
-  // Pack, Total items, Share). The base table wires sortBy() on its own headers, but
-  // cells we recreate here lose that handler; re-attach it so EVERY column sorts. ----
-  function sortArrow(k){ try{ return (typeof sortKey!=="undefined" && sortKey===k) ? '<span class=arw>'+(sortDir<0?'▼':'▲')+'</span>' : ''; }catch(e){ return ''; } }
-  function sortActive(k){ try{ return (typeof sortKey!=="undefined" && sortKey===k) ? ' act' : ''; }catch(e){ return ''; } }
-  function makeSortable(th, key, labelHTML){
-    th.className = (th.className? th.className+' ' : '') + 'srt' + sortActive(key);
-    th.style.cursor = 'pointer';
-    th.innerHTML = labelHTML + sortArrow(key);
-    th.setAttribute('onclick', "sortBy('"+key+"')");
-  }
   function hoursFor(name){ return HOURS.byName[name] || null; }
   window.hoursFor = hoursFor;
   function matchClockName(txt){
@@ -1661,104 +1663,8 @@ load();initAuto();initView();
     ]);
   }
 
-  /* ---------- Dashboard: NO separate top band (removed per Tavish). Instead add an
-     Items/hr column INSIDE the existing "On the clock" section of the detail table. */
+  /* No separate hours top-band (removed per Tavish); Items/hr is a native column in drawDetail. */
   function removeDashBand(){ var el=document.getElementById("hoursTiles"); if(el) el.remove(); }
-
-  function matchAnyName(txt){
-    var F=appFLOOR(); if(!F||!F.people||!txt) return null;
-    for(var i=0;i<F.people.length;i++){ if(F.people[i].person && txt.indexOf(F.people[i].person)===0) return F.people[i].person; }
-    for(var j=0;j<F.people.length;j++){ if(F.people[j].person && txt.indexOf(F.people[j].person)!==-1) return F.people[j].person; }
-    return null;
-  }
-  function fleetUPLH(){
-    var F=appFLOOR(); if(!F||!F.people) return null;
-    var it=0, hr=0; F.people.forEach(function(p){ if(p.has_clock){ it+=(p.items||0); hr+=(p.hours||0); } });
-    return hr>0? Math.round(it/hr) : null;
-  }
-  function injectDashClockCol(){
-    var dash=document.getElementById("dash"); if(!dash || !HOURS.list.length) return;
-    var tbl=[].slice.call(dash.querySelectorAll("table")).filter(function(t){
-      return /ON THE CLOCK/i.test(t.textContent) && /FULFILLMENT/i.test(t.textContent); })[0];
-    if(!tbl) return;
-    var rows=[].slice.call(tbl.rows); if(rows.length<2) return;
-    var groupTh=[].slice.call(rows[0].cells).filter(function(c){ return c.textContent.trim().toLowerCase()==="on the clock"; })[0];
-    if(!groupTh || groupTh.colSpan>=4) return; // already injected this render
-    var sub=rows[1], ai=-1;
-    for(var i=0;i<sub.cells.length;i++){ if(/Active/i.test(sub.cells[i].textContent)){ ai=i; break; } }
-    if(ai<0) return;
-    var pos=ai+1;
-    var F=appFLOOR(); var iphr={}; F.people.forEach(function(p){ iphr[p.person]=p.items_per_hr; });
-    groupTh.colSpan = groupTh.colSpan + 1;
-    var th=document.createElement("th");
-    if(sub.cells[ai]) th.className=sub.cells[ai].className;
-    th.style.textAlign="right";
-    makeSortable(th, "iphr", "Items/hr");
-    sub.insertBefore(th, sub.cells[pos]||null);
-    for(var r=2;r<rows.length;r++){
-      var row=rows[r]; if(row.cells.length<pos) continue;
-      var name=row.cells[0]? row.cells[0].textContent.trim() : "";
-      var td=document.createElement("td");
-      if(row.cells[ai]) td.className=row.cells[ai].className;
-      td.style.textAlign="right";
-      if(/^Total/i.test(name)){ var fu=fleetUPLH(); td.innerHTML=(fu!=null)? '<b>'+fu+'</b>' : ''; }
-      else { var nm=matchAnyName(name); var v=(nm!=null)? iphr[nm] : null;
-             td.innerHTML=(v!=null && !isNaN(v))? String(v) : '<span style="color:var(--muted)">—</span>'; }
-      row.insertBefore(td, row.cells[pos]||null);
-    }
-  }
-
-  /* ---------- Dashboard: split FULFILLMENT into Pick / Engrave / Pack / Total items / Share ---------- */
-  function num(x){ return (x==null||isNaN(x))?0:x; }
-  function matchDataName(txt){
-    var D=appDATA(); if(!D||!D.people||!txt) return null;
-    for(var i=0;i<D.people.length;i++){ if(D.people[i].person && txt.indexOf(D.people[i].person)===0) return D.people[i]; }
-    for(var j=0;j<D.people.length;j++){ if(D.people[j].person && txt.indexOf(D.people[j].person)!==-1) return D.people[j]; }
-    return null;
-  }
-  function injectDashFulfillmentCols(){
-    var D=appDATA(); if(!D || !D.people) return;
-    var dash=document.getElementById("dash"); if(!dash) return;
-    var tbl=[].slice.call(dash.querySelectorAll("table")).filter(function(t){
-      return /ON THE CLOCK/i.test(t.textContent) && /FULFILLMENT/i.test(t.textContent); })[0];
-    if(!tbl) return;
-    var rows=[].slice.call(tbl.rows); if(rows.length<2) return;
-    var sub=rows[1];
-    if([].slice.call(sub.cells).some(function(c){return /Total items/i.test(c.textContent);})) return; // already done
-    var fulStart=-1;
-    for(var i=0;i<sub.cells.length;i++){ if(/pick\+pack\+engrave/i.test(sub.cells[i].textContent) || /^Items/i.test(sub.cells[i].textContent.trim())){ fulStart=i; break; } }
-    if(fulStart<0) return;
-    var groupTh=[].slice.call(rows[0].cells).filter(function(c){return c.textContent.trim().toLowerCase()==="fulfillment";})[0];
-    if(!groupTh) return;
-    var thCls=sub.cells[fulStart]?sub.cells[fulStart].className:"";
-    var shareLabel=sub.cells[fulStart+1]?sub.cells[fulStart+1].innerHTML:"Share";
-    shareLabel=shareLabel.replace(/<span class=arw>[\s\S]*?<\/span>/,"");   // drop any inherited sort arrow; makeSortable re-adds it
-    sub.deleteCell(fulStart+2); sub.deleteCell(fulStart+1); sub.deleteCell(fulStart);
-    var hAnchor=sub.cells[fulStart]||null;
-    // each rebuilt fulfillment header stays click-to-sort, keyed to the field it shows
-    [["Pick","_pick"],["Engrave","_eng"],["Pack","_pack"],["Total items","items_total"],[shareLabel,"share"]].forEach(function(pair){
-      var th=document.createElement("th"); th.className=thCls; th.style.textAlign="right";
-      makeSortable(th, pair[1], pair[0]); sub.insertBefore(th,hAnchor); });
-    groupTh.colSpan = groupTh.colSpan + 2;
-    for(var r=2;r<rows.length;r++){
-      var row=rows[r]; if(row.cells.length<=fulStart+2) continue;
-      var name=row.cells[0]?row.cells[0].textContent.trim():"";
-      var shareHTML=row.cells[fulStart+1]?row.cells[fulStart+1].innerHTML:"";
-      var shareCls=row.cells[fulStart+1]?row.cells[fulStart+1].className:"";
-      var cls=row.cells[fulStart]?row.cells[fulStart].className:"";
-      var pick,eng,pack,total;
-      if(/^Total/i.test(name)){ var T=D.totals||{}; pick=num(T.pk_i); eng=num(T.eng_i); pack=num(T.packsh_i)+num(T.packshop_i); total=pick+eng+pack; }
-      else { var p=matchDataName(name);
-             if(p){ pick=num(p.items_picked_sh); eng=num(p.engraved_items); pack=num(p.items_packed_sh)+num(p.items_packed_shop); total=pick+eng+pack; }
-             else { pick=eng=pack=total=null; } }
-      row.deleteCell(fulStart+2); row.deleteCell(fulStart+1); row.deleteCell(fulStart);
-      var anchor=row.cells[fulStart]||null;
-      [pick,eng,pack].forEach(function(v){ var td=document.createElement("td"); td.className=cls; td.style.textAlign="right";
-        td.innerHTML=(v==null)?'<span style="color:var(--muted)">—</span>':intf(v); row.insertBefore(td,anchor); });
-      var tt=document.createElement("td"); tt.className=cls; tt.style.textAlign="right"; tt.innerHTML=(total==null)?"—":'<b>'+intf(total)+'</b>'; row.insertBefore(tt,anchor);
-      var ts=document.createElement("td"); ts.className=shareCls; ts.innerHTML=shareHTML; row.insertBefore(ts,anchor);
-    }
-  }
 
   /* ---------- Dashboard detail: content-sized columns that fill wide, scroll narrow ----------
      Fixed equal-width columns squeezed the name/type columns until long names, badges and
@@ -2170,8 +2076,7 @@ load();initAuto();initView();
     try{ relabelTab("floor"); ensureNote(document.getElementById("floor"),"clkNoteFloor"); }catch(e){}
     try{ if((typeof curTab!=="undefined"?curTab:"")==="an") renderTeamAnalytics(); }catch(e){}
     try{ relabelTab("watch"); ensureNote(document.getElementById("watch"),"clkNoteWatch"); }catch(e){}
-    try{ injectDashFulfillmentCols(); }catch(e){}
-    try{ relabelTab("dash"); injectDashClockCol(); }catch(e){}
+    try{ relabelTab("dash"); }catch(e){}
     try{ tidyDetail(); }catch(e){}
     try{ if((typeof curTab!=="undefined"?curTab:"")==="hours") renderHours(); }catch(e){}
   }
@@ -2198,7 +2103,7 @@ load();initAuto();initView();
   ["render","renderFloor","renderWatch"].forEach(function(fn){
     wrapBefore(fn, function(){ reconcileFloor(); });
   });
-  wrap("render", function(){ ensureHours(); removeDashBand(); injectDashFulfillmentCols(); relabelTab("dash"); injectDashClockCol(); tidyDetail(); });
+  wrap("render", function(){ ensureHours(); removeDashBand(); relabelTab("dash"); tidyDetail(); });
   wrap("renderFloor", function(){ injectFloorOnClock(); relabelTab("floor"); ensureNote(document.getElementById("floor"),"clkNoteFloor"); });
   wrap("renderWatch", function(){ relabelTab("watch"); ensureNote(document.getElementById("watch"),"clkNoteWatch"); });
   wrap("renderSpeed", function(){ injectSpeedCols(); });
