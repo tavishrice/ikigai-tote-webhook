@@ -14,7 +14,7 @@ populate the database:
 
 | Component | File | Role |
 |-----------|------|------|
-| **Dashboard + read API** | `read_api.py` (`read_api:app`) | The **Ikigai Warehouse** UI and its JSON endpoints. Serves `/` (the dashboard) and read endpoints like `/warehouse`, `/floor`, `/speed`, `/trend`, `/engraving`, `/outstanding`, `/teamdaily`, `/hours`, `/dataqc`. Host: `ikigai-contribution-api.onrender.com`. |
+| **Dashboard + read API** | `read_api.py` (`read_api:app`) | The **Ikigai Warehouse** UI and its JSON endpoints. Serves `/` (the dashboard) and read endpoints like `/warehouse`, `/floor`, `/speed`, `/trend`, `/engraving`, `/outstanding`, `/teamdaily`, `/hours`, `/dataqc`, `/dataflags`. Host: `ikigai-contribution-api.onrender.com`. |
 | **Tote Complete webhook** | `app.py` (`app:app`) | Receives ShipHero's Tote Complete webhook and writes `tote_barcode → orders → engraving SKUs` into the Engraving Logger sheet. Deployed by `render.yaml`. See [Webhook](#tote-complete-webhook) below. |
 | Ingest / sync | `shiphero_ingest.py`, `shopify_ingest.py`, `orders_snapshot.py`, `tracking_sync.py`, `hr_sync.py` | Pull raw fulfillment, order, tracking and roster data into the DB. |
 | Resolve / normalize | `identity_resolve.py`, `known_aliases.py`, `engrave_resolve.py`, `fulfill_resolve.py`, `magnano_fix.py` | Map raw scan identities to real people and normalize engraving / fulfillment events. |
@@ -33,6 +33,28 @@ Contribution is counted as: **pick + pack + engrave = one fulfillment figure**; 
 separate, parallel track. Active hours use a 45-minute-break rule (a scan gap ≥ 45 min is a break,
 not work). Engravers scan **tote barcodes**, which is where the "tote" vocabulary throughout the
 code comes from — those are real warehouse units, not leftover naming.
+
+### Data flags
+
+Some days are simply not trustworthy — a service was down, a feed never landed, a scan session
+went sideways — and a bad day still *looks* like a normal row on every chart. The `data_flag`
+table is the record that says otherwise. A flag **never edits a number**; it annotates the day so
+a broken day is never read as real performance, and so it's clear what still needs a double-check
+or a backfill.
+
+Each flag carries a day (or span), a **scope** (`all`, or `pick` / `pack` / `engrave` /
+`replenish` / `hours` / `orders`), a **severity** — `suspect` (verify it), `incomplete` (a
+backfill can still fix it), `unrecoverable` (the events are gone; no backfill will) — a **reason**,
+and a **status** (`open` until someone has checked or backfilled it, then `resolved`; resolving
+keeps the record and only stops the warning).
+
+Open flags overlapping the selected date range show as a banner above every range-driven tab.
+**Data Issues** lists them all and is where they're added and resolved.
+
+- Endpoints: `GET /dataflags[?from=&to=&all=1]`, `POST /dataflag`, `POST /dataflag/resolve`,
+  `POST /dataflag/delete`.
+- MCP tools (`mcp_server.py`): `data_flags`, `flag_day`, `resolve_data_flag` — so a day can be
+  flagged straight from a chat session.
 
 ## Tote Complete webhook
 

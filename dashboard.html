@@ -398,6 +398,7 @@ body.dark .badge.ft{background:#1e2a3f;color:#7fb0ff}body.dark .badge.in{backgro
   <span class=lbl style=margin-left:14px>Detail</span><span class=seg id=view><button class=on data-v=simple>Simple</button><button data-v=detailed>Detailed</button></span>
 </div>
 <div class=note id=summary></div>
+<div id=flagbar></div>
 
 <div id=dash>
   <div id=tvhead>
@@ -569,6 +570,7 @@ function tab(t){curTab=t;document.body.dataset.tab=t;['dash','dataqc','out','flo
   var c1=document.getElementById('ctl1');if(c1)c1.style.display=showU?'':'none';
   var c2=document.getElementById('ctl2');if(c2)c2.style.display=showTV?'':'none';
   var sm=document.getElementById('summary');if(sm)sm.style.display=showU?'':'none';
+  var fb=document.getElementById('flagbar');if(fb)fb.style.display=(t==='dataqc'||t==='out'||t==='plan')?'none':'';
   if(t==='speed')loadSpeed();if(t==='watch')loadWatch();if(t==='floor')loadFloor();if(t==='engt')loadEngraving();if(t==='an')loadAnalytics();if(t==='plan')loadPlanner();if(t==='log')loadLog();if(t==='trend')loadTrend();if(t==='out')loadOutstanding();if(t==='dataqc')loadDataqc();
   // TV/clean chrome is Dashboard-only: filters live in the drawer on Dashboard, back in place on every other panel
   if(document.body.classList.contains('clean')){if(t==='dash')moveControlsToDrawer();else restoreControls();}}
@@ -649,6 +651,38 @@ function renderOutstanding(){var o=OUT;
     stamp='<div class=sub style="margin-top:14px">Snapshot '+human+' ago &middot; '+new Date(o.snapshot_at).toLocaleString()+
       (stale?' &middot; <span style="color:#b45309;font-weight:600">may be stale &mdash; auto-refresh pending</span>':'')+'.</div>';}
   document.getElementById('out_body').innerHTML=hero+strip+cmp+ag+hold+st+ol+stamp;}
+// ===== Data flags (days whose numbers are known to be wrong) =====
+// A flag never changes a number. It marks a day so a broken day is never read as real
+// output: an outage, a feed that never landed, scanning that went sideways.
+const FLAG_SEV={suspect:{lbl:'verify',cls:'a'},incomplete:{lbl:'incomplete',cls:'a'},unrecoverable:{lbl:'unrecoverable',cls:'r'}};
+const FLAG_SCOPE_LBL={all:'all data',pick:'picking',pack:'packing',engrave:'engraving',replenish:'restocking',hours:'hours',orders:'orders'};
+function flagDay(d){var p=String(d).split('-');return ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][(+p[1])-1]+' '+(+p[2]);}
+function flagSpan(f){return f.d===f.d_end?flagDay(f.d):(flagDay(f.d)+'\u2013'+flagDay(f.d_end));}
+function flagChip(f){var m=FLAG_SEV[f.severity]||FLAG_SEV.suspect;return '<span class="wchip '+m.cls+'">'+m.lbl+'</span>';}
+function renderFlagbar(flags){var el=document.getElementById('flagbar');if(!el)return;
+  flags=(flags||[]).filter(function(f){return f.status==='open';});
+  if(!flags.length){el.innerHTML='';return;}
+  var worst=flags.some(function(f){return f.severity==='unrecoverable';});
+  var head=flags.length===1?'<b>'+flagSpan(flags[0])+' is flagged</b>':'<b>'+flags.length+' flagged days</b> in this range';
+  el.innerHTML='<div class="plancmp short" style="'+(worst?'background:#fef2f2;border-color:#fecaca;color:#991b1b':'')+'">'+
+    head+' &mdash; these numbers are known to be wrong. Don&rsquo;t read them as performance.'+
+    '<div style="margin-top:6px;line-height:1.6">'+flags.map(function(f){
+      return flagChip(f)+'<b>'+flagSpan(f)+'</b> &middot; '+esc(FLAG_SCOPE_LBL[f.scope]||f.scope)+' &mdash; '+esc(f.reason);}).join('<br>')+
+    '</div><div class=sub2 style="margin-top:6px">Manage these under <b>Data Issues</b>.</div></div>';}
+async function postFlag(url,body){try{var r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    var j=await r.json();if(!j.ok){alert(j.error||'could not save');return false;}return true;}catch(e){alert('could not reach the API');return false;}}
+async function addFlag(){
+  var d=document.getElementById('fl_from').value, e=document.getElementById('fl_to').value||d;
+  var reason=document.getElementById('fl_reason').value.trim();
+  if(!d){alert('pick a date');return;}
+  if(!reason){alert('say what went wrong \u2014 the reason is what makes the flag useful later');return;}
+  var ok=await postFlag('/dataflag',{date:d,end:e,scope:document.getElementById('fl_scope').value,
+    severity:document.getElementById('fl_sev').value,reason:reason,author:document.getElementById('fl_author').value.trim()});
+  if(ok){document.getElementById('fl_reason').value='';loadDataqc();load();}}
+async function resolveFlag(id){var res=prompt('What settled it? (e.g. "backfilled from ShipHero", "checked, numbers are real")')||'';
+  if(await postFlag('/dataflag/resolve',{id:id,resolution:res.trim()})){loadDataqc();load();}}
+async function deleteFlag(id){if(!confirm('Delete this flag? Resolving keeps the record; deleting removes it.'))return;
+  if(await postFlag('/dataflag/delete',{id:id})){loadDataqc();load();}}
 // ===== Data issues & warnings =====
 let DATAQC=null;
 async function loadDataqc(){var host=document.getElementById('dataqc_body');
@@ -660,6 +694,30 @@ function renderDataqc(){if(!DATAQC)return;var q=DATAQC;var host=document.getElem
   var out='<div class=nrow style="margin:6px 0 2px;gap:20px">'+
     '<span class=sub2>Data freshness: <b style="color:'+fcol+'">'+(fm==null?'no data':(fm+' min ago'))+'</b></span>'+
     '<span class=sub2>Now: <b>'+q.today_hm+'</b> &middot; '+q.today+'</span></div>';
+  // ---- Flagged days: the manual record of days whose numbers are known to be wrong ----
+  var fl=q.flags||[], open_=fl.filter(function(f){return f.status==='open';}), done=fl.filter(function(f){return f.status!=='open';});
+  out+='<div class=sub style="margin:18px 0 6px"><b>Flagged days</b> &mdash; days marked as not trustworthy (an outage, a feed that never landed, a bad scan session). '+
+    'A flag never edits a number; it stops a broken day being read as real output, and records what still needs a double-check or a backfill.</div>';
+  if(!fl.length)out+='<div class=sub2>No days flagged.</div>';
+  else{out+='<div class=tablewrap><table><tr><th style=text-align:left>Day(s)</th><th>Severity</th><th>Scope</th><th style=text-align:left>Why</th><th style=text-align:left>Flagged by</th><th></th></tr>'+
+    open_.concat(done).map(function(f){var res=f.status!=='open';
+      return '<tr'+(res?' style=opacity:.5':'')+'><td class=name style=text-align:left>'+flagSpan(f)+'</td>'+
+        '<td>'+flagChip(f)+'</td><td class=sub2>'+esc(FLAG_SCOPE_LBL[f.scope]||f.scope)+'</td>'+
+        '<td style=text-align:left>'+esc(f.reason)+(res&&f.resolution?'<div class=sub2>resolved: '+esc(f.resolution)+'</div>':'')+'</td>'+
+        '<td class=sub2 style=text-align:left>'+(esc(f.author)||'&mdash;')+'</td>'+
+        '<td style=text-align:right>'+(res?'<span class=sub2>resolved</span>':'<button class=pill onclick="resolveFlag('+f.id+')">Resolve</button>')+
+        ' <button class=pill onclick="deleteFlag('+f.id+')">Delete</button></td></tr>';}).join('')+
+    '</table></div>';}
+  var scopes=q.flag_scopes||['all'], sevs=q.flag_severities||['suspect'];
+  out+='<div class=logptr style="margin-top:12px"><div style="margin-bottom:8px"><b>Flag a day</b> &mdash; from and to are the same day unless the problem spanned several.</div>'+
+    '<div class=nrow style="gap:8px;flex-wrap:wrap;align-items:center">'+
+    '<input type=date class=nin id=fl_from value="'+q.today+'"> <span class=sub2>to</span> <input type=date class=nin id=fl_to value="'+q.today+'">'+
+    '<select class=nin id=fl_scope>'+scopes.map(function(x){return '<option value="'+x+'">'+(FLAG_SCOPE_LBL[x]||x)+'</option>';}).join('')+'</select>'+
+    '<select class=nin id=fl_sev>'+sevs.map(function(x){return '<option value="'+x+'">'+((FLAG_SEV[x]||{}).lbl||x)+'</option>';}).join('')+'</select>'+
+    '<input class=nin id=fl_author placeholder="your name" style="width:120px">'+
+    '</div><div class=nrow style="gap:8px;margin-top:8px">'+
+    '<input class=nin id=fl_reason placeholder="What went wrong? (e.g. ShipHero + Logger were down most of the day)" style="flex:1;min-width:280px">'+
+    '<button class=pill onclick="addFlag()">Add flag</button></div></div>';
   if((q.unidentified||[]).length){out+='<div class=sub style="margin:16px 0 6px"><b>Unidentified people</b> &mdash; source scans not matched to an employee. Nobody is named a number &mdash; map them in known_aliases.py (or tell me who they are).</div>'+
     '<div class=tablewrap><table><tr><th style=text-align:left>Raw identity</th><th>Decoded</th><th>Source</th><th>Events</th><th>Last seen</th></tr>'+
     q.unidentified.map(function(u){return '<tr><td class=name style=text-align:left>'+esc(u.person)+'</td><td class=sub2>'+esc(u.hint||'')+'</td><td class=sub2>'+esc(u.sources||'')+'</td><td><b>'+fmt(u.events)+'</b></td><td class=sub2>'+esc(u.last||'')+'</td></tr>';}).join('')+
@@ -740,6 +798,7 @@ function vis(){return visFor(segval('stage'),segval('source'));}
 function fulItems(p,v){return (v.pick?p.items_picked_sh:0)+(v.packsh?p.items_packed_sh:0)+(v.packshop?p.items_packed_shop:0)+(v.eng?p.engraved_items:0);}
 function fulOrders(p,v){return (v.pick?p.orders_picked_sh:0)+(v.packsh?p.orders_packed_sh:0)+(v.packshop?p.orders_packed_shop:0)+(v.eng?(p.engraved_orders||0):0);}
 function render(){if(!DATA)return;
+  renderFlagbar(DATA.flags);
   const unit=segval('unit'),v=vis();
   const ppl=DATA.people.filter(teamFilter);
   const sh=DATA.shipped, T=DATA.totals;
