@@ -108,6 +108,59 @@ def _ensure_canon():
         pass
 _ensure_canon()
 
+# ---------------- Data flags (days whose numbers are known to be wrong) ----------------
+# A day where a service was down, a feed never landed, or scanning went sideways still LOOKS
+# like a normal row on every chart. A flag is the annotation that says otherwise: it never
+# edits a number, it marks the day so a broken day is never read as real performance.
+#   scope     -- which part of the data is affected ('all', or one stage / hours / orders)
+#   severity  -- 'suspect'       (numbers look wrong, verify them),
+#                'incomplete'    (known missing, a backfill can still fix it),
+#                'unrecoverable' (the events are gone for good; no backfill will fix this day)
+#   status    -- 'open' until someone has checked / backfilled it, then 'resolved'
+FLAG_SCOPES = ("all", "pick", "pack", "engrave", "replenish", "hours", "orders")
+FLAG_SEVERITIES = ("suspect", "incomplete", "unrecoverable")
+
+_FLAG_DDL = """CREATE TABLE IF NOT EXISTS data_flag (
+  id          bigserial PRIMARY KEY,
+  d           date NOT NULL,                    -- first affected ET day
+  d_end       date NOT NULL,                    -- last affected ET day (= d for a single day)
+  scope       text NOT NULL DEFAULT 'all',
+  severity    text NOT NULL DEFAULT 'suspect',
+  status      text NOT NULL DEFAULT 'open',
+  reason      text NOT NULL DEFAULT '',
+  author      text NOT NULL DEFAULT '',
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  resolved_at timestamptz,
+  resolution  text NOT NULL DEFAULT ''
+)"""
+_FLAG_IDX = "CREATE INDEX IF NOT EXISTS data_flag_span_idx ON data_flag (d, d_end)"
+
+def _ensure_flags():
+    try:
+        with connect() as _c:
+            _cur = _c.cursor(); _cur.execute(_FLAG_DDL); _cur.execute(_FLAG_IDX); _c.commit()
+    except Exception:
+        pass
+_ensure_flags()
+
+def _flags(cur, frm=None, to=None, include_resolved=False, limit=200):
+    """Flags overlapping [frm, to] (or every flag when no range is given), newest day first."""
+    w = []; a = []
+    if frm and to:
+        w.append("d <= %s AND d_end >= %s"); a += [to, frm]
+    if not include_resolved:
+        w.append("status = 'open'")
+    cur.execute("SELECT id,d,d_end,scope,severity,status,reason,author,created_at,resolved_at,resolution "
+                "FROM data_flag" + (" WHERE " + " AND ".join(w) if w else "") +
+                " ORDER BY d DESC, id DESC LIMIT %s", a + [limit])
+    return [dict(id=r[0], d=str(r[1]), d_end=str(r[2]), scope=r[3], severity=r[4], status=r[5],
+                 reason=r[6] or "", author=r[7] or "",
+                 created_at=(r[8].isoformat() if r[8] else None),
+                 resolved_at=(r[9].isoformat() if r[9] else None),
+                 resolution=r[10] or "")
+            for r in cur.fetchall()]
+
+
 def _decode_hint(pn):
     if isinstance(pn, str) and pn.startswith("User-"):
         import base64
@@ -242,6 +295,8 @@ def warehouse():
                count(*) FILTER (WHERE sh AND (lg OR shop_pre)) both FROM o""", [list(EXCLUDED), frm, to])
         shipped = cur.fetchone()
 
+        flags = _flags(cur, frm, to)      # days in this range whose numbers are known to be wrong
+
     people = []
     tot = dict(pk_i=0,packsh_i=0,packshop_i=0,eng_i=0,pk_o=0,packsh_o=0,packshop_o=0,eng_o=0,repl=0)
     for r in rows:
@@ -255,7 +310,7 @@ def warehouse():
         tot["pk_o"]+=pk_o; tot["packsh_o"]+=psh_o; tot["packshop_o"]+=psp_o; tot["eng_o"]+=eng_o; tot["repl"]+=repl
     return jsonify(range={"from":frm,"to":to},
         shipped=dict(total=shipped[0], shiphero=shipped[1], shopify_only=shipped[2], both=shipped[3]),
-        totals=tot, people=people)
+        totals=tot, people=people, flags=flags)
 
 ACTIVE_BREAK = 2700  # seconds = 45 min. ONE definition of "active time" app-wide: from a person's first
                      # scan to their last, with any gap >= 45 min removed as a break (Floor Time, Speed,
@@ -383,6 +438,7 @@ def engraving():
                          AND person IN (SELECT a.alias FROM person_alias a JOIN employee e ON e.id=a.employee_id)
                        ORDER BY person, et_day""", [frm, to])
         rows = cur.fetchall()
+        flags = _flags(cur, frm, to)
     ppl={}
     for (person,d,scans,totes,matched,dotw,lid,ipe,units,orders,hours) in rows:
         if person in EXCLUDED: continue
@@ -406,7 +462,7 @@ def engraving():
         p["match_rate"]=round(100*p["matched"]/p["totes"]) if p["totes"] else 0
         out.append(p)
     out.sort(key=lambda x:-x["items"])
-    return jsonify(range={"from":frm,"to":to}, days=_daylist(frm,to), engravers=out)
+    return jsonify(range={"from":frm,"to":to}, days=_daylist(frm,to), engravers=out, flags=flags)
 
 # ---------------- Leader annotations (special-project / off-scanner time) ----------------
 @app.route("/note", methods=["POST"])
@@ -445,6 +501,62 @@ def del_note():
     if not nid: return jsonify(ok=False), 400
     with connect() as c, c.cursor() as cur:
         cur.execute("DELETE FROM floor_note WHERE id=%s", (int(nid),)); c.commit()
+    return jsonify(ok=True)
+
+# ---------------- Data flags (read + write) ----------------
+@app.route("/dataflags")
+def list_flags():
+    """Flags for a date range (?from=&to=), or every open flag with no range. ?all=1 includes
+    the resolved ones, so the Data Issues tab can show what has already been dealt with."""
+    frm=(request.args.get("from") or "").strip(); to=(request.args.get("to") or "").strip()
+    allf=(request.args.get("all") or "").lower() in ("1","true","yes")
+    if frm and to:
+        try: dt.date.fromisoformat(frm); dt.date.fromisoformat(to)
+        except Exception: return jsonify(ok=False, error="bad date"), 400
+    else:
+        frm=to=None
+    with connect() as c, c.cursor(row_factory=tuple_row) as cur:
+        return jsonify(ok=True, flags=_flags(cur, frm, to, include_resolved=allf))
+
+@app.route("/dataflag", methods=["POST"])
+def add_flag():
+    d=request.get_json(silent=True) or {}
+    day=(d.get("date") or "").strip()[:10]
+    end=((d.get("end") or "").strip() or day)[:10]
+    scope=(d.get("scope") or "all").strip().lower()
+    sev=(d.get("severity") or "suspect").strip().lower()
+    reason=(d.get("reason") or "").strip()[:500]
+    author=(d.get("author") or "").strip()[:80]
+    try: d0=dt.date.fromisoformat(day); d1=dt.date.fromisoformat(end)
+    except Exception: return jsonify(ok=False, error="bad date"), 400
+    if d1 < d0: d0, d1 = d1, d0
+    if scope not in FLAG_SCOPES: return jsonify(ok=False, error="bad scope"), 400
+    if sev not in FLAG_SEVERITIES: return jsonify(ok=False, error="bad severity"), 400
+    if not reason: return jsonify(ok=False, error="need a reason"), 400
+    with connect() as c, c.cursor() as cur:
+        cur.execute("INSERT INTO data_flag (d,d_end,scope,severity,reason,author) "
+                    "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id", (d0,d1,scope,sev,reason,author))
+        fid=cur.fetchone()[0]; c.commit()
+    return jsonify(ok=True, id=fid)
+
+@app.route("/dataflag/resolve", methods=["POST"])
+def resolve_flag():
+    """Mark a flag dealt with (checked, or backfilled). The flag stays in the table as the
+    record that the day was once wrong -- resolving it only stops the warning banner."""
+    d=request.get_json(silent=True) or {}
+    fid=d.get("id"); res=(d.get("resolution") or "").strip()[:500]
+    if not fid: return jsonify(ok=False, error="need an id"), 400
+    with connect() as c, c.cursor() as cur:
+        cur.execute("UPDATE data_flag SET status='resolved', resolved_at=now(), resolution=%s "
+                    "WHERE id=%s", (res, int(fid))); c.commit()
+    return jsonify(ok=True)
+
+@app.route("/dataflag/delete", methods=["POST"])
+def del_flag():
+    fid=(request.get_json(silent=True) or {}).get("id")
+    if not fid: return jsonify(ok=False), 400
+    with connect() as c, c.cursor() as cur:
+        cur.execute("DELETE FROM data_flag WHERE id=%s", (int(fid),)); c.commit()
     return jsonify(ok=True)
 
 GAP_SHOW = 1800   # seconds = 30 min: gaps this long or longer are surfaced as fillable windows
@@ -822,6 +934,7 @@ def dataqc():
         for (p, d, ful, l) in cur.fetchall():
             by.setdefault(p, []).append((d, int(ful), l))
         unidentified = _unmatched(cur)
+        flags = _flags(cur, include_resolved=True)
     anomalies = []; today_rows = []
     for p, rows in by.items():
         rows.sort(key=lambda x: x[0])
@@ -846,7 +959,8 @@ def dataqc():
         last_ts=(last_ts.isoformat() if last_ts else None),
         last_min_ago=(round((now - last_ts.astimezone(_ET)).total_seconds()/60) if last_ts else None),
         concurrency=conc, anomalies=anomalies, today_partial=today_rows,
-        unidentified=unidentified)
+        unidentified=unidentified, flags=flags, flag_scopes=list(FLAG_SCOPES),
+        flag_severities=list(FLAG_SEVERITIES))
 
 @app.route("/teamdaily")
 def teamdaily():

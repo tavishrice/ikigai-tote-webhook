@@ -297,6 +297,107 @@ def refresh_day(et_day: str) -> str:
         return json.dumps({"error": type(e).__name__, "detail": str(e)})
 
 
+FLAG_SCOPES = ("all", "pick", "pack", "engrave", "replenish", "hours", "orders")
+FLAG_SEVERITIES = ("suspect", "incomplete", "unrecoverable")
+
+
+@mcp.tool()
+def data_flags(include_resolved: bool = False, et_day: str = "") -> str:
+    """Days marked as NOT trustworthy — outages, feeds that never landed, bad
+    scan sessions. Check this before reading any day's numbers as real output:
+    a flagged day looks normal on every chart but its totals are known wrong.
+
+    Args:
+        include_resolved: Also return flags already checked / backfilled.
+        et_day: Optional 'YYYY-MM-DD' — only flags covering that day.
+
+    Returns:
+        JSON list of flags (scope, severity, status, reason, author, dates).
+    """
+    w, a = [], []
+    if et_day:
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", et_day):
+            return json.dumps({"error": "bad_date", "detail": "Use 'YYYY-MM-DD'."})
+        w.append("d <= %s::date AND d_end >= %s::date"); a += [et_day, et_day]
+    if not include_resolved:
+        w.append("status = 'open'")
+    q = ("SELECT id, d, d_end, scope, severity, status, reason, author, created_at, "
+         "resolved_at, resolution FROM data_flag" +
+         (" WHERE " + " AND ".join(w) if w else "") + " ORDER BY d DESC, id DESC")
+    try:
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(q, a)
+                return json.dumps(cur.fetchall(), default=_json_default)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"error": type(e).__name__, "detail": str(e)})
+
+
+@mcp.tool()
+def flag_day(et_day: str, reason: str, scope: str = "all",
+             severity: str = "suspect", end_day: str = "", author: str = "") -> str:
+    """Mark a day (or a span of days) as not trustworthy. This NEVER edits any
+    number — it annotates the day so the dashboard warns on it and nobody reads
+    a broken day as real performance.
+
+    Args:
+        et_day: First affected ET day, 'YYYY-MM-DD'.
+        reason: What went wrong. This is the whole value of the flag later — be specific.
+        scope: Which data is affected: all | pick | pack | engrave | replenish | hours | orders.
+        severity: 'suspect' (verify it), 'incomplete' (backfillable), or
+            'unrecoverable' (the events are gone; no backfill will fix this day).
+        end_day: Last affected day for a multi-day problem. Defaults to et_day.
+        author: Who is flagging it.
+    """
+    end_day = end_day or et_day
+    for v in (et_day, end_day):
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", v or ""):
+            return json.dumps({"error": "bad_date", "detail": "Use 'YYYY-MM-DD'."})
+    if scope not in FLAG_SCOPES:
+        return json.dumps({"error": "bad_scope", "detail": "One of: " + ", ".join(FLAG_SCOPES)})
+    if severity not in FLAG_SEVERITIES:
+        return json.dumps({"error": "bad_severity", "detail": "One of: " + ", ".join(FLAG_SEVERITIES)})
+    if not (reason or "").strip():
+        return json.dumps({"error": "no_reason", "detail": "Say what went wrong."})
+    if end_day < et_day:
+        et_day, end_day = end_day, et_day
+    try:
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO data_flag (d, d_end, scope, severity, reason, author) "
+                    "VALUES (%s::date, %s::date, %s, %s, %s, %s) RETURNING id",
+                    (et_day, end_day, scope, severity, reason.strip()[:500], (author or "").strip()[:80]))
+                fid = cur.fetchone()["id"]
+                conn.commit()
+        return json.dumps({"status": "flagged", "id": fid, "d": et_day, "d_end": end_day,
+                           "scope": scope, "severity": severity})
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"error": type(e).__name__, "detail": str(e)})
+
+
+@mcp.tool()
+def resolve_data_flag(flag_id: int, resolution: str = "") -> str:
+    """Mark a data flag dealt with — checked, or backfilled. The flag stays as the
+    record that the day was once wrong; resolving it only stops the warning.
+
+    Args:
+        flag_id: id from data_flags().
+        resolution: What settled it (e.g. 'backfilled from ShipHero').
+    """
+    try:
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE data_flag SET status = 'resolved', resolved_at = now(), "
+                            "resolution = %s WHERE id = %s",
+                            (resolution.strip()[:500], int(flag_id)))
+                n = cur.rowcount
+                conn.commit()
+        return json.dumps({"status": "resolved" if n else "not_found", "id": flag_id})
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"error": type(e).__name__, "detail": str(e)})
+
+
 # --------------------------------------------------------------------------- #
 # HTTP app: auth middleware + health route
 # --------------------------------------------------------------------------- #
