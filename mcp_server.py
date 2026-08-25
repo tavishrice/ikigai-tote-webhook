@@ -92,6 +92,28 @@ if not DATABASE_URL:
 _READ_ONLY_RE = re.compile(r"^\s*(?:with\b.*?\bselect\b|select|explain|show|table)\b",
                            re.IGNORECASE | re.DOTALL)
 
+# allow_write=True is an unlock the CALLER asks for; MCP_ALLOW_WRITE is the unlock the SERVER
+# grants. Both must line up before a write runs.
+#
+# Why the server-side half exists: this database holds `employee`, `time_clock`, `time_break`
+# and `person_alias` — people's hours and pay-adjacent records — and the append-only `event`
+# table that every rollup is derived from. A caller passing allow_write=true was, on its own,
+# enough to UPDATE or DROP any of it. One mistyped tool call stood between a model and payroll
+# data. Writing is now a deliberate act that costs one env var, set for as long as the fix
+# takes and then cleared.
+def _write_unlocked() -> bool:
+    return os.environ.get("MCP_ALLOW_WRITE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Relations that stay unreadable however the rest widens: credentials and session material.
+# NOTE what is deliberately NOT here — `employee`, `time_clock`, `person_alias`. Those are the
+# point of this database, and the attendance/performance workflows read them on purpose.
+# Personal data is protected by who holds the bearer token, not by hiding tables from the
+# tool that exists to query them. Secrets are different: nothing legitimate reads them here.
+_SENSITIVE_RE = re.compile(
+    r"(?:^|[^a-z0-9_])(?:oauth\w*|\w*(?:token|secret|credential|password|apikey|api_key)\w*)"
+    r"(?:[^a-z0-9_]|$)", re.IGNORECASE)
+
 
 def _json_default(o):
     if isinstance(o, (datetime, date)):
@@ -159,8 +181,32 @@ def run_sql(sql: str, allow_write: bool = False, max_rows: int = 200) -> str:
                        "Remember to refresh_day() the affected ET-day(s) after."),
         })
 
+    if not is_read and not _write_unlocked():
+        return json.dumps({
+            "error": "write_locked",
+            "server_write_locked": True,
+            "detail": ("allow_write=true is not enough on its own: this server is read-only "
+                       "unless MCP_ALLOW_WRITE=1 is set in its environment. This database "
+                       "holds employee and time-clock records and the append-only event "
+                       "table every rollup derives from, so a write here is a deliberate "
+                       "act. Set the var, make the change, then clear it."),
+        })
+
+    if is_read and _SENSITIVE_RE.search(sql or ""):
+        return json.dumps({
+            "error": "sensitive_relation",
+            "detail": ("This query names a credential/token/secret relation, which stays "
+                       "unreadable through the MCP. Employee and time-clock data is NOT "
+                       "restricted — query it normally."),
+        })
+
     try:
         with _connect() as conn:
+            # The regex above is a heuristic and heuristics can be fooled (a CTE that ends in
+            # a data-modifying statement, for one). On the read path let POSTGRES decide: a
+            # read-only transaction refuses a write no matter how the statement was classified.
+            if is_read:
+                conn.read_only = True
             with conn.cursor() as cur:
                 cur.execute(sql)
                 if cur.description is not None:

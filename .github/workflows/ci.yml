@@ -1,0 +1,51 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: pip install -r requirements.txt
+
+      # This repo is PUBLIC. A committed credential here is world-readable the moment it
+      # lands, and rotating it afterwards does not un-publish it.
+      - name: No credentials in source
+        run: |
+          if grep -rnE "(postgres(ql)?://[A-Za-z0-9_]+:[^@ '\"]+@)|(shpat_[A-Za-z0-9]{20,})|(xox[baprs]-[A-Za-z0-9-]{10,})|(AKIA[0-9A-Z]{16})|(sk-[A-Za-z0-9]{20,})" \
+               --include='*.py' --include='*.yaml' --include='*.yml' --include='*.html' --include='*.md' --include='*.json' .; then
+            echo "::error::a credential-shaped string is committed to a PUBLIC repository"
+            exit 1
+          fi
+          echo "clean"
+
+      - name: MCP server imports and registers its tools
+        env:
+          DATABASE_URL: postgresql://localhost.localdomain:5432/nonexistent
+          MCP_TOKEN: ci-token
+        run: |
+          python - <<'PY'
+          import asyncio, mcp_server
+          tools = asyncio.run(mcp_server.mcp.list_tools())
+          names = sorted(t.name for t in tools)
+          print(f"{len(names)} tools: {names}")
+          assert "run_sql" in names
+          undoc = [t.name for t in tools if not (t.description or "").strip()]
+          assert not undoc, f"undocumented tools: {undoc}"
+          PY
+
+      - name: Tests
+        run: |
+          fail=0
+          for t in tests/test_*.py; do
+            name="tests.$(basename "$t" .py)"
+            echo "::group::$name"; python -m "$name" || { echo "::error::$name FAILED"; fail=1; }; echo "::endgroup::"
+          done
+          exit $fail
